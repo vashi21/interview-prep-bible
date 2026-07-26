@@ -405,7 +405,13 @@ footer.colophon p{color:var(--ink-faint);margin-bottom:.6em;}
   background:var(--bg-raised);color:var(--ink);font-size:1.15rem;cursor:pointer;box-shadow:0 2px 10px var(--shadow);
 }
 
-@media print{ .ink-toolbar, .ink-canvas, .ink-fab{display:none !important;} }
+.ink-eraser-cursor{
+  position:fixed;display:none;z-index:60;border-radius:50%;pointer-events:none;
+  border:2px solid var(--ink);background:rgba(128,128,128,.15);
+  transform:translateZ(0); /* own compositor layer — moves every pointermove, keep it off the main paint */
+}
+
+@media print{ .ink-toolbar, .ink-canvas, .ink-fab, .ink-eraser-cursor{display:none !important;} }
 
 </style>
 <div id="app"></div>
@@ -674,11 +680,28 @@ window.__VOLUME_SELECTOR_HTML__ = "<div class=\"wrap\"><header class=\"hero\"><p
    it for a finger too. To keep finger-scrolling fully working regardless of
    annotation state (the actual requirement), a finger's one-finger drag is
    re-implemented here as a plain 1:1 `window.scrollTo` follow (see
-   fingerScroll below) — deliberately no momentum/fling after lift, since
-   replicating that physics exactly is out of scope; a direct drag-to-scroll
-   is what matters. The moment a second finger joins, this manual tracking
-   backs off and the browser's own native pinch-zoom (still permitted by
-   touch-action) takes over. */
+   fingerScroll below), applied once per animation frame via
+   requestAnimationFrame rather than once per raw pointermove — calling
+   scrollTo synchronously on every event is what made it feel glitchy,
+   since touchmove can fire faster than layout/paint can keep up; batching
+   to one call per frame is the standard fix. Deliberately still no
+   momentum/fling after lift — replicating that physics exactly is out of
+   scope, a direct drag-to-scroll is what matters. The moment a second
+   finger joins, this manual tracking backs off and the browser's own
+   native pinch-zoom (still permitted by touch-action) takes over.
+
+   Strokes are drawn as a sequence of small quadratic curves through the
+   midpoints of consecutive points (a standard freehand-smoothing trick),
+   not straight lineTo segments — straight segments only looked smooth at
+   slow, densely-sampled speeds; at normal writing speed the sparser points
+   made fast strokes and eraser drags look faceted/jagged. The same helper
+   draws both the live in-progress stroke and the full replay in
+   `paintEntry`, so nothing changes appearance the moment a stroke commits.
+
+   Eraser size is a RADIUS throughout (matches the size slider and the
+   circular cursor preview drawn at the Pencil's position while erasing);
+   the destination-out stroke used for precision/standard erasing uses
+   double that as its line width (a line's width is its diameter). */
 (function(){
   var DB_NAME = 'hld-bible-ink';
   var DB_VERSION = 1;
@@ -849,23 +872,41 @@ window.__VOLUME_SELECTOR_HTML__ = "<div class=\"wrap\"><header class=\"hero\"><p
     return baseWidth * (0.45 + 0.9 * (pressure == null ? 0.5 : pressure));
   }
 
-  function drawSegment(style, p0, p1){
-    ctx.save();
+  function midpoint(a, b){
+    return { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 };
+  }
+
+  function applyStrokeStyle(style, pressure){
     if (style.erase) {
       ctx.globalCompositeOperation = 'destination-out';
       ctx.globalAlpha = 1;
       ctx.strokeStyle = '#000';
+      ctx.lineWidth = style.width; // already a diameter — see file header
     } else {
       ctx.globalCompositeOperation = 'source-over';
       ctx.globalAlpha = style.alpha == null ? 1 : style.alpha;
       ctx.strokeStyle = style.color;
+      ctx.lineWidth = style.pressureSensitive ? lineWidthFor(style.width, pressure) : style.width;
     }
     ctx.lineCap = style.cap || 'round';
     ctx.lineJoin = 'round';
-    ctx.lineWidth = style.pressureSensitive ? lineWidthFor(style.width, p1.p) : style.width;
+  }
+
+  // Draws the segment ending at points[i] as a small quadratic curve through
+  // the midpoints on either side of points[i-1], using points[i-1] itself as
+  // the control point — the standard freehand-smoothing technique. Each call
+  // strokes only the new increment (no re-stroking of earlier segments), so
+  // it's safe to call once per new point during live drawing as well as
+  // once per point during a full replay.
+  function drawSmoothSegment(style, points, i){
+    var p1 = points[i - 1], p2 = points[i];
+    var start = i >= 2 ? midpoint(points[i - 2], p1) : p1;
+    var end = midpoint(p1, p2);
+    ctx.save();
+    applyStrokeStyle(style, p2.p);
     ctx.beginPath();
-    ctx.moveTo(p0.x, p0.y);
-    ctx.lineTo(p1.x, p1.y);
+    ctx.moveTo(start.x, start.y);
+    ctx.quadraticCurveTo(p1.x, p1.y, end.x, end.y);
     ctx.stroke();
     ctx.restore();
   }
@@ -886,7 +927,7 @@ window.__VOLUME_SELECTOR_HTML__ = "<div class=\"wrap\"><header class=\"hero\"><p
       var isHighlighter = entry.alpha != null && entry.alpha < 1;
       style = { color: entry.color, alpha: entry.alpha, width: entry.width, cap: isHighlighter ? 'butt' : 'round', pressureSensitive: !isHighlighter };
     }
-    for (var i = 1; i < pts.length; i++) drawSegment(style, pts[i - 1], pts[i]);
+    for (var i = 1; i < pts.length; i++) drawSmoothSegment(style, pts, i);
   }
 
   function redraw(){
@@ -935,27 +976,59 @@ window.__VOLUME_SELECTOR_HTML__ = "<div class=\"wrap\"><header class=\"hero\"><p
     return changed;
   }
 
+  // ---- eraser cursor preview ----
+  // A ring at the Pencil's current position, diameter = 2x the radius the
+  // slider controls, so it's obvious before/while erasing exactly how much
+  // is about to be removed, and it visibly grows/shrinks with the slider.
+  function updateEraserCursor(clientX, clientY){
+    var cursor = document.getElementById('ink-eraser-cursor');
+    if (!cursor) return;
+    var d = currentEraserSize() * 2;
+    cursor.style.width = d + 'px';
+    cursor.style.height = d + 'px';
+    cursor.style.left = (clientX - d / 2) + 'px';
+    cursor.style.top = (clientY - d / 2) + 'px';
+    cursor.style.display = 'block';
+  }
+
+  function hideEraserCursor(){
+    var cursor = document.getElementById('ink-eraser-cursor');
+    if (cursor) cursor.style.display = 'none';
+  }
+
   // ---- finger drag-to-scroll passthrough ----
   // touch-action:'pinch-zoom' (set while annotating) disables native
   // one-finger panning for EVERY pointer type, since touch-action can't
   // distinguish Pencil from finger. This replicates plain 1:1 finger
-  // scrolling by hand so it keeps working regardless of annotation state —
-  // deliberately no momentum after lift, see file header. Bails out the
-  // moment a second finger joins (touchPointerIds.size > 1) so the browser's
-  // own native pinch-zoom, still permitted by touch-action, takes over.
+  // scrolling by hand so it keeps working regardless of annotation state.
+  // Applied once per animation frame (not once per raw event — that's what
+  // made it feel glitchy) via requestAnimationFrame. Deliberately still no
+  // momentum after lift, see file header. Bails out the moment a second
+  // finger joins (touchPointerIds.size > 1) so the browser's own native
+  // pinch-zoom, still permitted by touch-action, takes over.
   var touchPointerIds = new Set();
   var fingerScroll = null;
+  var scrollRafPending = false;
+
+  function applyPendingScroll(){
+    scrollRafPending = false;
+    if (fingerScroll && touchPointerIds.size === 1) {
+      window.scrollTo(window.scrollX, fingerScroll.scrollY - (fingerScroll.lastY - fingerScroll.y));
+    }
+  }
 
   function onPointerDown(e){
     if (e.pointerType === 'touch') {
       touchPointerIds.add(e.pointerId);
       if (touchPointerIds.size > 1) { fingerScroll = null; return; }
       if (!prefs.collapsed && currentRoute && !e.target.closest('#ink-toolbar, #ink-fab')) {
-        fingerScroll = { pointerId: e.pointerId, y: e.clientY, scrollY: window.scrollY };
+        fingerScroll = { pointerId: e.pointerId, y: e.clientY, lastY: e.clientY, scrollY: window.scrollY };
       }
       return;
     }
-    if (e.pointerType !== 'pen' || !wrap || !canvas || prefs.collapsed) return;
+    if (e.pointerType !== 'pen') return;
+    if (prefs.tool === 'eraser' && !prefs.collapsed && currentRoute) updateEraserCursor(e.clientX, e.clientY);
+    if (!wrap || !canvas || prefs.collapsed) return;
     e.preventDefault();
     snapshotForUndo();
     var rect = wrap.getBoundingClientRect();
@@ -972,12 +1045,15 @@ window.__VOLUME_SELECTOR_HTML__ = "<div class=\"wrap\"><header class=\"hero\"><p
 
   function onPointerMove(e){
     if (e.pointerType === 'touch') {
-      if (fingerScroll && e.pointerId === fingerScroll.pointerId && touchPointerIds.size === 1) {
-        window.scrollTo(window.scrollX, fingerScroll.scrollY - (e.clientY - fingerScroll.y));
+      if (fingerScroll && e.pointerId === fingerScroll.pointerId) {
+        fingerScroll.lastY = e.clientY;
+        if (!scrollRafPending) { scrollRafPending = true; requestAnimationFrame(applyPendingScroll); }
       }
       return;
     }
-    if (e.pointerType !== 'pen' || !liveStroke) return;
+    if (e.pointerType !== 'pen') return;
+    if (prefs.tool === 'eraser' && !prefs.collapsed && currentRoute) updateEraserCursor(e.clientX, e.clientY);
+    if (!liveStroke) return;
     e.preventDefault();
     var rect = wrap.getBoundingClientRect();
     var newPoint = { x: e.clientX - rect.left, y: e.clientY - rect.top, p: e.pressure || 0.5 };
@@ -988,14 +1064,9 @@ window.__VOLUME_SELECTOR_HTML__ = "<div class=\"wrap\"><header class=\"hero\"><p
       return;
     }
 
-    var prevPoint = liveStroke[liveStroke.length - 1];
     liveStroke.push(newPoint);
-    if (prefs.tool === 'eraser') {
-      drawSegment({ erase: true, width: currentEraserSize() }, prevPoint, newPoint);
-    } else {
-      var style = currentDrawStyle();
-      drawSegment(style, prevPoint, newPoint);
-    }
+    var style = prefs.tool === 'eraser' ? { erase: true, width: currentEraserSize() * 2 } : currentDrawStyle();
+    drawSmoothSegment(style, liveStroke, liveStroke.length - 1);
   }
 
   function onPointerUp(e){
@@ -1004,7 +1075,9 @@ window.__VOLUME_SELECTOR_HTML__ = "<div class=\"wrap\"><header class=\"hero\"><p
       if (fingerScroll && e.pointerId === fingerScroll.pointerId) fingerScroll = null;
       return;
     }
-    if (e.pointerType !== 'pen' || !liveStroke) return;
+    if (e.pointerType !== 'pen') return;
+    hideEraserCursor();
+    if (!liveStroke) return;
     e.preventDefault();
 
     if (liveStroke === 'stroke-erase') {
@@ -1017,7 +1090,7 @@ window.__VOLUME_SELECTOR_HTML__ = "<div class=\"wrap\"><header class=\"hero\"><p
       var w = wrap.scrollWidth, h = wrap.scrollHeight;
       var relPoints = liveStroke.map(function(p){ return { x: p.x / w, y: p.y / h, p: p.p }; });
       if (prefs.tool === 'eraser') {
-        strokes.push({ type: 'erase', width: currentEraserSize(), points: relPoints });
+        strokes.push({ type: 'erase', width: currentEraserSize() * 2, points: relPoints });
       } else {
         var style = currentDrawStyle();
         strokes.push({ type: 'draw', color: style.color, alpha: style.alpha, width: style.width, points: relPoints });
@@ -1033,6 +1106,7 @@ window.__VOLUME_SELECTOR_HTML__ = "<div class=\"wrap\"><header class=\"hero\"><p
   function mount(routeKey){
     if (canvas && canvas.parentNode) canvas.parentNode.removeChild(canvas);
     canvas = null; ctx = null; wrap = null; strokes = []; liveStroke = null; currentRoute = null; undoStack = [];
+    hideEraserCursor();
     updateToolbarVisibility(!!routeKey);
     if (!routeKey) return;
 
@@ -1173,6 +1247,7 @@ window.__VOLUME_SELECTOR_HTML__ = "<div class=\"wrap\"><header class=\"hero\"><p
     prefs.tool = tool;
     savePrefs();
     refreshToolbar();
+    if (tool !== 'eraser') hideEraserCursor();
   }
 
   function buildToolbar(){
@@ -1194,6 +1269,11 @@ window.__VOLUME_SELECTOR_HTML__ = "<div class=\"wrap\"><header class=\"hero\"><p
       '</div>' +
       '<div class="ink-row ink-row-options" id="ink-options-row"></div>';
     document.body.appendChild(bar);
+
+    var eraserCursor = document.createElement('div');
+    eraserCursor.id = 'ink-eraser-cursor';
+    eraserCursor.className = 'ink-eraser-cursor';
+    document.body.appendChild(eraserCursor);
 
     var fab = document.createElement('button');
     fab.type = 'button';
@@ -1219,7 +1299,7 @@ window.__VOLUME_SELECTOR_HTML__ = "<div class=\"wrap\"><header class=\"hero\"><p
         else if (a === 'clear') { if (confirm('Clear all ink on this page?')) clearCurrent(); }
         else if (a === 'export') exportAll();
         else if (a === 'import') document.getElementById('ink-import-input').click();
-        else if (a === 'collapse') { prefs.collapsed = true; savePrefs(); updateToolbarVisibility(!!currentRoute); }
+        else if (a === 'collapse') { prefs.collapsed = true; savePrefs(); updateToolbarVisibility(!!currentRoute); hideEraserCursor(); }
         return;
       }
 
@@ -1359,5 +1439,5 @@ window.__VOLUME_SELECTOR_HTML__ = "<div class=\"wrap\"><header class=\"hero\"><p
   else boot();
 })();
 
-if ('serviceWorker' in navigator) { navigator.serviceWorker.register('sw.js').catch(function(){}); }
+if ('serviceWorker' in navigator) { navigator.serviceWorker.register('sw.js').then(function(reg){ reg.update(); }).catch(function(){}); var swReloadedForUpdate = false; navigator.serviceWorker.addEventListener('controllerchange', function(){ if (swReloadedForUpdate) return; swReloadedForUpdate = true; window.location.reload(); }); }
 </script>

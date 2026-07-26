@@ -250,7 +250,21 @@ def build():
     html.append(engine_js)
     html.append(annotate_js)
     html.append(router_js)
-    html.append("if ('serviceWorker' in navigator) { navigator.serviceWorker.register('sw.js').catch(function(){}); }")
+    # register() alone can leave an iOS home-screen PWA stuck on stale content
+    # for a long time — iOS doesn't reliably re-check sw.js on its own timeline.
+    # reg.update() asks right away instead of waiting on that; skipWaiting +
+    # clients.claim() (in service_worker_js) mean a new SW takes over almost
+    # immediately once found, firing 'controllerchange' — a one-time reload
+    # then picks up the fresh HTML/JS without the user re-adding the icon.
+    html.append(
+        "if ('serviceWorker' in navigator) {"
+        " navigator.serviceWorker.register('sw.js').then(function(reg){ reg.update(); }).catch(function(){});"
+        " var swReloadedForUpdate = false;"
+        " navigator.serviceWorker.addEventListener('controllerchange', function(){"
+        " if (swReloadedForUpdate) return; swReloadedForUpdate = true; window.location.reload();"
+        " });"
+        " }"
+    )
     html.append('</script>')
 
     out_dir = os.path.join(ROOT, "site")
