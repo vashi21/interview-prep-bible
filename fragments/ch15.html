@@ -1,0 +1,210 @@
+<p class="lede">Splitting a system into microservices doesn't make it faster or more reliable by default — it trades one set of problems (a big shared codebase) for another (a network between every two pieces of code that used to just call each other). This chapter is about when that trade is worth it, and the small set of patterns that keep a microservices system from falling over the first time one dependency has a bad day.</p>
+
+<h2><span class="idx">01</span>Monolith vs Microservices vs Modular Monolith</h2>
+<p>A <strong>monolith</strong> is one codebase, built and deployed as a single unit, usually talking to one shared database. A <strong>microservices architecture</strong> splits the system into many independently deployable services, each usually owning its own database, talking to each other over the network. A <strong>modular monolith</strong> is the option interview prep usually skips: one codebase, one deployment, but split internally into modules with clean boundaries and enforced interfaces — closer to microservices in structure, closer to a monolith in how it ships.</p>
+<p>The framing to avoid: "microservices are more scalable, so they're the better architecture." That's not a complete sentence. Scalable at what — request throughput, team headcount, or deployment frequency? Microservices mainly solve an <strong>organizational</strong> scaling problem — many teams shipping independently without stepping on each other — and only sometimes a technical one. A monolith can serve enormous request volume; Shopify, Stack Overflow, and Basecamp all ran (or still run) monoliths at a scale most companies never reach. The real question is never "which architecture is better," it's "which one matches this team's size and this system's failure-isolation needs, right now."</p>
+
+<h3>The decision framework</h3>
+<p>Three questions, answered honestly, cover most of the decision:</p>
+<ul>
+<li><strong>How many engineers are touching this codebase?</strong> A single team of 5-15 engineers rarely benefits from microservices — everyone can hold the whole system in their head, and a shared codebase means one pull request can change a function and every caller of it in one atomic commit. Once you have 5+ teams that need to ship on their own schedule without a cross-team release meeting, the case for splitting gets real.</li>
+<li><strong>Do parts of the system need to deploy, scale, or fail independently?</strong> If your recommendation engine crashing should never take down checkout, and checkout needs to scale to 50x traffic on Black Friday while the recommendation engine doesn't, that's a genuine technical reason to separate them — not just an org chart reason.</li>
+<li><strong>Where is the organizational pain actually showing up?</strong> If deploys are getting scarier and slower because unrelated teams' changes collide in one release train, if one team's slow test suite blocks every other team's deploy, or if on-call for "the app" means paging someone for a bug in code they've never touched — those are signs the monolith has outgrown a single team's ability to own it safely.</li>
+</ul>
+<p>If the honest answer to all three is "small team, no independent-scaling need, no real organizational pain yet," a modular monolith is very often the right call — not a compromise, not a stepping stone you're embarrassed about, but the correct engineering decision for that team's actual size. It keeps the operational simplicity of one deployable thing (one CI pipeline, one set of logs, no distributed tracing needed just to find a bug) while the module boundaries buy you most of the code-organization benefit people reach for microservices to get. When a module's boundary is clean and enforced by the compiler or the build system, pulling it out into its own service later — if the team or the traffic ever justifies it — is a mechanical extraction, not a rewrite.</p>
+
+<div class="callout tradeoff"><p>Microservices buy independent deployability and failure isolation, and they cost you a distributed system: network calls where function calls used to be, eventual consistency where a single transaction used to be, and a whole new category of failure (a service is up but slow, or unreachable, or returning garbage) that a monolith's in-process function calls never have to think about. You are not avoiding complexity by going to microservices — you are moving it from "one complicated codebase" to "many simple codebases and one complicated network."</p></div>
+
+<div class="callout say-this"><p>"I'd start this as a modular monolith with clear module boundaries, not microservices — the team is small enough that one deployable unit is a real advantage, and I'd only split out a module into its own service once a specific team-scaling or independent-scaling need actually shows up, not in anticipation of one."</p></div>
+
+<div class="callout em-angle"><p>An EM-level answer names the org cost directly: splitting into N services usually means you now need N on-call rotations, N sets of dashboards and alerts, N deploy pipelines, and a way to trace one user request across all of them — none of that is free, and none of it is optional once you've split. The decision to go to microservices is as much "are we willing to fund a platform team to run this" as it is a code-architecture call.</p></div>
+
+<div class="table-scroll">
+<table class="spec-table compare">
+<thead><tr><th>Concern</th><th>Monolith</th><th>Modular monolith</th><th>Microservices</th></tr></thead>
+<tbody>
+<tr><td>Deployment unit</td><td>One, for everything</td><td>One, for everything</td><td>One per service, independent</td></tr>
+<tr><td>Team fit</td><td>Single small team</td><td>Single team, or a few teams with respected module ownership</td><td>Several teams that need to ship on their own schedule</td></tr>
+<tr><td>Inter-module calls</td><td>In-process function calls</td><td>In-process, but only through defined module interfaces</td><td>Network calls (HTTP/gRPC) — can fail, can be slow, need retries/timeouts</td></tr>
+<tr><td>Data consistency</td><td>One database, real ACID transactions across modules</td><td>Usually one database still, real transactions</td><td>Each service usually owns its own store; cross-service consistency needs sagas (Ch.13)</td></tr>
+<tr><td>Failure isolation</td><td>A bug anywhere can crash the whole process</td><td>Same process, so still shared fate — but a bad module is easier to find and fix</td><td>One service crashing doesn't crash others, if you've built the resiliency patterns in this chapter</td></tr>
+<tr><td>Operational cost</td><td>Lowest — one thing to build, deploy, and watch</td><td>Low — still one thing to build, deploy, and watch</td><td>High — many pipelines, many dashboards, distributed tracing needed to debug anything</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2><span class="idx">02</span>Service Discovery</h2>
+<p>Once a system has more than one service, and each service runs as several instances behind the scenes, a new problem shows up: <strong>a service instance's network location changes constantly.</strong> Instances scale up under load and scale down when it's quiet. A container crashes and gets rescheduled onto a different machine with a different IP. A deploy replaces every instance with new ones. Hardcoding an IP address or a fixed list of hosts into a caller's config breaks the moment any of that happens. <strong>Service discovery</strong> is the general name for how a caller finds the current, healthy network location of the service it wants to call, without that list being hand-maintained anywhere.</p>
+<p>Every service-discovery setup has the same two moving parts. A <strong>service registry</strong> is a database of "which instances of which service are currently alive and where" — tools like Consul, etcd, or ZooKeeper commonly play this role (Ch.13 covers ZooKeeper's coordination mechanics in more depth). Each service instance <strong>registers itself</strong> on startup and keeps proving it's alive with periodic heartbeats (Ch.13 covers why a heartbeat is only ever a probabilistic signal, not a certainty) — the registry drops an instance that stops heartbeating, so callers are very unlikely to keep getting routed to a dead one once the registry catches up. That "once it catches up" is a real gap, not a formality: between the instance actually dying and its entry expiring in the registry (missed heartbeat cycles, a TTL that hasn't lapsed yet), the registry still lists it as healthy, and a caller can be routed straight into that dead instance. On top of that shared registry, there are two different ways a caller actually uses it.</p>
+
+<h3>Client-side discovery</h3>
+<p>The calling service itself queries the registry directly, gets back a list of healthy instances for the service it wants to call, and picks one — often using a load-balancing rule like round robin, running inside the caller's own process (Ch.5 covers those algorithms). Netflix's Eureka, paired with a client-side load balancer, is the textbook example of this shape. The upside is one less network hop per call, since the caller talks straight to the chosen instance. The downside is that every single service needs discovery-and-load-balancing logic built in, usually via a shared client library — and that library now has to exist in every language your services are written in.</p>
+
+<h3>Server-side discovery</h3>
+<p>The caller doesn't talk to the registry at all. It sends its request to a fixed, well-known address — a load balancer or proxy — which looks up a healthy instance in the registry on the caller's behalf and forwards the request there. AWS's Application Load Balancer paired with an ECS or Kubernetes service registry works this way, and it's what Kubernetes' own built-in <code>Service</code> object does for you by default. The upside is that the calling service stays completely ignorant of discovery — it just calls a stable name, and the platform handles the rest, with no per-language client library needed. The downside is an extra network hop through the load balancer on every call, and that load balancer is now one more piece of shared infrastructure that has to stay healthy.</p>
+
+<div class="callout tradeoff"><p>Client-side discovery trades an extra network hop for logic embedded in every service; server-side discovery trades that embedded logic for a shared hop everyone depends on. Most teams building on Kubernetes today get server-side discovery for free as a platform feature and never write discovery code by hand at all — which is a big part of why client-side discovery libraries like Eureka have become less common than they were a decade ago.</p></div>
+
+<div class="diagram" data-diagram='{
+  "title": "Client-side vs server-side service discovery",
+  "nodes": [
+    {"id":"c1","x":30,"y":60,"w":170,"h":60,"kind":"compute","label":"Caller A","sub":"client-side discovery"},
+    {"id":"reg1","x":330,"y":60,"w":170,"h":60,"kind":"storage","label":"Service Registry","sub":"Consul / etcd / ZooKeeper"},
+    {"id":"i1","x":630,"y":20,"w":170,"h":50,"kind":"compute","label":"Order Svc — instance 1"},
+    {"id":"i2","x":630,"y":90,"w":170,"h":50,"kind":"compute","label":"Order Svc — instance 2"},
+    {"id":"c2","x":30,"y":330,"w":170,"h":60,"kind":"compute","label":"Caller B","sub":"server-side discovery"},
+    {"id":"lb","x":330,"y":330,"w":170,"h":60,"kind":"compute","label":"Load Balancer / Proxy"},
+    {"id":"reg2","x":330,"y":440,"w":170,"h":60,"kind":"storage","label":"Service Registry"},
+    {"id":"i3","x":630,"y":300,"w":170,"h":50,"kind":"compute","label":"Order Svc — instance 1"},
+    {"id":"i4","x":630,"y":370,"w":170,"h":50,"kind":"compute","label":"Order Svc — instance 2"}
+  ],
+  "edges": [
+    {"from":"c1","to":"reg1","label":"1. who is healthy?"},
+    {"from":"reg1","to":"c1","label":"2. instance 2"},
+    {"from":"c1","to":"i2","label":"3. call directly"},
+    {"from":"c2","to":"lb","label":"1. call fixed address"},
+    {"from":"lb","to":"reg2","label":"2. who is healthy?"},
+    {"from":"lb","to":"i4","label":"3. forward"}
+  ]
+}'></div>
+
+<h2><span class="idx">03</span>API Gateway In A Microservices World</h2>
+<p>Ch.3 already introduced the API gateway as a reverse proxy that grew API-specific jobs. In a microservices architecture, that role stops being optional. Without a single entry point, every one of your N services would need to implement its own authentication check, its own per-client rate limiting, and its own routing logic — N copies of the same security-critical code, N chances to get it slightly wrong, and N places to update the day your auth scheme changes.</p>
+<p>An <strong>API gateway</strong> sits in front of all of it and owns those <strong>cross-cutting concerns</strong> — the pieces of logic that aren't specific to any one service's business logic, but that every request needs handled the same way — exactly once, centrally: checking a token before a request is let through, applying rate limits per client, and routing each request to the one service that actually owns it. Individual services get to stay focused on their own logic and can trust that anything reaching them already passed authentication.</p>
+<div class="callout em-angle"><p>For anything beyond a handful of services, writing your own auth-and-rate-limiting layer is rarely the right build-vs-buy call — see Ch.3's version of this same trade-off. The interesting new point at microservices scale is that the gateway becomes a single point of failure for the entire system: if it's down, every service behind it is unreachable even though every service itself is healthy. That's why gateway deployments should always run multiple redundant instances behind their own load balancer, never just one.</p></div>
+
+<h2><span class="idx">04</span>The Four Core Resiliency Patterns</h2>
+<p>Once a system is a network of services calling each other, a slow or broken dependency doesn't just fail its own request — left unhandled, it can cascade and take down every service that calls it, and then every service that calls those services, one hop at a time. Each of these four patterns exists to stop one specific way that cascade starts. They're often used together, and each targets a different failure mode, so knowing which one stops which failure is the actual interview-worthy content here.</p>
+
+<h3>Timeout — stops one slow dependency from freezing its caller</h3>
+<p>A <strong>timeout</strong> is a hard limit on how long a caller will wait for a dependency to respond before giving up and treating the call as failed. The specific failure it prevents: a caller has a limited pool of threads or connections available to make outgoing calls, and a dependency that has gone slow — not down, just slow, which is often worse — will hold onto one of those threads for as long as the caller lets it. With no timeout, every thread eventually calling that slow dependency gets stuck waiting, and once the pool is exhausted the caller can't serve any request at all anymore, even ones that have nothing to do with the slow dependency. A timeout puts a ceiling on how long any one call can hold a thread hostage, so the caller keeps working even while one dependency is in trouble.</p>
+
+<h3>Retry with backoff and jitter — handles transient failures without causing a retry storm</h3>
+<p>A <strong>retry</strong> re-sends a failed request, on the theory that many failures are <strong>transient</strong> — a dropped packet, a momentary blip, a load balancer routing to an instance that was mid-restart — and will succeed on a second try with no other change. The mistake that turns a good idea into an outage-maker is retrying immediately, or retrying every failed caller at the same fixed delay. If a dependency is struggling because it's overloaded, and every one of its callers immediately retries a failed call, you've just multiplied the load on an already-struggling service — that's a <strong>thundering herd</strong>: a retry storm that makes the outage worse instead of helping it recover. Two fixes, almost always used together: <strong>exponential backoff</strong> waits longer between each successive retry (1s, then 2s, then 4s, then 8s…) so retries thin out over time instead of piling on immediately; <strong>jitter</strong> adds a small random amount to each wait so that many callers who all failed at the same instant don't all retry at exactly the same instant either, spreading the retries out instead of sending them as one synchronized wave.</p>
+
+<h3>Circuit breaker — stops piling more doomed requests onto a dependency that's already failing</h3>
+<p>A <strong>circuit breaker</strong> wraps calls to a dependency and tracks its recent failure rate. Once failures cross a threshold, the breaker <strong>opens</strong>: for a cooldown period, it stops sending real requests to that dependency entirely and fails those calls immediately and cheaply on the caller's side, without even attempting the network call. The specific failure it prevents is different from what retries handle: if a dependency is already down or overwhelmed, every caller hammering it with request after request (retries included) doesn't just fail those individual requests — it keeps the dependency's connection pools and CPU busy processing (and failing) doomed requests, which is exactly the load that's stopping it from recovering. An open circuit gives that dependency room to breathe and come back up, instead of the flood of retries and fresh requests actively working against its recovery. After the cooldown, the breaker moves to a <strong>half-open</strong> state, lets a small number of real requests through as a test, and either closes again (dependency looks healthy) or reopens (still failing) based on how those test requests go.</p>
+
+<div class="callout tradeoff"><p>Retry and circuit breaker point in opposite directions on purpose. Retry assumes "this might just be a blip, try again" — the right instinct for a single request hitting a single transient error. Circuit breaker assumes "this dependency has crossed from blip into real outage, stop sending it work" — the right instinct once failures are sustained, not occasional. Using retries without a circuit breaker is how a struggling dependency gets buried under everyone's well-intentioned retry attempts.</p></div>
+
+<h3>Bulkhead — stops one failing dependency from starving calls to a different, healthy dependency</h3>
+<p>A <strong>bulkhead</strong> is a resource pool — threads, connections, or both — dedicated to calls to one specific dependency, isolated from the pools used for every other dependency. The name comes from ship design: a bulkhead is a wall that divides a ship's hull into separate watertight compartments, so a hole in one compartment floods only that compartment instead of sinking the whole ship. The failure it prevents: without isolated pools, a single shared pool of, say, 100 threads serving calls to Dependency A, Dependency B, and Dependency C means that if Dependency A goes slow, calls to A can eventually consume all 100 threads waiting on it (this is the same "slow dependency ties up threads" problem timeouts address alone — bulkheads add a second layer of protection). With no isolation, that leaves zero threads free to call B or C, even though B and C are both completely healthy. A caller just watched an unrelated dependency's problem take down its ability to talk to services that were never in trouble. Give A, B, and C their own separate thread pools of, say, 30-40 each, and A running out of its own pool no longer touches B's or C's capacity at all.</p>
+
+<div class="specsheet">
+  <details>
+    <summary><span class="cat">Failure</span> Which pattern stops which failure mode</summary>
+    <div class="specbody">
+      <ul>
+        <li><strong>Timeout</strong> — a slow (not down) dependency holds a caller's thread/connection forever, eventually exhausting the caller's whole pool.</li>
+        <li><strong>Retry + backoff/jitter</strong> — a single request hits a one-off transient error; naive immediate retries from many callers at once turn into a thundering-herd retry storm.</li>
+        <li><strong>Circuit breaker</strong> — a dependency is in a sustained failure state; continuing to send it fresh requests and retries keeps it from ever getting the headroom to recover.</li>
+        <li><strong>Bulkhead</strong> — one failing dependency exhausts a resource pool that healthy, unrelated dependencies also depend on, taking them down by association.</li>
+      </ul>
+    </div>
+  </details>
+</div>
+
+<div class="callout say-this"><p>"I'd wrap every outbound call to a dependency with a timeout so a slow response can't tie up threads forever, add retries with exponential backoff and jitter for transient errors, wrap the whole thing in a circuit breaker so a sustained outage stops getting hammered with more doomed requests, and give each dependency its own thread pool — a bulkhead — so a failure in one doesn't starve calls to a completely different, healthy dependency."</p></div>
+
+<div class="diagram" data-diagram='{
+  "title": "Bulkhead: isolated pools per dependency vs one shared pool",
+  "nodes": [
+    {"id":"caller","x":30,"y":230,"w":170,"h":70,"kind":"compute","label":"Order Service"},
+    {"id":"poolA","x":330,"y":40,"w":170,"h":60,"kind":"compute","label":"Pool A: 30 threads","sub":"calls to Inventory Svc"},
+    {"id":"poolB","x":330,"y":230,"w":170,"h":60,"kind":"compute","label":"Pool B: 30 threads","sub":"calls to Payment Svc"},
+    {"id":"poolC","x":330,"y":420,"w":170,"h":60,"kind":"compute","label":"Pool C: 30 threads","sub":"calls to Shipping Svc"},
+    {"id":"inv","x":650,"y":40,"w":190,"h":60,"kind":"compute","label":"Inventory Svc","sub":"slow / failing"},
+    {"id":"pay","x":650,"y":230,"w":190,"h":60,"kind":"compute","label":"Payment Svc","sub":"healthy"},
+    {"id":"ship","x":650,"y":420,"w":190,"h":60,"kind":"compute","label":"Shipping Svc","sub":"healthy"}
+  ],
+  "edges": [
+    {"from":"caller","to":"poolA"},
+    {"from":"caller","to":"poolB"},
+    {"from":"caller","to":"poolC"},
+    {"from":"poolA","to":"inv","label":"exhausted here"},
+    {"from":"poolB","to":"pay","label":"unaffected"},
+    {"from":"poolC","to":"ship","label":"unaffected"}
+  ],
+  "groups": [
+    {"x":300,"y":10,"w":230,"h":110,"label":"Isolated — a full Pool A can&#39;t touch B or C"}
+  ]
+}'></div>
+
+<h2><span class="idx">05</span>Strangler Fig: Replacing A Legacy System Without A Big-Bang Rewrite</h2>
+<p>The <strong>strangler fig pattern</strong> is named after a real vine that grows around a host tree and, over years, gradually takes over its structure until nothing of the original tree is left. Applied to software, it's a way to replace a legacy system with a new one incrementally, instead of the high-risk approach of building the whole replacement in isolation and cutting over to it in one big switch.</p>
+<p>The mechanics: put a routing layer — often the same API gateway or reverse proxy already sitting in front of the system — between callers and the legacy system. Build the new system feature by feature (or endpoint by endpoint, or customer-segment by customer-segment), and each time a piece is ready, change the routing layer to send that specific slice of traffic to the new system instead of the old one. The legacy system keeps handling everything that hasn't been migrated yet. Over time, the slice of traffic going to the new system grows and the slice going to the old one shrinks, until eventually nothing is routed to the legacy system at all and it can be safely decommissioned.</p>
+<p>The reason teams reach for this instead of a rewrite: a full rewrite has to reach total feature parity before it can replace anything, which for a real production system routinely takes far longer than planned — and a legacy system frozen mid-rewrite still needs bug fixes and new features the business keeps demanding, which the rewrite team now also has to keep re-applying to a codebase they're trying to retire. Strangler fig avoids the freeze entirely: each migrated slice ships and starts earning its value immediately, is independently testable and independently revertible (route that slice back to the legacy system if the new one has a problem), and the legacy system never needs to be "paused" for the migration to happen around it.</p>
+
+<div class="callout em-angle"><p>This is one of the most common EM-scale interview questions in disguise — "how would you migrate this monolith to microservices" is almost always answered with strangler fig at the top: pick the module with the clearest boundary and the least cross-module coupling first, route its traffic through the gateway to a new service, prove it in production, and repeat. The organizational sell is as important as the technical one: leadership can see incremental, low-risk progress instead of betting the whole migration on a rewrite that either fully lands or fully doesn't.</p></div>
+
+<h2><span class="idx">06</span>Backend-For-Frontend (BFF)</h2>
+<p>A single generic API trying to serve every kind of client — a mobile app, a web app, a smart TV app — tends to end up as a compromise that fits none of them well. A mobile client on a slow connection wants a small, tailored response with only the fields that specific screen needs. A web client might want a richer response because bandwidth isn't the bottleneck. A single shared endpoint either over-fetches for mobile or under-fetches for web, and every new client type adds more conditional logic to the one API everyone shares.</p>
+<p>The <strong>backend-for-frontend (BFF)</strong> pattern gives each frontend type its own dedicated backend layer, built and owned by (or in close partnership with) the team that owns that frontend. A mobile BFF calls the same underlying services as a web BFF, but shapes and trims the response specifically for what the mobile app's screens need. This keeps each frontend team free to evolve their BFF's contract at their own pace, without having to negotiate changes with every other frontend team sharing one generic API — the same organizational-independence argument behind microservices in general, applied specifically to the API layer.</p>
+<div class="callout tradeoff"><p>BFFs remove the "one API trying to please everyone" problem, but they add a real cost: shared logic (say, a discount calculation) now needs to be either duplicated across every BFF or pulled into a shared library that all of them import — and if it's duplicated, it can drift, with mobile and web quietly computing a discount slightly differently after enough independent changes.</p></div>
+
+<h2><span class="idx">07</span>Sidecar Pattern</h2>
+<p>A <strong>sidecar</strong> is a second process that runs alongside a service instance — same host, same pod in Kubernetes terms — handling a cross-cutting concern like networking, retries, encryption, or observability, so the service's own code never has to implement any of it. The name is literal: like a motorcycle's sidecar, it travels attached to the main vehicle but is a physically separate compartment.</p>
+<p>Concretely: instead of every service in five different languages each linking in its own retry logic, its own mTLS (mutual TLS — both sides of a connection prove their identity with certificates, not just the server) handshake code, and its own metrics-emitting library, each service instance gets a small proxy process deployed next to it. All of that service's outbound and inbound traffic flows through its sidecar, which applies retries, timeouts, encryption, and logging uniformly — completely independent of what language or framework the service itself is written in. Envoy is the most widely used sidecar proxy in production today.</p>
+<div class="callout tradeoff"><p>A sidecar per service instance means more running processes, more memory overhead, and one more hop for every network call (service to its own sidecar, sidecar to sidecar, sidecar to the destination service). The trade is worth it precisely because it turns "every service team re-implements retries and mTLS correctly" into "every service gets it for free, identically, regardless of language" — a strong echo of why an API gateway centralizes cross-cutting concerns at the edge, just applied to service-to-service traffic instead of external traffic.</p></div>
+
+<h2><span class="idx">08</span>Service Mesh: Sidecars As Infrastructure</h2>
+<p>A <strong>service mesh</strong> is what you get when the sidecar pattern is applied to every single service in the system, all managed together as one dedicated infrastructure layer for service-to-service traffic — rather than each team hand-configuring its own sidecar independently. A <strong>control plane</strong> (Istio and Linkerd are the two most common) lets operators configure retries, timeouts, circuit breakers, mTLS between every pair of services, and consistent observability (which service called which, how long it took, how often it failed) from one central place, and pushes that configuration out to every sidecar in the mesh automatically. The services themselves stay completely unaware any of this exists — from inside a service's own code, it just makes a plain network call, and the mesh handles the rest around it.</p>
+
+<div class="specsheet">
+  <details>
+    <summary><span class="cat">Discovery</span> Client-side vs server-side service discovery</summary>
+    <div class="specbody">
+      <ul>
+        <li><strong>Client-side</strong> — caller queries the registry itself and picks an instance; one fewer network hop, but every service needs discovery logic (often via a shared client library, e.g. Netflix Eureka).</li>
+        <li><strong>Server-side</strong> — caller sends to a fixed address; a load balancer/proxy looks up a healthy instance for it (e.g. Kubernetes Service); caller stays ignorant of discovery, at the cost of an extra hop.</li>
+      </ul>
+    </div>
+  </details>
+  <details>
+    <summary><span class="cat">Resiliency</span> The four patterns in one line each</summary>
+    <div class="specbody">
+      <ul>
+        <li><strong>Timeout</strong> — caps how long a caller waits, so a slow dependency can't hold a thread forever.</li>
+        <li><strong>Retry + backoff/jitter</strong> — re-sends failed calls after a growing, randomized delay, to fix transient errors without causing a retry storm.</li>
+        <li><strong>Circuit breaker</strong> — stops sending requests to a dependency once its failure rate crosses a threshold, giving it room to recover.</li>
+        <li><strong>Bulkhead</strong> — isolates resource pools per dependency, so one dependency's failure can't starve calls to a different, healthy one.</li>
+      </ul>
+    </div>
+  </details>
+  <details>
+    <summary><span class="cat">Migration</span> Strangler fig, in one line</summary>
+    <div class="specbody">
+      <ul>
+        <li>Route an increasing slice of traffic to the new system through a shared routing layer, leave the rest on the legacy system, and decommission the legacy system only once no traffic points at it anymore.</li>
+      </ul>
+    </div>
+  </details>
+  <details>
+    <summary><span class="cat">Placement</span> Sidecar vs service mesh</summary>
+    <div class="specbody">
+      <ul>
+        <li><strong>Sidecar</strong> — one helper process per service instance, handling networking/observability for that instance.</li>
+        <li><strong>Service mesh</strong> — every service's sidecar, managed together by one control plane (Istio, Linkerd), so retries/mTLS/observability are configured centrally instead of per service.</li>
+      </ul>
+    </div>
+  </details>
+</div>
+
+<div class="flashcards" data-cards='[
+  {"q":"What kind of problem do microservices mainly solve, and what kind do they NOT automatically solve?","a":"Mainly an organizational one — letting many teams deploy independently without a shared release train. They do not automatically make a system faster, cheaper, or more reliable; they trade in-process complexity for distributed-systems complexity."},
+  {"q":"When is a modular monolith the right call, not just a compromise?","a":"When the team is small enough to hold the whole system in its head, when there is no real need for parts of the system to scale or deploy independently, and when the organizational pain (slow deploys, cross-team release collisions) that microservices solve hasn&#39;t shown up yet."},
+  {"q":"What specific problem does service discovery solve?","a":"A service instance&#39;s network location keeps changing as instances scale up/down or get rescheduled onto different machines, so callers need a way to find current, healthy instances instead of relying on a hardcoded address."},
+  {"q":"Client-side vs server-side service discovery — what&#39;s the practical trade-off?","a":"Client-side: the caller queries the registry and picks an instance itself, saving a network hop but requiring discovery logic in every service (often via a shared client library). Server-side: the caller hits a fixed address and a load balancer looks up the instance for it, adding a hop but keeping the caller&#39;s code simple."},
+  {"q":"What problem does an API gateway solve specifically for a microservices architecture?","a":"Without it, every one of N services would need to reimplement authentication, rate limiting, and routing itself. A gateway centralizes those cross-cutting concerns in one place, so services only implement their own business logic."},
+  {"q":"What specific failure does a timeout prevent?","a":"A slow (not necessarily down) dependency holding onto a caller&#39;s thread or connection indefinitely, which — with enough slow calls — exhausts the caller&#39;s whole pool and stops it from serving any request, even unrelated ones."},
+  {"q":"Why is a naive immediate retry dangerous, and what two fixes address it?","a":"If a dependency is struggling and every failed caller retries immediately, the combined retry traffic can overload it further — a thundering herd. Exponential backoff spaces out each successive retry attempt, and jitter adds randomness so many callers don&#39;t retry in one synchronized wave."},
+  {"q":"What specific failure does a circuit breaker prevent that retries alone don&#39;t?","a":"A sustained outage, not a one-off blip. Once failures cross a threshold, the breaker opens and stops sending real requests entirely for a cooldown period, so continued requests and retries stop piling doomed load onto a dependency that needs room to recover."},
+  {"q":"What are the three states of a circuit breaker?","a":"Closed (requests flow normally), open (requests fail immediately without hitting the network, once the failure threshold is crossed), and half-open (a small number of test requests are let through after the cooldown to decide whether to close again or reopen)."},
+  {"q":"What specific failure does a bulkhead prevent?","a":"One failing dependency exhausting a shared resource pool (threads/connections) that calls to a different, completely healthy dependency also depend on — starving the healthy dependency&#39;s traffic by association. Bulkheads give each dependency its own isolated pool."},
+  {"q":"Timeout vs bulkhead — aren&#39;t they solving the same problem?","a":"They&#39;re related but not the same. A timeout limits how long any one call can hold a thread. A bulkhead limits how many threads any one dependency&#39;s calls can hold in total, so even several slow calls to Dependency A (each individually still within its timeout) can&#39;t exhaust the pool that Dependency B&#39;s calls also need."},
+  {"q":"What is the strangler fig pattern, in one line?","a":"Incrementally replacing a legacy system by routing a growing slice of traffic to the new system through a shared routing layer, leaving the rest on the legacy system, until nothing points at the legacy system anymore and it can be retired."},
+  {"q":"Why do teams prefer strangler fig over a big-bang rewrite?","a":"A full rewrite has to reach total feature parity before it can replace anything, which routinely takes longer than planned, while the legacy system still needs bug fixes and new features in the meantime. Strangler fig ships and de-risks one slice at a time, with each slice independently revertible."},
+  {"q":"What is a backend-for-frontend (BFF), and what problem does it solve?","a":"A dedicated backend per frontend type (e.g. one for mobile, one for web) instead of one generic API serving both. It solves the problem of a single shared API becoming a compromise that over-fetches for some clients and under-fetches for others, and lets each frontend team evolve its contract independently."},
+  {"q":"What is a sidecar, and why put cross-cutting logic there instead of in the service&#39;s own code?","a":"A helper process running alongside a service instance (same host or pod) that handles concerns like retries, mTLS, and observability. Putting it in a sidecar means every service gets this behavior uniformly, regardless of what language it&#39;s written in, instead of every team re-implementing it correctly in every service."},
+  {"q":"What is a service mesh, at a high level?","a":"A sidecar deployed next to every service in the system, all managed together by one control plane (e.g. Istio, Linkerd) as a dedicated infrastructure layer for service-to-service traffic — retries, mTLS, and observability configured centrally instead of per service."}
+]'></div>

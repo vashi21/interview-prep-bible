@@ -1,0 +1,253 @@
+<p class="lede">One database on one machine always runs out of room or runs out of speed. This chapter covers the two fixes — splitting data across machines (sharding) and copying data across machines (replication) — and shows exactly how MySQL and MongoDB each do both in production.</p>
+
+<h2><span class="idx">01</span>Why One Box Stops Being Enough</h2>
+<p>A single database server has two hard limits. <strong>Storage</strong>: a disk is only so big, and an index only stays fast up to a certain table size. <strong>Throughput</strong>: one machine can only answer so many reads and writes per second, no matter how good the hardware is.</p>
+<p>There are two independent fixes, and real systems almost always use both together:</p>
+<ul>
+  <li><strong>Partitioning / sharding</strong> — split your data into pieces (shards) so each machine only holds a subset of it. This fixes the storage limit and spreads write load across machines. "Partitioning" and "sharding" mean the same idea; people usually say "partitioning" for splitting inside one database instance and "sharding" for splitting across separate servers.</li>
+  <li><strong>Replication</strong> — copy the same data onto more than one machine. This fixes availability (one machine dying doesn't lose data) and read throughput (more machines can answer read queries).</li>
+</ul>
+<p>The rest of this chapter walks through the three ways to shard, the three ways to replicate, and then shows both concepts as they actually exist inside MySQL (via a routing layer called Vitess) and MongoDB (which has sharding and replication built in).</p>
+
+<h2><span class="idx">02</span>Splitting The Data: Range, Hash, And Directory Sharding</h2>
+<p>Every sharding strategy answers the same question: given a row's shard key (the column value you shard on, usually something like <code>user_id</code>), which machine does this row live on? There are three answers.</p>
+
+<h3>Range-based sharding</h3>
+<p>Sort rows by the shard key and cut the sorted list into contiguous ranges. Shard 1 might hold <code>user_id</code> 1 through 1,000,000; shard 2 holds 1,000,001 through 2,000,000; and so on. A lookup just checks which range a key falls into — no computation needed, and range scans (fetch all users between two IDs) stay on one shard.</p>
+<p>The weakness: if activity isn't spread evenly across the key range, one shard gets overloaded. New users, new posts, and anything with a rising ID or a rising timestamp all pile up at the newest end of the range — one shard takes all the write traffic while older shards sit idle.</p>
+
+<h3>Hash-based sharding</h3>
+<p>Run the shard key through a hash function (a function that turns any input into a fixed-size, evenly-scattered number) and use the result to pick a shard, usually with <code>hash(key) % number_of_shards</code> or, better, consistent hashing (see Ch.5) so adding a shard doesn't reshuffle everything. This spreads load evenly and kills the "hot range" problem.</p>
+<p>The cost: you gave up order. A range query like "all orders from March" now has to ask every shard and merge the results, because March's orders are scattered across all of them by hash.</p>
+
+<h3>Directory-based sharding</h3>
+<p>Keep an explicit lookup table (a directory) that maps each key, or each range of keys, to a specific shard. A router service checks the directory on every request instead of computing an answer with math.</p>
+<p>This is the most flexible option: rebalancing means moving individual rows in the directory, not redesigning a formula. The cost is that the directory itself is now a critical, highly-available service — if it's slow or down, every query is stuck, and it's one more moving part to operate.</p>
+
+<div class="table-scroll">
+  <table class="spec-table">
+    <caption>Range, hash, and directory sharding at a glance</caption>
+    <thead><tr><th>Strategy</th><th>How rows are placed</th><th>Strength</th><th>Weakness</th></tr></thead>
+    <tbody>
+      <tr><td>Range-based</td><td>Sorted, contiguous ranges of the shard key per shard</td><td>Range queries and scans stay on one shard</td><td>Hot ranges — a busy slice of the key space overloads one shard</td></tr>
+      <tr><td>Hash-based</td><td>A hash function maps the shard key to a shard</td><td>Even load, no hot ranges</td><td>Range queries have to fan out to every shard</td></tr>
+      <tr><td>Directory-based</td><td>An explicit lookup table maps key to shard</td><td>Most flexible — rebalance by editing the map</td><td>The lookup service is a new dependency and possible bottleneck</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<div class="callout tradeoff"><p>Hash-based sharding is the safe default for even load, but it trades away every range query you might have wanted. If your access pattern leans on ranges — "give me this week's events," "give me orders since Monday" — a pure hash shard key turns every one of those into a scatter-gather query across the whole cluster.</p></div>
+
+<h2><span class="idx">03</span>Copying The Data: Leader-Follower, Multi-Leader, And Leaderless Replication</h2>
+<p>Once you know how data is split, the next question is how it's copied. There are three topologies.</p>
+
+<h3>Leader-follower (single-leader) replication</h3>
+<p>One node, the leader (also called the primary), accepts all writes. It streams every change to one or more followers (replicas), which apply the same changes in the same order. Reads can go to the leader or to a follower; writes only ever go to the leader.</p>
+<p>This is the simplest topology because there's no ambiguity about write order — one leader decides it. It's what MySQL, PostgreSQL, and a default MongoDB replica set all do.</p>
+
+<h3>Multi-leader (multi-master) replication</h3>
+<p>More than one node accepts writes — commonly one leader per data center — and leaders replicate changes to each other. This gives every region a local leader for low write latency, which matters for multi-region products.</p>
+<p>The price is write conflicts: two leaders can accept a write to the same row at nearly the same time, and the system has to reconcile them (last-write-wins, a merge function, or pushing the decision to the application). This is real complexity that single-leader setups never have to think about.</p>
+
+<h3>Leaderless replication</h3>
+<p>There's no leader at all. A client (or a coordinator node) writes directly to several replicas at once and reads from several replicas at once, then reconciles which value is newest using version information and a quorum rule (see Ch.13 for vector clocks and quorum math, and Ch.9 for how Cassandra does this in detail). DynamoDB and Cassandra both work this way.</p>
+<p>Leaderless systems trade strict ordering for very high write availability — as long as enough replicas are reachable, writes succeed even if some nodes are down or partitioned off.</p>
+
+<h2><span class="idx">04</span>Synchronous Vs Asynchronous Replication, And Read Replicas</h2>
+<p>Independent of topology, every replication link has to decide when to tell the writer "done."</p>
+<ul>
+  <li><strong>Synchronous replication</strong> — the leader waits for a follower to confirm it received (and often applied) the change before telling the client the write succeeded. Safer: if the leader dies the instant after that, the follower already has the data. Slower, and it lowers availability — if that follower is unreachable, the leader can't safely accept the write.</li>
+  <li><strong>Asynchronous replication</strong> — the leader commits and replies to the client immediately, then ships the change to followers in the background. Fast and available, but there's a window where a crash on the leader loses whatever hadn't shipped yet.</li>
+  <li><strong>Semi-synchronous replication</strong> — a practical middle ground: the leader waits for at least one follower to acknowledge it received the change (not necessarily applied it) before committing, then ships to the rest asynchronously. You pay one round trip of latency and get a durability guarantee that the last write isn't only on one machine.</li>
+</ul>
+<p><strong>Read replicas</strong> are followers kept around specifically to serve read traffic, not for failover. If your workload is read-heavy — most web apps are — you point read queries at a pool of replicas and keep the leader free for writes. The catch is replication lag: because that link is almost always asynchronous, a read right after a write can come back stale until the replica catches up. Products that need to read their own writes immediately either route that specific read to the leader or check how far behind the replica is first.</p>
+
+<div class="callout em-angle"><p>An EM-level answer adds the operational side: every read replica you add is another machine someone has to patch, monitor for lag, and fail over correctly. Managed offerings (Amazon RDS read replicas, MongoDB Atlas, PlanetScale for Vitess) absorb a lot of that toil — for a small team, paying for managed replicas is often cheaper than the on-call cost of running them yourselves in year one.</p></div>
+
+<h2><span class="idx">05</span>MySQL In Practice: Sharding And Replication With Vitess</h2>
+<p>Plain MySQL doesn't shard itself — a single MySQL server is a single leader-follower unit. To shard MySQL, most large companies put a routing layer in front of a fleet of MySQL instances. The best-known one is <strong>Vitess</strong>, built at YouTube to scale MySQL for YouTube's own metadata, later open-sourced and now a CNCF project. Vitess's own list of adopters includes YouTube, Slack, GitHub, and Square, among others — Slack has talked publicly about moving its core MySQL fleet onto Vitess once a single-primary database ran out of write capacity for its job.</p>
+<p>Vitess has three main pieces:</p>
+<ul>
+  <li><strong>VTGate</strong> — a stateless query router. Applications connect to VTGate instead of to MySQL directly. It parses each query, figures out which shard(s) it needs using a <strong>Vindex</strong> (a pluggable rule that maps a column value to a shard), and forwards the query there.</li>
+  <li><strong>VTTablet</strong> — a lightweight agent that runs next to every MySQL instance, handling connection pooling, query rewriting, and coordinating with the primary/replica topology for that shard.</li>
+  <li><strong>Topology service</strong> — a small, separate key-value store (typically etcd) holding the cluster's shard map: which shard owns which keyrange, and which MySQL instance is currently the primary for that shard.</li>
+</ul>
+<p>Vindexes are where all three sharding strategies from section 02 actually show up inside Vitess: a <strong>hash vindex</strong> hashes the shard key for even distribution, a plain <strong>range</strong> layout assigns contiguous keyranges to shards, and a <strong>lookup vindex</strong> keeps an explicit table mapping a secondary column (say, an email address) to its shard — that's directory-based sharding, built in.</p>
+<p>Underneath each shard, replication is plain MySQL binlog replication: the primary writes every committed change to its <strong>binlog</strong> (binary log, an ordered record of data changes), and each replica streams that binlog and replays it. Row-based binlog format (logging the actual changed rows) is the safe default; statement-based logging can replay non-deterministic statements — anything using <code>NOW()</code> or a random function — differently on a replica than it ran on the primary. Replication is asynchronous by default; MySQL also offers a semi-sync plugin for the durability guarantee described in section 04. Vitess ships a component called <strong>VTOrc</strong> (Vitess Orchestrator) that watches primary health and automates promoting a replica to primary on failure, then updates the topology service so VTGate starts routing writes to the new primary.</p>
+<p>Each shard's replicas double as that shard's read-replica pool: VTGate can route read-only queries to replicas and writes to the primary, exactly the read-replica pattern from section 04, just scoped per shard instead of per whole database.</p>
+
+<div class="diagram" data-diagram='{
+  "title": "Vitess-sharded MySQL, the model YouTube and Slack use",
+  "nodes": [
+    {"id":"client","x":30,"y":250,"w":150,"h":60,"kind":"external","label":"Application"},
+    {"id":"vtgate","x":230,"y":250,"w":160,"h":60,"kind":"compute","label":"VTGate","sub":"stateless query router"},
+    {"id":"topo","x":750,"y":250,"w":170,"h":60,"kind":"storage","label":"Topology Service","sub":"etcd: shard map"},
+    {"id":"s1p","x":480,"y":80,"w":170,"h":60,"kind":"storage","label":"Shard 1: Primary"},
+    {"id":"s1r","x":480,"y":170,"w":170,"h":60,"kind":"storage","label":"Shard 1: Replica","sub":"binlog stream, serves reads"},
+    {"id":"s2p","x":480,"y":340,"w":170,"h":60,"kind":"storage","label":"Shard 2: Primary"},
+    {"id":"s2r","x":480,"y":430,"w":170,"h":60,"kind":"storage","label":"Shard 2: Replica","sub":"binlog stream, serves reads"}
+  ],
+  "edges": [
+    {"from":"client","to":"vtgate","label":"query"},
+    {"from":"vtgate","to":"topo","label":"shard map lookup"},
+    {"from":"vtgate","to":"s1p","label":"route by vindex"},
+    {"from":"vtgate","to":"s2p","label":"route by vindex"},
+    {"from":"s1p","to":"s1r","label":"binlog"},
+    {"from":"s2p","to":"s2r","label":"binlog"}
+  ],
+  "groups": [
+    {"x":460,"y":60,"w":210,"h":190,"label":"Shard 1 (keyrange -80)"},
+    {"x":460,"y":320,"w":210,"h":190,"label":"Shard 2 (keyrange 80-)"}
+  ]
+}'></div>
+
+<div class="callout say-this"><p>"I'd default to a hash vindex on the primary key so writes spread evenly across shards. I'd only reach for range-based sharding if the dominant query pattern is a range scan on that same key — like pulling a contiguous block of time-series events — because that's the one case where losing locality actually costs more than the hot-shard risk."</p></div>
+
+<h2><span class="idx">06</span>MongoDB In Practice: Shard Keys, Chunks, The Balancer, Config Servers, And Mongos</h2>
+<p>Unlike MySQL, sharding is built into MongoDB itself — you don't bolt on a separate routing layer. But that also means one decision, the shard key, is much harder to change after the fact.</p>
+
+<h3>Choosing a shard key</h3>
+<p>The <strong>shard key</strong> is the field (or combination of fields) MongoDB uses to decide which shard a document lives on. Every write and every targeted read goes through this key, so picking it well is close to the single most important decision in a MongoDB sharded design.</p>
+<p>The classic mistake is a <strong>monotonically increasing key</strong> — a field that only ever goes up, like an auto-generated timestamp, an incrementing counter, or MongoDB's own default <code>ObjectId</code> (which embeds a creation timestamp, so it's roughly increasing too). Every new document has the highest value seen so far, so every new document lands in the same range: the top of the key space, which lives on one shard. That shard becomes a hot spot for 100% of write traffic while every other shard sits idle.</p>
+<p>This is exactly why MongoDB also offers <strong>hashed sharding</strong> — hash the shard key's value before using it to pick a shard, the same idea as Vitess's hash vindex. It spreads writes evenly, at the cost of range queries on that key now scattering across every shard, the same trade-off from section 02.</p>
+
+<div class="callout tradeoff"><p>The balancer (below) can't fix a monotonic-key hot spot by splitting chunks. Splitting only relocates already-written, cooling data into its own chunk — new inserts still keep landing at the tail of the range, on whichever chunk currently owns the maximum value, which usually stays on the same shard. The fix has to happen at shard-key design time: hash the key, or prefix it with something that varies (like a hashed user segment), not after the collection is already sharded and hot.</p></div>
+
+<div class="callout"><p>For a long time, a collection's shard key was fixed for life once chosen. Newer MongoDB versions added ways to refine a shard key (add a more selective suffix field) or fully reshard a collection online, but both are heavy, cluster-wide operations — which is exactly why this decision gets so much attention before launch instead of after.</p></div>
+
+<h3>Chunks and the balancer</h3>
+<p>MongoDB groups contiguous ranges of shard-key values into <strong>chunks</strong>. Each chunk is capped at roughly 128 MB by default; once inserts push a chunk over that size, MongoDB automatically splits it into two smaller chunks.</p>
+<p>The <strong>balancer</strong> is a background process that watches how many chunks (and how much data) sit on each shard, and migrates chunks from over-loaded shards to under-loaded ones so the cluster stays roughly even. It's the same underlying job as manually rebalancing a directory-based shard map, just automated.</p>
+
+<h3>Config servers and mongos</h3>
+<p>Three (or more) dedicated nodes called <strong>config servers</strong> store the cluster's metadata: which shard currently owns which chunk, and the shard-key ranges that define every chunk. Since config servers hold data no one can afford to lose, they run as their own small replica set, usually called the <strong>CSRS</strong> (config server replica set) — the metadata store has the same failover story as any other replica set, see the next section.</p>
+<p>Applications never talk to a shard directly. They connect to <strong>mongos</strong>, a stateless query router — the direct equivalent of Vitess's VTGate. Mongos reads the chunk map from the config servers, works out which shard(s) hold the data for a query's shard-key value, and forwards the query there. A query that omits the shard key can't be routed to one shard, so mongos has to broadcast it to every shard and merge the results — called a <strong>scatter-gather query</strong> — which is far slower and doesn't get cheaper as you add shards.</p>
+
+<div class="diagram" data-diagram='{
+  "title": "MongoDB sharded cluster: mongos, config servers, and per-shard replica sets",
+  "nodes": [
+    {"id":"client","x":30,"y":250,"w":150,"h":60,"kind":"external","label":"Application"},
+    {"id":"mongos","x":230,"y":250,"w":160,"h":60,"kind":"compute","label":"mongos","sub":"stateless query router"},
+    {"id":"cfg","x":230,"y":400,"w":160,"h":55,"kind":"storage","label":"Config Server RS","sub":"chunk map (CSRS)"},
+    {"id":"balancer","x":760,"y":280,"w":190,"h":55,"kind":"compute","label":"Balancer","sub":"migrates chunks"},
+    {"id":"saP","x":480,"y":60,"w":190,"h":55,"kind":"storage","label":"Shard A: Primary"},
+    {"id":"saS","x":480,"y":145,"w":190,"h":55,"kind":"storage","label":"Shard A: Secondary","sub":"oplog replication"},
+    {"id":"sbP","x":480,"y":280,"w":190,"h":55,"kind":"storage","label":"Shard B: Primary"},
+    {"id":"sbS","x":480,"y":365,"w":190,"h":55,"kind":"storage","label":"Shard B: Secondary","sub":"oplog replication"}
+  ],
+  "edges": [
+    {"from":"client","to":"mongos","label":"query"},
+    {"from":"mongos","to":"cfg","label":"chunk map lookup"},
+    {"from":"mongos","to":"saP","label":"route by shard key"},
+    {"from":"mongos","to":"sbP","label":"route by shard key"},
+    {"from":"saP","to":"saS","label":"oplog"},
+    {"from":"sbP","to":"sbS","label":"oplog"},
+    {"from":"balancer","to":"saP","label":"migrate chunk"},
+    {"from":"balancer","to":"sbP","label":"migrate chunk"}
+  ],
+  "groups": [
+    {"x":460,"y":40,"w":230,"h":180,"label":"Shard A (replica set)"},
+    {"x":460,"y":260,"w":230,"h":180,"label":"Shard B (replica set)"}
+  ]
+}'></div>
+
+<h2><span class="idx">07</span>MongoDB Replication: Replica Sets And Failover</h2>
+<p>Every shard in a sharded MongoDB cluster — and the config server group itself — is a <strong>replica set</strong>: one primary handling all writes, plus two or more secondaries. This is plain leader-follower replication (section 03), just MongoDB's specific implementation of it.</p>
+<p>Secondaries continuously copy the primary's <strong>oplog</strong> (operations log) — MongoDB's equivalent of MySQL's binlog, an ordered record of every write — and replay it to stay in sync. Replication is asynchronous by default: the primary acknowledges a write as soon as it's applied locally, before any secondary has it. Setting write concern to <code>majority</code> makes the primary wait until a majority of replica-set members have acknowledged the write before it tells the client the write succeeded — MongoDB's version of the synchronous / semi-synchronous trade-off from section 04, applied per write instead of as a fixed server setting.</p>
+<p>If the primary becomes unreachable, the remaining members run an election — a Raft-like consensus protocol (see Ch.12) — and promote one secondary to primary, typically within about 10 seconds by default. Mongos and drivers detect the new primary automatically and redirect writes to it; no manual DNS or config change is needed.</p>
+
+<h2><span class="idx">08</span>Same Concept, How SQL Does It, How Mongo Does It</h2>
+<p>Put side by side, MySQL-with-Vitess and MongoDB solve the exact same set of problems with different names for nearly identical pieces.</p>
+
+<div class="table-scroll">
+  <table class="spec-table compare">
+    <caption>Same concept, how SQL does it, how Mongo does it</caption>
+    <thead><tr><th>Concept</th><th>MySQL (with Vitess)</th><th>MongoDB</th></tr></thead>
+    <tbody>
+      <tr><td>Sharding mechanism</td><td>Vindexes: hash, range, or lookup (directory) vindex per table</td><td>A single shard key per collection, using a range or hashed strategy</td></tr>
+      <tr><td>Query routing</td><td>VTGate — stateless router, resolves shard via Vindex</td><td>mongos — stateless router, resolves shard via chunk map</td></tr>
+      <tr><td>Cluster metadata store</td><td>Topology service (etcd), holds the shard map</td><td>Config server replica set (CSRS), holds the chunk map</td></tr>
+      <tr><td>Rebalancing</td><td>Manual/scripted resharding of keyranges (Vitess reshard workflow)</td><td>Automatic balancer migrates chunks in the background</td></tr>
+      <tr><td>Replication topology</td><td>Leader-follower per shard; MySQL binlog streamed to replicas</td><td>Leader-follower per shard (a replica set); oplog streamed to secondaries</td></tr>
+      <tr><td>Sync vs async</td><td>Asynchronous by default; semi-sync plugin for a durability guarantee</td><td>Asynchronous by default; write concern <code>majority</code> for the same guarantee</td></tr>
+      <tr><td>Failover</td><td>VTOrc detects a dead primary and promotes a replica</td><td>Replica-set members run a Raft-like election automatically</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<div class="specsheet">
+  <details>
+    <summary><span class="cat">Sharding</span> Range vs hash vs directory, one line each</summary>
+    <div class="specbody">
+      <ul>
+        <li><strong>Range</strong> — contiguous key ranges per shard; cheap range scans, risk of hot ranges.</li>
+        <li><strong>Hash</strong> — hash the key to pick a shard; even load, range queries fan out.</li>
+        <li><strong>Directory</strong> — explicit key-to-shard lookup table; flexible, adds a dependency.</li>
+      </ul>
+    </div>
+  </details>
+  <details>
+    <summary><span class="cat">Vitess</span> The pieces of a Vitess deployment</summary>
+    <div class="specbody">
+      <ul>
+        <li><strong>VTGate</strong> — stateless query router apps connect to.</li>
+        <li><strong>VTTablet</strong> — agent running alongside each MySQL instance.</li>
+        <li><strong>Vindex</strong> — the rule (hash/range/lookup) mapping a column to a shard.</li>
+        <li><strong>Topology service</strong> — etcd-backed store of the shard map.</li>
+        <li><strong>VTOrc</strong> — watches primary health, automates failover.</li>
+      </ul>
+    </div>
+  </details>
+  <details>
+    <summary><span class="cat">Mongo</span> The pieces of a sharded MongoDB cluster</summary>
+    <div class="specbody">
+      <ul>
+        <li><strong>mongos</strong> — stateless query router apps connect to.</li>
+        <li><strong>Shard</strong> — a replica set holding one slice of the data.</li>
+        <li><strong>Chunk</strong> — a contiguous range of shard-key values, capped at roughly 128 MB.</li>
+        <li><strong>Balancer</strong> — background process migrating chunks to keep shards even.</li>
+        <li><strong>Config server (CSRS)</strong> — replica set holding the chunk map.</li>
+      </ul>
+    </div>
+  </details>
+  <details>
+    <summary><span class="cat">Replication</span> Leader-follower vs multi-leader vs leaderless</summary>
+    <div class="specbody">
+      <ul>
+        <li><strong>Leader-follower</strong> — one writer, others copy it. Simple, no write conflicts.</li>
+        <li><strong>Multi-leader</strong> — several writers, usually one per region. Needs conflict resolution.</li>
+        <li><strong>Leaderless</strong> — any replica takes writes; reconciled by quorum. Highest write availability.</li>
+      </ul>
+    </div>
+  </details>
+  <details>
+    <summary><span class="cat">Durability</span> Sync, async, semi-sync, and write concern</summary>
+    <div class="specbody">
+      <ul>
+        <li><strong>Synchronous</strong> — wait for a replica to confirm before acknowledging the write. Safe, slower.</li>
+        <li><strong>Asynchronous</strong> — acknowledge immediately, replicate in the background. Fast, riskier on crash.</li>
+        <li><strong>Semi-sync (MySQL)</strong> — wait for one replica to receive (not apply) the change.</li>
+        <li><strong>Write concern majority (MongoDB)</strong> — wait for a majority of replica-set members to acknowledge.</li>
+      </ul>
+    </div>
+  </details>
+</div>
+
+<div class="flashcards" data-cards='[
+  {"q":"What is the core trade-off between range-based and hash-based sharding?","a":"Range-based keeps sorted, contiguous key ranges together, so range queries stay on one shard but a busy range can overload it. Hash-based spreads keys evenly via a hash function, killing hot ranges, but forces range queries to fan out to every shard."},
+  {"q":"What does directory-based sharding add that hashing can&#39;t give you?","a":"An explicit key-to-shard lookup table you can edit directly to rebalance, instead of redesigning a hash formula — at the cost of running that lookup service as another highly available component."},
+  {"q":"What does Vitess&#39;s VTGate do?","a":"It is a stateless query router applications connect to instead of MySQL directly. It uses a Vindex to work out which shard(s) a query&#39;s key belongs to and forwards the query there."},
+  {"q":"Name real systems that shard MySQL using Vitess.","a":"YouTube, where Vitess was built to scale its own metadata, and Slack, which has talked publicly about moving its core MySQL fleet onto Vitess. GitHub and Square are also public adopters."},
+  {"q":"What is a Vitess lookup vindex?","a":"An explicit table mapping a secondary column value to its shard — directory-based sharding, built into Vitess as one of its Vindex types alongside hash and range vindexes."},
+  {"q":"What is MySQL&#39;s binlog, and what two things is it used for?","a":"The binary log — an ordered record of every committed data change. Replicas stream and replay it to stay in sync, and it also powers point-in-time recovery."},
+  {"q":"Synchronous vs asynchronous replication — what is the real trade-off?","a":"Synchronous waits for a replica to acknowledge before confirming the write (safer, slower, less available if that replica is down). Asynchronous acknowledges immediately and ships changes in the background (faster, but a crash right after commit can lose the last few writes)."},
+  {"q":"What is semi-synchronous replication in MySQL?","a":"A middle ground: the primary waits for at least one replica to acknowledge it received the change, not that it applied it, before committing — one round trip of latency for a durability guarantee."},
+  {"q":"Leader-follower vs multi-leader vs leaderless — one line each.","a":"Leader-follower: one node takes writes, others replicate from it, no write conflicts. Multi-leader: several nodes accept writes and replicate to each other, needed for multi-region write locality but writes can conflict. Leaderless: any replica can take a write directly, reconciled by quorum."},
+  {"q":"Why is a read replica sensitive to replication lag?","a":"Because replication to it is usually asynchronous, so a read right after a write on the primary can return stale data until the replica catches up — the read-your-writes problem."},
+  {"q":"Why is a monotonically increasing field a bad MongoDB shard key?","a":"Every new insert has the highest value seen so far, so all new writes land in the same chunk at the top of the range, on one shard. That shard becomes a hot spot for every write, and splitting the chunk only relocates old data — it does not stop new writes from hitting the same spot."},
+  {"q":"What does MongoDB&#39;s balancer actually do?","a":"It is a background process that migrates chunks between shards to keep the amount of data roughly even across the cluster."},
+  {"q":"What are MongoDB config servers, and why do they run as a replica set?","a":"They store the cluster&#39;s metadata — which shard owns which chunk. They run as their own small replica set (the CSRS) so that metadata store itself has no single point of failure."},
+  {"q":"What is a scatter-gather query in a sharded MongoDB cluster?","a":"A query that omits the shard key, so mongos cannot route it to one shard. It broadcasts the query to every shard and merges the results, which is much slower and does not get cheaper as you add shards."},
+  {"q":"How does a MongoDB replica set fail over?","a":"The secondaries detect the primary is unreachable and run a Raft-like election among themselves, promoting one secondary to primary, typically within about 10 seconds by default."},
+  {"q":"What is the MongoDB equivalent of MySQL&#39;s binlog?","a":"The oplog (operations log) — an ordered record of writes that secondaries continuously copy and replay to stay in sync with the primary."}
+]'></div>

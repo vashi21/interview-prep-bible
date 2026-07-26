@@ -1,0 +1,2004 @@
+<p class="lede">Every problem in this chapter moves a small piece of state — a chat message, a bid, a cursor position, a six-digit code — from one place to many places, fast, without losing it. The interesting design choices all come down to two questions: who else needs to find out about this write, and how strictly does everyone have to agree on the order it happened in?</p>
+
+<h2><span class="idx">00</span>How to use this chapter</h2>
+<p>Fourteen problems, but not fourteen unrelated systems. Nearly every deep dive below is a specific combination of a small number of ideas from earlier chapters: persistent connections and connection scaling (Ch.3), sharding (Ch.6), queues (Ch.14), consistency models (Ch.12), and distributed locks (Ch.13). Read this chapter as pattern-matching practice, not memorization — when you reach problem nine, the goal is to recognize "this is the same fan-out shape as problem two, just eventually consistent instead of encrypted," not to start from a blank page. The five entries below name the combinations that keep coming back, so you have a name for each one before you meet it inside a full write-up.</p>
+<div class="specsheet">
+  <details>
+    <summary><span class="cat">Fan-out</span> Mailbox-per-recipient vs. shared-log-with-cursor</summary>
+    <div class="specbody">
+      <ul>
+        <li><strong>Mailbox-per-recipient</strong> — every recipient (or every device) gets its own copy of the message. Forced whenever content is end-to-end encrypted, because the server cannot decrypt one copy and hand it out to whoever asks. Cost scales with recipient count. Used by WhatsApp/Messenger.</li>
+        <li><strong>Shared log with a read cursor</strong> — one append-only log per channel or document; every reader just tracks a pointer ("I have seen up to message #48,213"). The write is O(1) no matter how many people are watching. Works only when the server is allowed to read the content. Used by Slack/Discord, the webinar Q&amp;A ranking, and presence "last seen" state.</li>
+        <li><strong>Broker relay</strong> — when two participants can land on different stateful servers (two ends of a WebSocket, two signaling servers), a shared pub/sub channel or topic (Redis Pub/Sub, Kafka) in the middle republishes to whichever server is actually holding the relevant socket, instead of servers talking to each other directly.</li>
+      </ul>
+    </div>
+  </details>
+  <details>
+    <summary><span class="cat">Transport</span> A persistent connection still needs a broker to cross servers</summary>
+    <div class="specbody">
+      <ul>
+        <li>A WebSocket is sticky to one server, but the two people in a conversation, a call, or a document rarely land on the same one.</li>
+        <li>The fix that repeats across this chapter: each gateway server subscribes to a per-room, per-channel, or per-shard broker topic and republishes anything it receives to its own local sockets. Video-call signaling, Slack fan-out, the collaborative whiteboard, presence, and support chat all use this exact shape.</li>
+        <li>This is also why "the signaling/control server can crash and restart without dropping the call" is a recurring claim — the broker and the actual media/data session are independent of any one gateway process.</li>
+      </ul>
+    </div>
+  </details>
+  <details>
+    <summary><span class="cat">Consistency</span> Eventual by default; strict only when order changes the outcome</summary>
+    <div class="specbody">
+      <ul>
+        <li>Most of this chapter is deliberately eventually consistent: presence status, viewer counts, chat delivery, CRDT document merges. A few seconds of staleness is invisible to a human, so paying for strong consistency there would be waste.</li>
+        <li>The exception: when two concurrent writes racing each other changes who wins, not just what the final display looks like. A live auction's highest bid and an OTP's one-time verification are the two cases in this chapter where eventual consistency is the wrong answer — both use a single-writer or atomic check-and-set instead of "it will catch up."</li>
+        <li>The tell in an interview: ask yourself "if this write and that write arrive in the opposite order, does the correct answer change?" If yes, you need strict ordering.</li>
+      </ul>
+    </div>
+  </details>
+  <details>
+    <summary><span class="cat">Merge</span> OT vs. CRDT — the one-question test</summary>
+    <div class="specbody">
+      <ul>
+        <li>Ask: do concurrent operations commute (does applying them in either order give the same result)?</li>
+        <li><strong>Yes</strong> — independent whiteboard shapes, or any case where you need true offline, peer-to-peer editing — pick a CRDT (conflict-free replicated data type). No central referee is needed, but you pay for it in permanent metadata (unique IDs, tombstones) that can outgrow the visible content.</li>
+        <li><strong>No</strong> — text where every character's position depends on everything before it, or anything where arrival order itself determines the outcome — you need a central sequencer: OT (operational transformation) for documents, or a single-writer lock for something like a bid.</li>
+      </ul>
+    </div>
+  </details>
+  <details>
+    <summary><span class="cat">Isolation</span> Keep the bursty path from starving the one that must not fail</summary>
+    <div class="specbody">
+      <ul>
+        <li>A recurring move in this chapter: give a latency-critical or correctness-critical path its own infrastructure, so a burst somewhere else can never borrow its capacity.</li>
+        <li>Examples: the signaling plane is separate from the media plane in a video call; a recording worker pool is separate from the live SFU it is recording; a webinar's Q&amp;A write burst is separate from its CDN video path; a transactional OTP or notification queue is separate from a bulk marketing queue.</li>
+        <li>The giveaway phrase to listen for in your own answer: "...must never be able to degrade..." — if you catch yourself saying that, you are describing this pattern.</li>
+      </ul>
+    </div>
+  </details>
+</div>
+<article class="problem">
+  <h3>Design WhatsApp/Messenger (1:1 and Group Chat, End-to-End Encryption)</h3>
+
+  <h4>Problem framing</h4>
+  <p>Strip away the branding and this is a system that moves a short piece of text or media from one phone to
+  another (or to several phones, for a group), as fast as possible, and holds onto it safely if the recipient
+  is offline. The twist that makes it hard is end-to-end encryption: the servers that route the message are
+  not allowed to read it. Everything the backend normally does to make messaging easy — search, spam
+  filtering, generating previews — has to happen on an encrypted blob it cannot open.</p>
+
+  <h4>Clarifying questions</h4>
+  <ul>
+    <li><strong>What is the maximum group size?</strong> — a 8-person family group and a 1,000-person
+    community group need very different fan-out strategies. Real apps cap this (WhatsApp: 1,024 members
+    per group at the time of writing) precisely so the fan-out cost stays bounded.</li>
+    <li><strong>Do we need to support the same account on multiple devices at once</strong> (phone, web,
+    desktop)? — this multiplies the encryption and delivery work per message by the number of active
+    devices, because the server never has a single decryptable copy it can hand out to whichever device
+    asks.</li>
+    <li><strong>How long do we hold an undelivered message for an offline user?</strong> — a day, a month,
+    forever? This sets the size of the offline-delivery store and whether we ever give up and drop a message.</li>
+    <li><strong>Are media attachments (photos, voice notes, video) in scope, and do we keep them on the
+    server after delivery?</strong> — most messaging apps delete media from the server once every device
+    has fetched it, which is very different from a social app that keeps every photo forever.</li>
+    <li><strong>Do we need delivery and read receipts?</strong> — this adds a second, lighter-weight message
+    stream (acknowledgements) that also has to survive the sender being offline when the ack arrives.</li>
+  </ul>
+
+  <h4>Requirements</h4>
+  <p><strong>Functional:</strong> send and receive 1:1 and group text/media messages; preserve per-chat message
+  order; queue messages for offline recipients and deliver them on reconnect; support delivery and read
+  receipts; support the same account signed in on multiple devices; end-to-end encrypt message content so
+  only the sender's and recipients' devices can read it.</p>
+  <p><strong>Non-functional:</strong> low latency when both parties are online (well under a second, in-region);
+  durability — an accepted message must never be silently lost, even if the recipient is offline for weeks;
+  horizontal scalability to hundreds of millions of concurrently connected devices; privacy by construction,
+  not by policy — the operator of the servers should not be able to read message content even if compelled to.</p>
+
+  <h4>Capacity estimate</h4>
+  <p>Assume a platform with 1 billion daily active users (DAU), each sending an average of 40 messages a day
+  across 1:1 and group chats combined. Assume 80% of sends are 1:1 and 20% go to groups with an average of
+  8 members each.</p>
+  <pre><code>Messages sent/day        = 1,000,000,000 users x 40 = 40,000,000,000 (40B)
+Average send QPS         = 40B / 86,400s ~= 463,000 msgs/sec
+Peak send QPS (3x)       ~= 1,390,000 msgs/sec
+
+Deliveries (fan-out), not sends:
+  1:1 deliveries          = 32B sends x 1 recipient        = 32B
+  Group deliveries        = 8B sends x 7 other members     = 56B
+  Total deliveries/day    = 88B
+Average delivery QPS     = 88B / 86,400s ~= 1,020,000 /sec
+Peak delivery QPS (3x)   ~= 3,060,000 /sec
+
+Text storage (offline queue, short TTL, ~200 bytes/msg incl. metadata):
+  40B msgs/day x 200 bytes = 8 TB/day written, mostly deleted within hours once delivered
+
+Media (assume 15% of sends carry a photo/voice note, avg 300 KB compressed):
+  40B x 15% = 6B media messages/day
+  6B x 300 KB = 1.8 PB/day passing through blob storage (transient — deleted after all
+  recipients download it or after a ~30-day TTL, not retained forever like a social feed)
+  Average ingest bandwidth ~= 1.8 PB / 86,400s ~= 21 GB/sec
+
+Concurrent connections (persistent sockets held open for push delivery):
+  Assume 30% of DAU online at once at peak = 300,000,000 concurrent connections
+  At ~50,000 sockets/gateway server -> ~6,000 gateway servers just to hold connections
+</code></pre>
+  <p>The headline number for an interview is not the storage — it is the 300 million concurrent long-lived
+  connections and the 3 million deliveries/sec at peak. That is a connection-management and fan-out problem
+  more than a database problem.</p>
+
+  <h4>API design</h4>
+  <p>The primary transport is a persistent connection (WebSocket or a custom binary protocol over TCP), not
+  request/response REST, because the server needs to push messages to idle clients (see Ch.3 for why
+  WebSockets beat polling here). REST/gRPC still handles setup and key exchange:</p>
+  <pre><code>-- Over the persistent socket, once authenticated:
+SEND   { toUserId | toGroupId, ciphertext, msgId, deviceId, senderKeyEpoch }
+ACK    { msgId, status: delivered | read }
+
+-- REST for everything that is not "send a message right now":
+POST /keys/prekeys                       publish this device's prekey bundle
+GET  /keys/prekeys/{userId}/{deviceId}   fetch a prekey bundle to start a new session
+POST /media/upload-url                   get a presigned URL to upload an attachment
+GET  /messages/sync?since={cursor}       multi-device backlog pull (fallback / catch-up)
+POST /groups/{id}/members                add/remove a group member (triggers key rotation)
+</code></pre>
+
+  <h4>High-level design</h4>
+  <p>A message from Client A reaches the gateway fleet over its open socket, gets routed by chat ID, is
+  durably appended, and then either pushed straight to an online recipient or parked in an offline queue
+  that wakes the recipient with a silent push when they come back.</p>
+  <div class="diagram" data-diagram='{
+    "title": "WhatsApp-style 1:1 and group message delivery",
+    "nodes": [
+      {"id":"client_a","x":20,"y":30,"w":150,"h":60,"kind":"external","label":"Client A, Sender"},
+      {"id":"client_b","x":20,"y":230,"w":150,"h":60,"kind":"external","label":"Client B, Recipient (online)"},
+      {"id":"client_c","x":20,"y":430,"w":150,"h":60,"kind":"external","label":"Client C, Recipient (offline)"},
+      {"id":"gateway","x":250,"y":120,"w":190,"h":70,"kind":"compute","label":"Connection Gateway Fleet (WebSocket, sticky by user_id)"},
+      {"id":"presence","x":250,"y":320,"w":190,"h":60,"kind":"storage","label":"Presence and Session Store (Redis)"},
+      {"id":"router","x":520,"y":30,"w":190,"h":60,"kind":"compute","label":"Message Router and Fan-out Service"},
+      {"id":"groupsvc","x":520,"y":320,"w":190,"h":60,"kind":"compute","label":"Group Membership Service"},
+      {"id":"msgstore","x":790,"y":30,"w":190,"h":60,"kind":"storage","label":"Message Store (Cassandra, per-chat log)"},
+      {"id":"offlineq","x":790,"y":150,"w":190,"h":60,"kind":"queue","label":"Per-Recipient Offline Queue"},
+      {"id":"pushsvc","x":520,"y":430,"w":190,"h":60,"kind":"compute","label":"Push Notification Fan-out"},
+      {"id":"keysvc","x":790,"y":270,"w":190,"h":60,"kind":"storage","label":"Prekey and Identity Key Store"},
+      {"id":"media","x":790,"y":390,"w":190,"h":70,"kind":"external","label":"Media Blob Store and CDN"}
+    ],
+    "edges": [
+      {"from":"client_a","to":"gateway","label":"1. send ciphertext (WSS)"},
+      {"from":"gateway","to":"router","label":"2. route envelope"},
+      {"from":"router","to":"groupsvc","label":"resolve group members"},
+      {"from":"router","to":"presence","label":"check recipient online"},
+      {"from":"router","to":"msgstore","label":"append to chat log"},
+      {"from":"router","to":"gateway","label":"3a. deliver, recipient online"},
+      {"from":"gateway","to":"client_b","label":"push ciphertext"},
+      {"from":"router","to":"offlineq","label":"3b. offline: enqueue"},
+      {"from":"offlineq","to":"pushsvc","label":"trigger wake-up"},
+      {"from":"pushsvc","to":"client_c","label":"silent push, APNs or FCM"},
+      {"from":"client_c","to":"gateway","label":"reconnect, pull backlog"},
+      {"from":"client_a","to":"keysvc","label":"fetch prekey bundle, new session"}
+    ],
+    "groups": [
+      {"x":230,"y":10,"w":490,"h":390,"label":"Stateless service tier, scales horizontally (only gateway needs sticky routing)"}
+    ]
+  }'></div>
+
+  <h4>Deep dive</h4>
+  <p><strong>Key management for groups: sender keys, not pairwise ratchets.</strong> Real end-to-end
+  encrypted messaging (Signal Protocol, which both WhatsApp and Messenger's secret chats are built on) starts
+  a 1:1 session with X3DH (a key-agreement handshake using pre-published one-time keys) and then advances a
+  Double Ratchet — a new encryption key derived for every message, so that leaking one key never exposes past
+  or future messages. Doing that pairwise for a group of 8 would mean encrypting the same message 7 times.
+  WhatsApp's actual answer is a <strong>sender key</strong>: each device encrypts a group message once with
+  a key it distributes to the other members over their existing pairwise sessions. That drops the crypto cost
+  from O(members) to O(1) per send, at a real cost: when someone leaves the group, everyone must rotate to a
+  new sender key, or the removed member could still decrypt anything encrypted with the old one they still hold.</p>
+  <p><strong>Ordering within a chat, not across the whole system.</strong> Nobody needs a global order across
+  every conversation on the platform — they need "did my last message land before or after theirs, in this
+  one chat." Treat each chat (or group) as its own partition with a single point of sequencing, the same way
+  Ch.14 assigns a Kafka partition key per entity to keep per-key order without needing a single global writer.
+  This is also why the offline queue in the diagram is per-recipient: with content encrypted, the server
+  cannot merge or deduplicate by looking at the payload, so ordering and delivery state have to be tracked
+  by ID, not by inspecting the message.</p>
+  <p><strong>Multi-device fan-out multiplies everything.</strong> Once a user can be logged in on a phone, a
+  laptop, and a browser at once, there is no single "the recipient's copy" — each logged-in device needs its
+  own encrypted copy, because the server still cannot decrypt-and-redistribute. A message to one person with
+  three devices becomes three independent encrypted deliveries. This is the real reason multi-device took
+  Signal-based apps years longer to ship than 1:1 chat: it is not a UI feature, it is a re-derivation of the
+  encryption fan-out.</p>
+
+  <h4>Trade-offs</h4>
+  <div class="callout tradeoff"><p>At 10x scale, the thing that breaks first is a large, active group: a
+  1,000-member group with a burst of replies turns one send into up to 999 independent encrypted deliveries,
+  999 offline-queue writes for anyone not currently connected, and potentially 999 push notifications. The
+  trade-off is between per-recipient copies (needed because content is encrypted per device and delivery
+  state must be tracked per device) and fan-out cost that scales linearly with group size — there is no way
+  to make one write serve many recipients the way an unencrypted "shared log with a read cursor" design
+  (see the Slack/Discord problem in this chapter) can.</p></div>
+
+  <h4>Say this</h4>
+  <div class="callout say-this"><p>"For groups, I would use sender keys instead of a pairwise Double Ratchet
+  session per member pair — it turns an O(members) encryption cost per message into O(1), at the cost of
+  needing to rotate the sender key on every membership change. That is the right trade for chat groups,
+  which change membership far less often than they send messages."</p></div>
+
+  <h4>Final design</h4>
+  <p>One picture: a fleet of gateway servers holding millions of long-lived sockets, a stateless router that
+  looks up presence and group membership to decide "push now" or "queue it," a durable per-chat message log
+  behind that decision, and a key-exchange side-system (prekeys, sender keys) that lets every hop in between
+  stay blind to the actual message content.</p>
+
+  <h4>EM-level follow-up</h4>
+  <div class="callout em-angle"><p>Rollout: ship 1:1 encrypted chat first, then groups, then multi-device —
+  each step is a real re-architecture of the key-fan-out logic, not a flag flip, so sequence them as separate
+  launches with separate risk reviews. Build vs. buy: push delivery itself should ride on the platform push
+  services (APNs, FCM) rather than a custom always-on protocol to mobile devices — battery and OS-level
+  wake restrictions make that a losing build. Cross-team impact: the prekey/identity key server is usually
+  shared with the account and device-management team, since "which devices does this account have, and are
+  they still trusted" is an identity question, not a messaging one.</p></div>
+</article>
+
+<article class="problem">
+  <h3>Design Slack/Discord (Channels and Servers)</h3>
+
+  <h4>Problem framing</h4>
+  <p>This is a persistent, searchable group chat: many people post into a shared, named channel inside a
+  workspace (Slack) or server (Discord), and everyone who has access can scroll back through history at any
+  time. Unlike WhatsApp's model above, there is no per-recipient copy of anything — there is one shared log
+  per channel, and it is read far more often than it is written.</p>
+
+  <h4>Clarifying questions</h4>
+  <ul>
+    <li><strong>How large can a single channel get?</strong> — a 12-person project channel and a 500,000-member
+    Discord announcement channel need different fan-out strategies for pushing new messages to viewers.</li>
+    <li><strong>What is the message retention policy?</strong> — some plans cap visible history (for example,
+    a free tier showing only the last 90 days), which changes what has to stay hot versus what can move to
+    cold storage.</li>
+    <li><strong>Do we need full-text search across all channel history?</strong> — this adds a whole
+    subsystem (an inverted index, see Ch.11) that has to stay in sync with every edit and delete.</li>
+    <li><strong>Are threads, reactions, and message edits in scope?</strong> — threads in particular need a
+    second ordering key nested inside the main channel timeline.</li>
+    <li><strong>Is voice/video in scope?</strong> — Discord's voice channels are a real-time media problem,
+    covered by the Video-call signaling system problem later in this chapter; this write-up stays focused on
+    text and channel structure.</li>
+  </ul>
+
+  <h4>Requirements</h4>
+  <p><strong>Functional:</strong> create workspaces/servers and channels (public, private); post, edit, and
+  delete messages; support threads and reactions; track per-user unread state per channel; search message
+  history; enforce role-based permissions on who can read/post in a channel.</p>
+  <p><strong>Non-functional:</strong> heavily read-skewed traffic (people scroll far more than they type);
+  strict ordering within a single channel; durability of history for the life of the retention policy;
+  multi-tenant isolation, so one workspace's load or data can never leak into another's; graceful handling
+  of very large channels without a "post to 500,000 people" write storm.</p>
+
+  <h4>Capacity estimate</h4>
+  <p>Assume a Slack-scale deployment: 20 million DAU, averaging 15 messages posted per user per day.</p>
+  <pre><code>Messages posted/day   = 20,000,000 x 15 = 300,000,000 (300M)
+Average write QPS     = 300M / 86,400s ~= 3,470 /sec
+Peak write QPS (3x)   ~= 10,400 /sec
+
+Reads dominate: assume a 50:1 read-to-write ratio (scrolling and re-opening channels)
+Average read QPS      ~= 3,470 x 50 ~= 174,000 /sec
+Peak read QPS          ~= 520,000 /sec
+
+Storage: ~250 bytes/message (text + metadata, no encryption overhead here)
+  300M/day x 250 bytes = 75 GB/day -> ~27 TB/year of raw message text at this scale
+
+Large-channel fan-out: a 100,000-member announcement channel, 10% concurrently online
+  1 post -> up to 10,000 real-time pushes, vs. a normal channel's single-digit push count
+
+Concurrent connections: 25% of 20M DAU online at once at peak = 5,000,000 connections
+  At ~50,000 sockets/gateway server -> ~100 gateway servers (far fewer than the WhatsApp
+  case above, because total DAU here is smaller)
+</code></pre>
+
+  <h4>API design</h4>
+  <pre><code>POST   /workspaces/{id}/channels                create a channel
+POST   /channels/{id}/messages                   { text, threadId?, attachments? }
+GET    /channels/{id}/messages?before={cursor}   paginated history, newest-first
+PATCH  /messages/{id}                            edit
+DELETE /messages/{id}                            delete
+POST   /messages/{id}/reactions                   add a reaction
+GET    /search?workspace={id}&q={query}          full-text search, scoped to one workspace
+
+-- Real-time event stream over a persistent connection:
+message.created, message.updated, message.deleted, reaction.added, typing.start
+</code></pre>
+
+  <h4>High-level design</h4>
+  <p>A post goes through a permission check, is appended to a per-channel log, and then fans out
+  asynchronously over an event bus to online members' sockets, an unread-counter cache, a search indexer,
+  and a notification path for anyone offline — none of those downstream steps block the write.</p>
+  <div class="diagram" data-diagram='{
+    "title": "Channel message fan-out in a multi-tenant workspace",
+    "nodes": [
+      {"id":"client","x":20,"y":30,"w":170,"h":60,"kind":"external","label":"Client (desktop, mobile, web)"},
+      {"id":"gateway","x":250,"y":30,"w":190,"h":60,"kind":"compute","label":"WebSocket Gateway Fleet"},
+      {"id":"channelsvc","x":250,"y":150,"w":190,"h":60,"kind":"compute","label":"Channel and Message Service"},
+      {"id":"permsvc","x":250,"y":270,"w":190,"h":60,"kind":"compute","label":"Membership and Permissions Service"},
+      {"id":"eventbus","x":520,"y":30,"w":190,"h":60,"kind":"queue","label":"Fan-out Event Bus (Kafka)"},
+      {"id":"msgstore","x":520,"y":150,"w":190,"h":60,"kind":"storage","label":"Message Store (sharded by channel_id)"},
+      {"id":"unreadcache","x":520,"y":270,"w":190,"h":60,"kind":"storage","label":"Unread Counters and Presence (Redis)"},
+      {"id":"notifysvc","x":790,"y":30,"w":190,"h":60,"kind":"compute","label":"Push and Email Fan-out (Notification System)"},
+      {"id":"searchidx","x":790,"y":150,"w":190,"h":60,"kind":"storage","label":"Search Index (Elasticsearch)"},
+      {"id":"filestore","x":790,"y":270,"w":190,"h":60,"kind":"external","label":"File and Attachment Store plus CDN"}
+    ],
+    "edges": [
+      {"from":"client","to":"gateway","label":"post message or subscribe"},
+      {"from":"gateway","to":"channelsvc","label":"write message"},
+      {"from":"channelsvc","to":"permsvc","label":"check channel membership and role"},
+      {"from":"channelsvc","to":"msgstore","label":"append, ordered by channel"},
+      {"from":"channelsvc","to":"eventbus","label":"publish message.created"},
+      {"from":"eventbus","to":"gateway","label":"fan out to online members"},
+      {"from":"gateway","to":"client","label":"push new message"},
+      {"from":"eventbus","to":"unreadcache","label":"increment unread count per member"},
+      {"from":"eventbus","to":"searchidx","label":"index message asynchronously"},
+      {"from":"eventbus","to":"notifysvc","label":"offline member: queue push or email"},
+      {"from":"client","to":"filestore","label":"upload or download attachment"}
+    ],
+    "groups": [
+      {"x":230,"y":130,"w":230,"h":220,"label":"Core chat service, stateless, scaled per workspace shard"}
+    ]
+  }'></div>
+
+  <h4>Deep dive</h4>
+  <p><strong>A shared log with a read cursor, not a mailbox per recipient.</strong> This is the single
+  biggest architectural difference from the WhatsApp problem above. There, encryption forces a copy per
+  device. Here, content is not encrypted end-to-end, so one channel can have exactly one append-only log,
+  and every member just tracks their own read cursor (a pointer: "I have read up to message #48,213") into
+  that shared log. A post to a 100,000-member channel is still a single write. The cost of scale shows up
+  only in the unread-counter increments and the real-time push, not in the write itself — which is exactly
+  why very large channels are workable here in a way a 100,000-recipient encrypted 1:1-style fan-out never
+  would be.</p>
+  <p><strong>Two ordering axes: channel and thread.</strong> A thread reply belongs to the main channel
+  timeline and to its own thread timeline at the same time. The practical fix is a composite ordering key —
+  (channel_id, parent_message_id, sequence) — and two different read paths: "give me the channel in order"
+  ignores thread nesting beyond showing a reply count, while "give me this thread" filters to one
+  parent_message_id. Getting this key wrong is the most common bug in a from-scratch design here: people
+  often model threads as a second entity with no link back to channel order, and then cannot render "new
+  messages since you left" correctly.</p>
+  <p><strong>Multi-tenant search isolation.</strong> A single Elasticsearch cluster serving every workspace
+  has to guarantee one workspace can never see, and can never slow down, another's search traffic. The
+  standard fix is one index (or index alias) per workspace rather than one shared index filtered by a
+  workspace field — a query against a small workspace's own index cannot be starved by a huge workspace's
+  indexing load the way a shared index's query planner and cache could be.</p>
+
+  <h4>Trade-offs</h4>
+  <div class="callout tradeoff"><p>At 10x scale, the shared-log-plus-cursor model is fine for storage and
+  writes, but real-time push breaks first: a very large, very active channel (a viral Discord server, or a
+  company all-hands channel) tries to push every message to every currently-connected member instantly, and
+  that turns into a broadcast storm on the gateway fleet. The trade-off is immediacy versus stability — you
+  throttle or batch real-time push for channels above a member-count threshold, so those members see updates
+  a few seconds late instead of the gateway fleet falling over.</p></div>
+
+  <h4>Say this</h4>
+  <div class="callout say-this"><p>"I would store one append-only log per channel that every member reads
+  with their own cursor, not a mailbox per recipient. That makes posting to a 100,000-member channel an O(1)
+  write instead of an O(members) write — the cost shows up only in computing each user's unread count and in
+  real-time push, which I can throttle independently of the write path."</p></div>
+
+  <h4>Final design</h4>
+  <p>One picture: a stateless chat service that checks permissions and appends to a per-channel shard, an
+  event bus that fans that write out asynchronously to sockets, unread counters, search, and notifications —
+  with the write path never blocked on any of those downstream consumers.</p>
+
+  <h4>EM-level follow-up</h4>
+  <div class="callout em-angle"><p>Multi-tenant SaaS considerations dominate here: one noisy workspace (a huge
+  Discord server, a Slack enterprise grid) must not degrade another's latency, which is why sharding by
+  workspace/server (Ch.6) and per-tenant search indices matter more than raw QPS. Build vs. buy: most teams
+  buy the search layer (managed Elasticsearch, or Algolia) rather than operating it themselves, since
+  relevance tuning and index-lifecycle management is a specialty. Rollout: new channel features (like a new
+  reaction type or thread behavior) should ship behind a per-workspace flag, because a workspace admin, not
+  the platform team, usually decides when their org is ready for a UI change.</p></div>
+</article>
+
+<article class="problem">
+  <h3>Design a Notification System (Push, Email, and SMS Fan-out)</h3>
+
+  <h4>Problem framing</h4>
+  <p>This is not a product on its own — it is shared infrastructure that other services call when they want
+  to tell a user something, across whichever channel (push, email, SMS, in-app) the user prefers. Unlike
+  WhatsApp or Slack above, this system does not own the conversation or the relationship with the user; it
+  is a dispatcher other teams' events pass through.</p>
+
+  <h4>Clarifying questions</h4>
+  <ul>
+    <li><strong>Which channels are in scope — push, email, SMS, in-app, or all four?</strong> — each has a
+    different provider, a different rate limit, and a different failure mode.</li>
+    <li><strong>Is this transactional (an OTP, an order receipt) or bulk (a marketing blast to millions)?</strong>
+    — transactional needs low latency and cannot wait behind a queue; bulk needs pacing so it does not get
+    the sending account throttled or banned by a provider.</li>
+    <li><strong>Do users control preferences and quiet hours?</strong> — opting out of marketing SMS but not
+    security alerts is a real, common requirement that changes the preference model.</li>
+    <li><strong>Do we need delivery-status tracking and retries?</strong> — "did the SMS actually arrive" is
+    often only knowable from a provider webhook, arriving asynchronously and out of order.</li>
+    <li><strong>What happens if the same upstream event fires twice?</strong> — this decides whether we need
+    an idempotency key, given that most event buses (Ch.14) deliver at-least-once, not exactly-once.</li>
+  </ul>
+
+  <h4>Requirements</h4>
+  <p><strong>Functional:</strong> accept notification requests from other internal services (via a direct API
+  call or by consuming a domain event); resolve the user's channel preference and device tokens; render a
+  template with localization; send through the right provider; retry on transient failure; record delivery
+  status; respect quiet hours and opt-outs.</p>
+  <p><strong>Non-functional:</strong> handle bursty fan-out (a single marketing event can target tens of
+  millions of users at once); at-least-once delivery with idempotency so retries never duplicate a send to
+  the user; strict prioritization, so a security alert or OTP is never delayed behind a marketing campaign;
+  a pluggable provider layer, since SMS/email/push vendors get swapped over a system's lifetime.</p>
+
+  <h4>Capacity estimate</h4>
+  <p>Assume the platform serves 500 million registered users across several products, with two distinct
+  traffic shapes.</p>
+  <pre><code>Transactional (OTP, order updates, alerts): ~2 notifications/user/day
+  1,000,000,000 sends/day / 86,400s ~= 11,600 /sec average
+  Peak (5x, bursty logins/orders)     ~= 58,000 /sec
+
+Bulk/marketing: 10 campaigns/day, ~20,000,000 targets each, sent inside a 30-minute window
+  Per campaign:  20,000,000 / 1,800s ~= 11,100 /sec sustained, just for ONE campaign
+  With several campaigns overlapping, this alone can exceed the transactional peak --
+  which is exactly why bulk needs its own paced queue, not a shared one with OTP traffic
+
+Total daily volume ~= 1B (transactional) + 200M (bulk) = 1.2B notifications/day
+
+Storage: ~300 bytes/record (recipient, channel, template id, status, provider response)
+  1.2B/day x 300 bytes = 360 GB/day; kept 90 days for delivery audit -> ~32 TB
+
+Hard external constraint: providers throttle you, not the other way around. Push
+(APNs/FCM) tolerates very high throughput per app; SMS providers commonly cap a single
+sending number to low hundreds of messages/sec -- so SMS at this scale needs a pool of
+many sender numbers, not one, regardless of how fast your own infrastructure is.
+</code></pre>
+
+  <h4>API design</h4>
+  <pre><code>POST /notifications         { userId | segmentId, template, data, channels: [push,email,sms], priority }
+POST /notifications/bulk    { segmentQuery, template, data, sendWindow }
+GET  /notifications/{id}/status
+PUT  /users/{id}/preferences   { channelOptIns, quietHours }
+
+-- Preferred entry point for most callers: publish a domain event, do not call the API directly
+order.shipped, security.login_new_device, campaign.scheduled  -->  consumed by the orchestrator
+</code></pre>
+
+  <h4>High-level design</h4>
+  <p>Every upstream event or direct call flows through preference resolution and template rendering once,
+  then splits into one queue per channel, each with its own worker pool and its own rate limiter tuned to
+  that channel's real-world provider limits.</p>
+  <div class="diagram" data-diagram='{
+    "title": "Notification fan-out across push, email, and SMS",
+    "nodes": [
+      {"id":"producers","x":20,"y":30,"w":170,"h":60,"kind":"external","label":"Upstream Services (order, auth, marketing)"},
+      {"id":"api","x":20,"y":270,"w":170,"h":60,"kind":"compute","label":"Notification API (synchronous path)"},
+      {"id":"eventbus","x":250,"y":30,"w":190,"h":60,"kind":"queue","label":"Event Bus (Kafka)"},
+      {"id":"orchestrator","x":250,"y":150,"w":190,"h":60,"kind":"compute","label":"Notification Orchestrator (dedupe, preferences, priority)"},
+      {"id":"prefstore","x":250,"y":270,"w":190,"h":60,"kind":"storage","label":"User Preference Store"},
+      {"id":"templatesvc","x":250,"y":390,"w":190,"h":60,"kind":"compute","label":"Template Rendering Service"},
+      {"id":"pushq","x":500,"y":30,"w":170,"h":60,"kind":"queue","label":"Push Queue"},
+      {"id":"emailq","x":500,"y":150,"w":170,"h":60,"kind":"queue","label":"Email Queue"},
+      {"id":"smsq","x":500,"y":270,"w":170,"h":60,"kind":"queue","label":"SMS Queue"},
+      {"id":"statusstore","x":500,"y":410,"w":190,"h":60,"kind":"storage","label":"Delivery Status Store"},
+      {"id":"pushworker","x":730,"y":30,"w":170,"h":60,"kind":"compute","label":"Push Workers to APNs and FCM"},
+      {"id":"emailworker","x":730,"y":150,"w":170,"h":60,"kind":"compute","label":"Email Workers to SES or SMTP"},
+      {"id":"smsworker","x":730,"y":270,"w":170,"h":60,"kind":"compute","label":"SMS Workers to SMS Gateway"}
+    ],
+    "edges": [
+      {"from":"producers","to":"eventbus","label":"publish domain event"},
+      {"from":"producers","to":"api","label":"direct call for synchronous OTP"},
+      {"from":"eventbus","to":"orchestrator","label":"consume event"},
+      {"from":"api","to":"orchestrator","label":"direct request"},
+      {"from":"orchestrator","to":"prefstore","label":"resolve preference and opt-outs"},
+      {"from":"orchestrator","to":"templatesvc","label":"render templated content"},
+      {"from":"templatesvc","to":"pushq","label":"enqueue push"},
+      {"from":"templatesvc","to":"emailq","label":"enqueue email"},
+      {"from":"templatesvc","to":"smsq","label":"enqueue sms"},
+      {"from":"pushq","to":"pushworker","label":"dequeue, rate-limited"},
+      {"from":"emailq","to":"emailworker","label":"dequeue"},
+      {"from":"smsq","to":"smsworker","label":"dequeue, per-number throttle"},
+      {"from":"pushworker","to":"statusstore","label":"record delivery result"},
+      {"from":"emailworker","to":"statusstore","label":"record delivery result"},
+      {"from":"smsworker","to":"statusstore","label":"record delivery result"}
+    ],
+    "groups": [
+      {"x":480,"y":10,"w":440,"h":340,"label":"Per-channel queues and workers, scaled and rate-limited independently"}
+    ]
+  }'></div>
+
+  <h4>Deep dive</h4>
+  <p><strong>Pacing bulk sends against a hard provider ceiling.</strong> Fan-out speed is not actually your
+  choice once you are sending SMS: the provider will throttle or ban a sending number that bursts past its
+  limit. The fix is a per-channel worker pool sized to the provider's real ceiling, guarded by a token bucket
+  (Ch.5), and a campaign scheduler that spreads 20 million sends across a window instead of firing them all
+  at once. This is a case where slower is the only correct answer, not a trade-off you get to avoid.</p>
+  <p><strong>Idempotency under at-least-once delivery.</strong> The event bus that feeds the orchestrator
+  guarantees at-least-once delivery (Ch.14), meaning the same order.shipped event can arrive twice after a
+  consumer restart. Sending the same push twice is a visible bug, not an invisible one. The fix is an
+  idempotency key — a hash of (event_id, channel, user_id) — checked against a short-TTL cache (a Redis
+  SETNX-style "claim this key or bail") before any provider call is made.</p>
+  <p><strong>Priority isolation.</strong> A login OTP delayed behind a 20-million-user marketing campaign is
+  a support incident, not a minor inconvenience. The fix is not a priority field on a shared queue — under
+  load, low-priority backlog still starves high-priority messages on a single queue and worker pool. It is
+  physically separate queues (and often separate worker pools) per priority tier, so a marketing campaign
+  cannot touch the same capacity an OTP needs.</p>
+
+  <h4>Trade-offs</h4>
+  <div class="callout tradeoff"><p>At 10x scale, the first thing that breaks is not your infrastructure — it
+  is the provider relationship. An SMS sender number that worked fine at 1x volume gets flagged as spam or
+  throttled by the carrier at 10x if fan-out is not paced and spread across a large pool of sender numbers.
+  The trade-off is speed of delivery versus provider trust: you deliberately slow bulk campaigns down and
+  spread them across more sending identities, trading "everyone gets it in one minute" for "everyone gets it
+  reliably over thirty."</p></div>
+
+  <h4>Say this</h4>
+  <div class="callout say-this"><p>"I would give transactional traffic like OTPs its own queue and worker
+  pool, completely separate from bulk marketing, even though they share the same orchestrator and template
+  engine. A 20-million-user campaign backing up is an inconvenience; a delayed login OTP is a support fire —
+  they cannot share a failure domain."</p></div>
+
+  <h4>Final design</h4>
+  <p>One picture: a single entry point (event bus or direct API) feeding one orchestrator that resolves
+  preferences and renders templates once, fanning out into independently rate-limited, independently scaled
+  queues and worker pools per channel and per priority tier, with a shared status store for tracking what
+  actually got delivered.</p>
+
+  <h4>EM-level follow-up</h4>
+  <div class="callout em-angle"><p>Build vs. buy: almost nobody builds their own SMS or email delivery — you
+  buy that from a provider (Twilio-style SMS, SES/SendGrid-style email) and build only the orchestration,
+  preference, and dedupe layer in-house, since the hard, regulated, carrier-relationship part is exactly what
+  the vendor is selling. Cross-team impact: every product team becomes a "producer" into this system, so its
+  real bottleneck as the company grows is not throughput — it is a stable, versioned event schema and a
+  self-serve template registry, so the notification team is not a manual approval gate for every feature
+  launch across the company.</p></div>
+</article>
+
+<article class="problem">
+  <h3>Design Google-Docs-Style Collaborative Editing (OT/CRDT)</h3>
+
+  <h4>Problem framing</h4>
+  <p>Several people type into the same document at once, and everyone's screen must end up showing the
+  identical final text, no matter what order their keystrokes actually reached the server in. This is a
+  correctness problem before it is a scale problem: the hard requirement is that every replica converges to
+  the same state, not that the system is fast (though it also has to feel instant while typing).</p>
+
+  <h4>Clarifying questions</h4>
+  <ul>
+    <li><strong>Do we need to support offline editing that later reconciles with everyone else's changes?</strong>
+    — this single answer decides between Operational Transformation (OT), which wants a central server as
+    referee, and a Conflict-free Replicated Data Type (CRDT), which is designed to merge two states with no
+    referee at all.</li>
+    <li><strong>What is the realistic worst-case concurrent editor count on one document?</strong> — 3 people
+    on a shared doc and 500 people watching a company all-hands doc are very different load shapes.</li>
+    <li><strong>Do we need full version history, with the ability to restore any past revision?</strong> —
+    this needs periodic named checkpoints on top of the live operation stream, not just the live stream.</li>
+    <li><strong>Is this plain text, or structured content with tables and embedded objects?</strong> — richer
+    content means the "operation" is not just insert/delete-a-character, which changes how hard the merge
+    logic is.</li>
+    <li><strong>Do we need to broadcast live cursors and selections?</strong> — this is ephemeral, per-session
+    state that should never be written to durable storage, unlike the document content itself.</li>
+  </ul>
+
+  <h4>Requirements</h4>
+  <p><strong>Functional:</strong> multiple users edit the same document concurrently and converge to an
+  identical final state; local edits apply instantly on the typer's own screen (optimistic apply) before the
+  server confirms; remote edits merge in correctly regardless of arrival order; live cursor/selection sharing;
+  version history; offline edits reconcile cleanly on reconnect.</p>
+  <p><strong>Non-functional:</strong> guaranteed convergence (the core correctness property — see Ch.12 for how
+  this relates to CAP and consistency models); low latency for the local echo; bounded metadata growth (the
+  bookkeeping a CRDT needs per character must not make the document balloon in size); scale across many
+  documents with low concurrency each, not one document with extreme concurrency.</p>
+
+  <h4>Capacity estimate</h4>
+  <p>Assume 300 million monthly active users of the product, and 50 million documents edited on a given day.
+  Assume only 5% of edited documents have more than one person editing at the same time — the rest are solo
+  edits, which need no merge logic at all, just persistence.</p>
+  <pre><code>Concurrently-edited docs/day = 50,000,000 x 5% = 2,500,000
+Assume avg 3 concurrent editors/doc, each session ~10 minutes, one operation every ~0.5s
+  Ops/session ~= 10min x 60s / 0.5s = 1,200 operations
+  Ops/day from concurrent docs = 2,500,000 docs x 3 editors x 1,200 ops ~= 9,000,000,000 (9B)
+
+Average ops/sec = 9B / 86,400s ~= 104,000 /sec
+Each op is tiny (~100 bytes incl. CRDT/OT metadata):
+  Average bandwidth = 104,000 x 100 bytes ~= 10.4 MB/sec
+  Peak (3x, business hours)                ~= 31 MB/sec
+
+This is a small number on purpose -- the problem is fan-out latency and merge
+correctness, not throughput or storage.
+
+Storage: op history for concurrently-edited docs, kept 30 days for undo/history
+  2,500,000 docs x 3 editors x 1,200 ops/day x 100 bytes x 30 days ~= 27 TB
+  In practice this gets compacted into periodic snapshots (see Deep dive) instead of
+  keeping every keystroke forever.
+
+Connections: assume 10% of 300M MAU are in an actively shared document at peak
+  = 30,000,000 concurrent sockets -> at ~50,000/gateway server -> ~600 gateway servers
+</code></pre>
+
+  <h4>API design</h4>
+  <pre><code>POST /docs/{id}/ops              { baseVersion, ops: [...], clientId }   submit local ops
+GET  /docs/{id}/snapshot?version={v}   fetch a compacted snapshot instead of full replay
+GET  /docs/{id}/history           list named revisions
+POST /docs/{id}/cursor            { clientId, position }   ephemeral, not persisted
+
+-- Over the persistent connection, broadcast to everyone else in the room:
+op.broadcast   { docId, ops, version }
+</code></pre>
+
+  <h4>High-level design</h4>
+  <p>Every operation for one document routes through a single merge-engine instance for that document, gets
+  transformed or merged against what has already landed, is appended to that document's own log, and is
+  broadcast to every other connected editor in the same "room."</p>
+  <div class="diagram" data-diagram='{
+    "title": "Realtime document merge for one doc_id",
+    "nodes": [
+      {"id":"editorA","x":20,"y":30,"w":150,"h":60,"kind":"external","label":"Editor A"},
+      {"id":"editorB","x":20,"y":230,"w":150,"h":60,"kind":"external","label":"Editor B"},
+      {"id":"editorC","x":20,"y":430,"w":150,"h":60,"kind":"external","label":"Editor C, reconnecting after offline"},
+      {"id":"presencesvc","x":230,"y":40,"w":180,"h":60,"kind":"compute","label":"Cursor and Presence Broadcast (ephemeral, not persisted)"},
+      {"id":"gateway","x":230,"y":230,"w":180,"h":60,"kind":"compute","label":"Realtime Gateway (WebSocket, room is doc_id)"},
+      {"id":"docservice","x":470,"y":130,"w":190,"h":60,"kind":"compute","label":"Document Service (OT or CRDT merge engine)"},
+      {"id":"oplog","x":470,"y":280,"w":190,"h":60,"kind":"storage","label":"Operation Log (append-only, per doc)"},
+      {"id":"snapshotstore","x":470,"y":420,"w":190,"h":60,"kind":"storage","label":"Snapshot or Compacted State Store"},
+      {"id":"versionsvc","x":730,"y":280,"w":190,"h":60,"kind":"compute","label":"Version History Service"},
+      {"id":"blobstore","x":730,"y":420,"w":190,"h":60,"kind":"storage","label":"Version Snapshots (Blob Store)"}
+    ],
+    "edges": [
+      {"from":"editorA","to":"gateway","label":"local op, already applied optimistically"},
+      {"from":"gateway","to":"docservice","label":"forward op with base version"},
+      {"from":"docservice","to":"oplog","label":"append transformed op"},
+      {"from":"docservice","to":"gateway","label":"broadcast transformed op to room"},
+      {"from":"gateway","to":"editorB","label":"remote op applied"},
+      {"from":"docservice","to":"snapshotstore","label":"periodic compaction"},
+      {"from":"snapshotstore","to":"versionsvc","label":"checkpoint as named revision"},
+      {"from":"versionsvc","to":"blobstore","label":"store full snapshot"},
+      {"from":"editorC","to":"gateway","label":"reconnect, request missed ops since last version"},
+      {"from":"gateway","to":"docservice","label":"replay or catch-up request"},
+      {"from":"editorA","to":"presencesvc","label":"cursor position"},
+      {"from":"presencesvc","to":"editorB","label":"cursor broadcast, not stored"}
+    ],
+    "groups": [
+      {"x":210,"y":125,"w":460,"h":230,"label":"One doc_id, pinned to a single merge-engine instance, no cross-instance race"}
+    ]
+  }'></div>
+
+  <h4>Deep dive</h4>
+  <p><strong>OT versus CRDT is the whole design decision.</strong> Operational Transformation (the technique
+  behind the original Google Docs) needs a central server that receives every operation, transforms a
+  just-arrived operation against whatever already landed ahead of it so it still makes sense, and re-sends
+  the corrected version — this requires one authoritative order per document, which is exactly why the
+  diagram above pins one document to one merge-engine instance. A CRDT (Conflict-free Replicated Data Type,
+  the approach behind tools like Yjs and Automerge, and behind Figma's multiplayer sync — see the
+  Collaborative Whiteboard problem later in this chapter) instead designs the data structure itself so that
+  concurrent operations commute: applying them in any order gives the same result, with no referee needed.
+  That buys true offline editing and peer-to-peer merge, at a real cost — every inserted character typically
+  carries a permanent unique ID (for example, a (site_id, counter) pair), and deleted characters often become
+  "tombstones" kept around instead of truly removed, so document metadata can grow well past the visible
+  text size unless you run garbage collection.</p>
+  <p><strong>Deterministic tie-breaking for simultaneous edits at the same position.</strong> Two users typing
+  different characters at the same cursor position at the same instant is not an edge case — it is the
+  everyday case for real-time collaboration. Both approaches need a rule that produces the identical final
+  order on every replica regardless of arrival order: OT's transform function defines the canonical
+  resolution; a sequence CRDT (the family behind Yjs, related to RGA/Treedoc-style structures) instead gives
+  every inserted element a globally unique, totally ordered ID and places it deterministically by comparing
+  IDs, not arrival time.</p>
+  <p><strong>Reconnection after an offline edit is where the two approaches diverge hardest.</strong> A
+  client offline for an hour has a document that has genuinely diverged. With OT, catching up means replaying
+  the full missed operation history from the log against the client's last known version — which is why the
+  operation log in the diagram has to be retained, not just the latest state. With a CRDT, two independently
+  edited states can be merged directly as a pure function of the two states, with no shared operation history
+  required at all — which is the real argument for choosing CRDT when offline support is a hard requirement.</p>
+
+  <h4>Trade-offs</h4>
+  <div class="callout tradeoff"><p>At 10x scale, a CRDT-based design breaks first on metadata bloat: a document
+  edited heavily for years, especially one with lots of deletions, can grow its stored size 10 to 50 times
+  past its visible text unless tombstones are garbage-collected — and GC itself needs a "causally stable"
+  cutoff point past which no more concurrent edits can arrive, which is genuinely hard to define cleanly in a
+  fully offline, peer-to-peer setting. An OT-based design instead breaks on unusually high concurrency on one
+  document (a company all-hands doc with 500 simultaneous editors), since it is inherently a single-threaded
+  sequencer for that one document.</p></div>
+
+  <h4>Say this</h4>
+  <div class="callout say-this"><p>"If offline editing and peer-to-peer merge are hard requirements, I would
+  pick a CRDT over OT and accept the metadata overhead, because CRDT merge is a pure function of two states
+  with no shared history needed. I would run background compaction that garbage-collects tombstones once a
+  document has no pending offline clients older than some cutoff, say 24 hours."</p></div>
+
+  <h4>Final design</h4>
+  <p>One picture: each document pinned to a single merge-engine instance that either transforms (OT) or merges
+  (CRDT) every incoming operation against document state, appends the result to a per-document log, broadcasts
+  it to everyone else in that document's room, and periodically compacts into a named snapshot so clients
+  never have to replay a document's entire lifetime just to open it.</p>
+
+  <h4>EM-level follow-up</h4>
+  <div class="callout em-angle"><p>Rollout: ship solo editing with autosave first, then live cursors as a
+  cheap, low-risk visible win, then true concurrent merge last — the merge engine is the highest-risk
+  component, so it should launch last, behind the most testing. Cross-team impact: this is almost always a
+  shared "realtime collaboration platform" team's problem, serving many product surfaces (documents,
+  spreadsheets, slides) with one merge engine, rather than each product team building its own OT or CRDT
+  implementation — the correctness bar (guaranteed convergence) is too easy to get subtly wrong to
+  re-implement per team.</p></div>
+</article>
+
+<article class="problem">
+  <h3>Design a Live Auction/Bidding System</h3>
+
+  <h4>Problem framing</h4>
+  <p>Many bidders compete for one item inside a strict time window, and the system must guarantee exactly one
+  winner and never tell two people at once that they are currently winning. This shares the real-time
+  broadcast shape of the live comments/voting system in Ch.17, but the correctness bar is much stricter: a
+  vote count being off by one for a second is tolerable, a bidding war declaring two winners is not.</p>
+
+  <h4>Clarifying questions</h4>
+  <ul>
+    <li><strong>Is this an English auction (ascending, open, real-time) or a sealed-bid auction (blind,
+    single round)?</strong> — this decides whether the current highest bid needs to be broadcast live at
+    all; a sealed-bid system needs none of the real-time infrastructure below.</li>
+    <li><strong>Do we need anti-snipe protection</strong> (extending the end time if a bid lands in the last
+    few seconds, as many live auction platforms do)? — without it, the very last moment of the auction is
+    exploitable by whoever has the lowest network latency to the server.</li>
+    <li><strong>Is payment/escrow in scope, or does this system only own the bidding mechanics?</strong> —
+    assume the latter; payment capture is a downstream system, similar to the Payment Gateway problem covered
+    in a later chapter.</li>
+    <li><strong>Do we need proxy bidding</strong> (an auto-bid up to a max amount on the bidder's behalf)? —
+    this adds server-side logic that places bids for a user without their direct action.</li>
+    <li><strong>Is this one item at a time (a live-streamed auction) or millions of independent, simultaneous
+    auctions (an eBay-style listing site)?</strong> — the second case spreads load naturally across many
+    small hot keys; the first case is a single very hot key by design.</li>
+  </ul>
+
+  <h4>Requirements</h4>
+  <p><strong>Functional:</strong> accept a bid; reject any bid below the current highest bid plus the minimum
+  increment; broadcast the current highest bid to everyone watching in real time; close the auction exactly
+  once, atomically, at end time (or extend it once on a valid last-moment bid); declare exactly one winner;
+  keep a full, auditable bid history.</p>
+  <p><strong>Non-functional:</strong> strong, linearizable consistency on the current-highest-bid value — this
+  is the one problem in this chapter where eventual consistency is the wrong answer, because two bids
+  milliseconds apart must be strictly ordered and the loser must be told immediately, not eventually; durable
+  bid acceptance (an accepted bid must never be lost); low-latency broadcast to watchers; fairness, in that no
+  bidder should get a systematic advantage purely from being geographically closer to the server.</p>
+
+  <h4>Capacity estimate</h4>
+  <p>Assume a platform running 50,000 concurrent live auctions during a peak sale event, averaging 40 watchers
+  each, with bidding activity concentrated in each auction's own closing window.</p>
+  <pre><code>Per-auction closing-window load: a typical hot auction sees ~2 bids/sec at its peak;
+  an extreme-contention item (a limited drop) can spike to ~20 bids/sec briefly.
+
+Platform-wide peak write QPS (many auctions closing around the same time):
+  50,000 auctions x 2 bids/sec (avg, in their own closing window) = 100,000 bids/sec
+  This is the number the bid-acceptance path must handle -- even though any ONE
+  auction's shard only ever sees a handful of bids/sec. Many small hot keys, not one
+  giant hot key -- the same shape as the CRDT document problem above, but here the
+  operations are NOT commutative, which changes the answer (see Deep dive).
+
+Broadcast fan-out: 50,000 auctions x 40 watchers = 2,000,000 concurrent connections
+  Each accepted bid broadcasts to at most ~40 sockets (its own auction's watchers) --
+  bounded and small, unlike Slack's 100,000-member-channel fan-out problem. The risk
+  here is write contention, not broadcast storms.
+
+Storage: ~150 bytes/bid (auction_id, bidder_id, amount, timestamp, sequence number)
+  Assume 20,000,000 bids/day across the platform on average
+  20,000,000 x 150 bytes = 3 GB/day -- storage volume is never the challenge here;
+  correctness under concurrent writes to a single record is.
+</code></pre>
+
+  <h4>API design</h4>
+  <pre><code>POST /auctions/{id}/bids        { amount, bidderId, idempotencyKey }
+                                 -> synchronous: accepted/rejected + current highest bid
+POST /auctions/{id}/proxy-bid   { maxAmount }   auto-bid up to a ceiling on the user's behalf
+GET  /auctions/{id}             current highest bid, end time, bid count (for a client joining late)
+
+-- Broadcast to everyone watching an auction:
+bid.accepted   { auctionId, amount, bidderId, newEndTime? }
+
+-- Published once the auction closes, for downstream systems:
+auction.closed { auctionId, winnerId, finalAmount }
+</code></pre>
+
+  <h4>High-level design</h4>
+  <p>Every bid for one auction is routed to a single writer for that auction, which atomically checks the bid
+  against the current highest and the auction's open/closed state before accepting it, then broadcasts the
+  result and durably logs it.</p>
+  <div class="diagram" data-diagram='{
+    "title": "Bid acceptance and live broadcast for one auction",
+    "nodes": [
+      {"id":"bidderA","x":20,"y":30,"w":150,"h":60,"kind":"external","label":"Bidder A"},
+      {"id":"bidderB","x":20,"y":230,"w":150,"h":60,"kind":"external","label":"Bidder B"},
+      {"id":"watchers","x":20,"y":430,"w":150,"h":60,"kind":"external","label":"Watchers, view-only, no bid"},
+      {"id":"gateway","x":230,"y":230,"w":180,"h":60,"kind":"compute","label":"Realtime Gateway (WebSocket, room is auction_id)"},
+      {"id":"lock","x":470,"y":30,"w":190,"h":60,"kind":"storage","label":"Per-Auction Sequencer (Redis CAS or DB row lock)"},
+      {"id":"bidsvc","x":470,"y":150,"w":190,"h":60,"kind":"compute","label":"Bid Acceptance Service (single writer per auction)"},
+      {"id":"bidlog","x":470,"y":300,"w":190,"h":60,"kind":"storage","label":"Bid Log (append-only, ordered)"},
+      {"id":"timerSvc","x":730,"y":30,"w":190,"h":60,"kind":"compute","label":"Auction Clock and Close Scheduler"},
+      {"id":"auctionstate","x":730,"y":150,"w":190,"h":60,"kind":"storage","label":"Current Highest Bid Cache (Redis)"},
+      {"id":"eventbus","x":730,"y":300,"w":190,"h":60,"kind":"queue","label":"auction.closed Event Bus"},
+      {"id":"downstream","x":730,"y":430,"w":190,"h":60,"kind":"external","label":"Payment or Escrow and Notification (downstream)"}
+    ],
+    "edges": [
+      {"from":"bidderA","to":"gateway","label":"submit bid"},
+      {"from":"gateway","to":"bidsvc","label":"forward bid, auction_id room"},
+      {"from":"bidsvc","to":"lock","label":"acquire sequencer, compare-and-set highest bid"},
+      {"from":"bidsvc","to":"bidlog","label":"append accepted bid before ack"},
+      {"from":"bidsvc","to":"auctionstate","label":"update highest bid cache"},
+      {"from":"bidsvc","to":"gateway","label":"accepted or rejected result"},
+      {"from":"gateway","to":"bidderA","label":"you are winning or outbid"},
+      {"from":"auctionstate","to":"gateway","label":"broadcast new highest bid"},
+      {"from":"gateway","to":"watchers","label":"live price update"},
+      {"from":"timerSvc","to":"bidsvc","label":"close auction at end time or extend"},
+      {"from":"bidsvc","to":"eventbus","label":"publish auction.closed and winner"},
+      {"from":"eventbus","to":"downstream","label":"trigger payment capture and notify winner"}
+    ],
+    "groups": [
+      {"x":450,"y":15,"w":240,"h":210,"label":"Single writer per auction_id, the strict-consistency boundary"}
+    ]
+  }'></div>
+
+  <h4>Deep dive</h4>
+  <p><strong>Why this is the one problem in the chapter that needs strict consistency.</strong> Two bids a
+  few milliseconds apart for the same item must be given one, unambiguous, agreed-upon order, and the loser
+  must find out immediately (see Ch.12 for consistency models, and Ch.13 for the distributed-locking and
+  quorum mechanics behind making one value strongly consistent). The practical fix is a single-writer-per-
+  auction pattern: every bid for a given auction_id routes to exactly one node or partition — a Redis
+  instance guarded by a Lua script doing a compare-and-set ("accept only if this amount exceeds the current
+  highest"), or a database row lock via <code>SELECT ... FOR UPDATE</code> — so there is no race to untangle
+  after the fact. Contrast this directly with the collaborative-document problem earlier in this chapter:
+  there, concurrent operations are designed to commute so a CRDT can merge them with no referee; here,
+  concurrent bids are not commutative — order determines the winner — so a CRDT-style merge is the wrong
+  tool, and this needs a sequencer, much closer to the OT model.</p>
+  <p><strong>The anti-snipe race between "accept this bid" and "close this auction."</strong> A bid arriving
+  in the auction's final moment must be accepted-or-rejected and the close decision made as one atomic step —
+  otherwise you get the classic bug where the auction closes while a valid winning bid is still in flight.
+  The fix is making bid-acceptance and the close-check part of the same critical section: the same
+  compare-and-set operation checks "is this bid valid, and is the auction still open," and if the bid lands
+  within the last few seconds, that same operation atomically extends the end time, rather than a separate
+  timer racing the bid path.</p>
+  <p><strong>Fairness under real network latency.</strong> Bidders are not equidistant from your servers, so a
+  naive "first request wins" rule can systematically favor whoever is geographically closest to your region.
+  The practical answer is to keep one authoritative region per auction (accepting the extra latency for
+  far-away bidders rather than letting two regions each believe they are authoritative) and, if global
+  fairness matters more, timestamp bids at the edge/gateway rather than at the final backend, so queuing
+  delay inside your own infrastructure does not compound the geographic disadvantage. Worth saying plainly:
+  perfect fairness across geography is not fully achievable — the speed of light sets a floor — only
+  minimizable.</p>
+
+  <h4>Trade-offs</h4>
+  <div class="callout tradeoff"><p>At 10x scale, the single-writer-per-auction model breaks first for the "one
+  giant live-streamed auction" case — thousands of bidders all reacting to the same on-screen moment for one
+  item, which is a single hot key by design, unlike the 50,000-independent-auctions case where load spreads
+  naturally. A single Redis node or lock becomes a real throughput ceiling. The trade-off is either a hard
+  cap on sustained bids/sec for one item (accepting only the first valid bid within a sub-second bucket and
+  rejecting the rest) or sharding the per-item sequencing into a Raft/Paxos-backed group (Ch.12) to get more
+  than one node's throughput while still agreeing on a single order — at real added complexity.</p></div>
+
+  <h4>Say this</h4>
+  <div class="callout say-this"><p>"The current-highest-bid value is the one place in this design I will not
+  make eventually consistent. I would rather take on a single-writer bottleneck per auction, guarded by a
+  Redis compare-and-set or a database row lock, than risk two bidders both being told they are currently
+  winning."</p></div>
+
+  <h4>Final design</h4>
+  <p>One picture: every bid for one auction funnels through exactly one writer that atomically checks it
+  against the current highest bid and the open/closed state, durably logs the decision before acknowledging
+  it, and broadcasts the new state to a bounded set of watchers — with the close decision living inside that
+  same atomic step, not racing it from a separate timer.</p>
+
+  <h4>EM-level follow-up</h4>
+  <div class="callout em-angle"><p>Rollout: ship plain ascending auctions first, without proxy bidding or
+  anti-snipe extension, and add those as a v2 once the core sequencing is proven under real load — they are
+  refinements on top of a correctness-critical core, not features to bundle into the first release. Build vs.
+  buy: the sequencing/lock primitive should reuse the organization's existing distributed lock service
+  (Ch.16) rather than being built bespoke for this one system. Cross-team impact: payment/escrow and fraud
+  teams build irreversible, money-moving logic directly on top of this system's "exactly one declared winner,
+  ever" guarantee, so any change to the bid-acceptance critical section needs their sign-off, not just this
+  team's.</p></div>
+</article>
+<article class="problem">
+  <h3>Design a Video-Call Signaling System (Zoom-style)</h3>
+
+  <h4>Problem framing</h4>
+  <p>Strip away the buzzwords and a video-call product is really two separate systems glued together. The
+  <strong>signaling plane</strong> is the control-plane conversation that lets two or more clients find each
+  other, agree on how to encode audio/video, and exchange network addresses. The <strong>media plane</strong>
+  is the actual audio/video bytes flowing peer-to-peer or through a relay. This problem is specifically about
+  the signaling plane: the handshake that sets a call up, not the pipe the call flows through afterward. Get
+  this distinction wrong in an interview and you will spend the whole session designing the wrong bottleneck.</p>
+
+  <h4>Clarifying questions</h4>
+  <ul>
+    <li><strong>Is this strictly 1:1, or do we need group calls?</strong> — group calls of more than 3-4
+    people make a full mesh (everyone connects to everyone) too expensive on the client's upload bandwidth,
+    forcing a server-side media relay (an SFU) instead of pure peer-to-peer.</li>
+    <li><strong>What is the max participants per call?</strong> — a 4-person team call and a 1,000-person
+    webinar are different systems wearing the same UI; the webinar case needs a broadcast-style media
+    topology, not a mesh-of-equals.</li>
+    <li><strong>Do we need call recording?</strong> — recording forces media to transit a server you control
+    (so you can capture it), which rules out pure peer-to-peer even for small calls.</li>
+    <li><strong>What NAT and firewall environments must we support?</strong> — corporate networks with
+    symmetric NAT (a type of network address translation that assigns a different public port for every
+    destination, making direct peer connections hard to establish) force you to budget for relay bandwidth,
+    not just discovery.</li>
+    <li><strong>What is an acceptable call-setup latency?</strong> — this decides how much signaling
+    round-tripping (offer, answer, candidate exchange) you can afford before the user notices the call is
+    slow to connect.</li>
+  </ul>
+
+  <h4>Requirements</h4>
+  <p><strong>Functional:</strong> a user can create or join a meeting room by ID; the system exchanges each
+  side's session description (what codecs, resolutions, and encryption it supports) and network candidates
+  so the two sides can find a media path; participants can mute/unmute and start/stop screen share, and
+  every participant sees an up-to-date roster of who is in the call; the system copes with brief network
+  drops by re-establishing signaling without dropping the already-connected media path.</p>
+  <p><strong>Non-functional:</strong> call setup should complete in roughly 1-2 seconds end to end; the
+  signaling service must be highly available, because a signaling server crash should never be able to drop
+  a call that is already connected, since the media plane is a separate, independent session; the design
+  must scale horizontally to millions of concurrent participants; and every signaling message must travel
+  over TLS, with the eventual media itself encrypted with DTLS-SRTP (a standard that combines the DTLS
+  handshake with the SRTP media-encryption protocol).</p>
+
+  <h4>Capacity estimate</h4>
+  <p>Assume 10 million concurrent participants at peak, with an average call size of 4 people, so roughly
+  2.5 million concurrent calls. Signaling itself is light: each participant sends on the order of 10-20
+  small messages (offer, answer, a handful of ICE candidates — ICE stands for Interactive Connectivity
+  Establishment, the process of trying several network paths until one works) during the roughly 1-2 seconds
+  it takes to connect, plus a periodic keepalive every 20-30 seconds to keep the WebSocket alive through
+  corporate proxies. The interesting number is not steady-state traffic, it is the join storm: many meetings
+  start on the hour, so assume 500,000 calls start within the same 60-second window. With an average call
+  size of 4, that is 2 million joining participants, each sending on the order of 15 signaling messages
+  during connect — about 30 million signaling messages in 60 seconds, or roughly 500,000 messages/sec at
+  that peak, each only a few kilobytes (an SDP blob is typically 1-5 KB). That is still a rounding error
+  next to the media plane — on the order of a gigabyte per second of control traffic against the media
+  plane's tens of Tbps aggregate — which is the whole point of keeping the two planes on separate
+  infrastructure.</p>
+  <div class="table-scroll">
+    <table class="spec-table">
+      <thead><tr><th>Quantity</th><th>Assumption</th><th>Result</th></tr></thead>
+      <tbody>
+        <tr><td>Concurrent participants</td><td>peak load</td><td>10,000,000</td></tr>
+        <tr><td>Concurrent calls</td><td>avg 4 participants/call</td><td>~2,500,000</td></tr>
+        <tr><td>Signaling servers needed</td><td>~80,000 sticky WS connections/server</td><td>~125 servers (+ redundancy)</td></tr>
+        <tr><td>Peak signaling msg rate</td><td>500k calls x 4 participants x ~15 msgs, in 60s</td><td>~500,000 msgs/sec</td></tr>
+        <tr><td>Media-plane bandwidth (separate budget)</td><td>~1.5 Mbps/stream, fan-out at SFU</td><td>on the order of tens of Tbps aggregate</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p>Each signaling server holding persistent WebSocket connections can realistically hold on the order of
+  50,000-100,000 open sockets with enough memory and file descriptors, so 10 million concurrent participants
+  divided by roughly 80,000 per box is about 125 signaling servers, plus redundancy for failover. Note this
+  is a completely different, and much larger, capacity problem than the media plane, which is why you call
+  that out explicitly as "budgeted separately" rather than trying to size it in the same breath.</p>
+
+  <h4>API design</h4>
+  <p>Signaling runs over a persistent WebSocket, not request/response REST, because either side can push a
+  message at any time and low latency matters. A thin REST layer handles room lifecycle and auth.</p>
+  <pre><code>POST /meetings                      -> { roomId, hostToken }
+GET  /meetings/{id}/join-token       -> { token }         // auth to join
+
+WS wss://signal.example.com/ws?token=...
+  -> JOIN_ROOM      { roomId, userId }
+  &lt;- ROOM_STATE     { participants: [...] }
+  -> OFFER          { toUserId, sdp }
+  &lt;- ANSWER         { fromUserId, sdp }
+  -> ICE_CANDIDATE  { toUserId, candidate }
+  -> MUTE_STATE     { audio: bool, video: bool }
+  -> LEAVE_ROOM     { roomId }</code></pre>
+
+  <h4>High-level design</h4>
+  <div class="diagram" data-diagram='{
+    "title": "Video-call signaling: control plane vs media plane",
+    "nodes": [
+      {"id":"clientA","x":30,"y":40,"w":150,"h":60,"kind":"external","label":"Caller Client"},
+      {"id":"clientB","x":30,"y":300,"w":150,"h":60,"kind":"external","label":"Callee Client"},
+      {"id":"lb","x":230,"y":170,"w":150,"h":60,"kind":"compute","label":"Load Balancer","sub":"sticky by connection"},
+      {"id":"signal1","x":430,"y":50,"w":170,"h":60,"kind":"compute","label":"Signaling Server A"},
+      {"id":"signal2","x":430,"y":290,"w":170,"h":60,"kind":"compute","label":"Signaling Server B"},
+      {"id":"redis","x":430,"y":430,"w":170,"h":60,"kind":"storage","label":"Redis Pub/Sub","sub":"room-based fan-out"},
+      {"id":"turn","x":680,"y":30,"w":150,"h":60,"kind":"compute","label":"TURN/STUN Relay"},
+      {"id":"sfu","x":680,"y":290,"w":170,"h":60,"kind":"compute","label":"SFU Media Cluster","sub":"forwards audio/video"},
+      {"id":"metadb","x":680,"y":430,"w":170,"h":60,"kind":"storage","label":"Meeting Metadata DB"}
+    ],
+    "edges": [
+      {"from":"clientA","to":"lb","label":"connect wss"},
+      {"from":"clientB","to":"lb","label":"connect wss"},
+      {"from":"lb","to":"signal1"},
+      {"from":"lb","to":"signal2"},
+      {"from":"signal1","to":"redis","label":"publish room events"},
+      {"from":"signal2","to":"redis","label":"subscribe room events"},
+      {"from":"signal1","to":"sfu","label":"SDP negotiated"},
+      {"from":"signal2","to":"sfu","label":"SDP negotiated"},
+      {"from":"clientA","to":"turn","label":"ICE/STUN discovery"},
+      {"from":"clientB","to":"turn","label":"ICE/STUN discovery"},
+      {"from":"clientA","to":"sfu","label":"DTLS-SRTP media"},
+      {"from":"clientB","to":"sfu","label":"DTLS-SRTP media"},
+      {"from":"signal1","to":"metadb"}
+    ],
+    "groups": [
+      {"x":410,"y":30,"w":210,"h":480,"label":"Signaling plane: control only"},
+      {"x":660,"y":10,"w":220,"h":500,"label":"Media plane: audio/video bytes"}
+    ]
+  }'></div>
+
+  <h4>Deep dive</h4>
+  <p><strong>Room fan-out across stateful sockets.</strong> A WebSocket is stateful and sticky to one
+  server, but the two participants of a call can easily land on two different signaling servers behind the
+  load balancer. You need a way to route "here is my offer" from participant A's server to participant B's
+  server. The standard answer is a broker in the middle: each signaling server subscribes to a Redis
+  Pub/Sub channel (or a Kafka topic for very large rooms) per room, and republishes anything it receives to
+  its own local sockets. This is the exact same "fan-out via a broker, never server-to-server directly"
+  pattern used for group chat fan-out — see the WhatsApp/Slack problems earlier in this chapter — just
+  carrying SDP blobs instead of chat text.</p>
+  <p><strong>NAT traversal.</strong> Most clients sit behind a NAT (network address translation), so they do
+  not know their own public IP and port. STUN (Session Traversal Utilities for NAT) lets a client ask a
+  public server "what does my traffic look like from the outside," which is enough for most home routers.
+  Roughly 8-10% of real-world connections sit behind a stricter "symmetric" NAT where that trick fails, and
+  those calls fall back to TURN (Traversal Using Relays around NAT), which now relays the actual media bytes
+  through your infrastructure. That relay bandwidth is the real hidden cost of a product that markets itself
+  as peer-to-peer.</p>
+  <p><strong>SFU vs. mesh vs. MCU.</strong> For more than 3-4 participants, a full mesh makes every client
+  upload its stream N-1 times, which blows up client bandwidth. An SFU (Selective Forwarding Unit) receives
+  each participant's stream exactly once and forwards it to everyone else without decoding or re-encoding
+  it, which is cheap on server CPU and is what Zoom and most modern video products use, often combined with
+  simulcast (the client itself sends the same stream at several resolutions and the SFU picks which one to
+  forward to each viewer based on that viewer's bandwidth). An MCU (Multipoint Control Unit) decodes every
+  stream, mixes them into one composite picture, and re-encodes — it sends far less data to each client but
+  costs dramatically more server CPU, so it is reserved for special cases like recording a single composite
+  file.</p>
+
+  <h4>Trade-offs</h4>
+  <div class="callout tradeoff"><p>At 10x scale, the first thing that breaks is the per-room fan-out
+  mechanism, not the media plane. A 1,000-person webinar's mute/hand-raise/chat events fan out to 1,000
+  sockets that may be spread across 100 different signaling servers, turning one Redis channel into a hot
+  key. You either build a hierarchical fan-out (a per-room aggregator that batches before broadcasting) or
+  you accept that huge "webinar" rooms need a fundamentally different, mostly one-way broadcast model
+  instead of the full mesh-of-equals signaling model that works fine for a 10-person meeting.</p></div>
+
+  <h4>Say this</h4>
+  <div class="callout say-this"><p>"I would keep the signaling plane and the media plane on completely
+  separate infrastructure. Signaling only carries small control messages, so it can be a fleet of stateless
+  WebSocket servers behind a broker. Media is the expensive part — that is where I would put an SFU with
+  simulcast, and I would size that capacity separately, because it scales with total minutes of video, not
+  with signaling message count."</p></div>
+
+  <h4>Final design</h4>
+  <p>If you had to draw one picture: clients hold a WebSocket to a signaling server, which exchanges SDP
+  offers/answers and ICE candidates through a Redis-backed per-room broker; once negotiation finishes, media
+  flows directly between clients and an SFU cluster over DTLS-SRTP, falling back to a TURN relay when NAT
+  traversal fails; the signaling servers can crash and restart without dropping an already-connected call,
+  because the media session lives independently of the control-plane connection that set it up.</p>
+
+  <h4>EM-level follow-up</h4>
+  <div class="callout em-angle"><p>Build vs. buy matters a lot here: very few companies should build their
+  own SFU and TURN fleet from scratch. Managed video infrastructure (Twilio Video, Agora, LiveKit) covers
+  most of this for a fraction of the engineering cost of running it yourself, and it only makes sense to
+  build in-house once video is a core, differentiating part of the product, the way it is for Zoom itself.
+  On rollout: TURN relay capacity and SFU placement are inherently regional — a badly placed point of
+  presence adds latency that no amount of clever signaling code can fix — so this is a cross-team dependency
+  on whoever owns your network/infra footprint, not a pure application-layer decision.</p></div>
+</article>
+
+<article class="problem">
+  <h3>Design an Online Multiplayer Game Real-Time State Sync</h3>
+
+  <h4>Problem framing</h4>
+  <p>Every player needs to see approximately the same version of a shared, constantly-changing game world,
+  even though their network connections have different latency and occasionally drop packets. One server
+  process is the single source of truth for what actually happened (this is called being "authoritative"),
+  and every client's screen is really just a fast, locally-smoothed guess about that truth that gets
+  corrected as real updates arrive.</p>
+
+  <h4>Clarifying questions</h4>
+  <ul>
+    <li><strong>What genre are we building for?</strong> — a fast-paced shooter needs the world to feel
+    consistent within well under 100 milliseconds, while a turn-based strategy game can tolerate much looser
+    timing; this decides your tick rate (how many times per second the server updates the world) and how
+    much client-side prediction you need.</li>
+    <li><strong>How many players share one game session?</strong> — 10 players in a small arena and 100
+    players in a battle-royale map are different systems; the second needs spatial interest management just
+    to keep bandwidth sane.</li>
+    <li><strong>Is this competitive, so we need strong anti-cheat?</strong> — competitive games must treat
+    the client as untrusted and keep the server fully authoritative over hit detection and outcomes.</li>
+    <li><strong>Do we need cross-region matchmaking?</strong> — this decides whether the matchmaker
+    optimizes purely for latency, purely for skill, or has to trade off between the two.</li>
+    <li><strong>Do we need replays or spectator mode?</strong> — this decides whether we persist the full
+    input/event stream, not just final results.</li>
+  </ul>
+
+  <h4>Requirements</h4>
+  <p><strong>Functional:</strong> a client sends its input to the server; the server simulates the world
+  and broadcasts state updates to every client in that session; clients predict their own movement locally
+  instead of waiting for a round trip, and reconcile with the server's version when it arrives; a
+  matchmaking service groups players into a session and hands them off to an allocated game server
+  instance.</p>
+  <p><strong>Non-functional:</strong> perceived input latency under roughly 100 ms even though real network
+  round trips are 50-150 ms; a fixed simulation tick rate, commonly in the 20-60 Hz range; resilience to
+  packet loss, which points toward UDP (a connectionless transport that does not retransmit automatically)
+  instead of TCP; and server-side authority strong enough that a compromised or modified client cannot
+  simply lie about its position or whether it landed a hit.</p>
+
+  <h4>Capacity estimate</h4>
+  <p>Assume 5 million concurrent players at peak, in sessions of 10 players on average, giving roughly
+  500,000 concurrent matches. At a 30 Hz tick rate, the server broadcasts 30 times a second to each of the
+  10 players in a match, so 300 outbound messages/sec per match, and 500,000 matches means 150 million
+  broadcast messages/sec cluster-wide — this is the number that should worry you, far more than raw
+  bandwidth. A naive full-state snapshot (position, rotation, health, and similar fields for 10 players)
+  runs on the order of 1 KB; with delta compression (only sending fields that changed since the last tick)
+  that typically drops to 300-400 bytes. At 300 messages/sec times roughly 350 bytes, one match uses about
+  105 KB/sec, and 500,000 matches in aggregate is on the order of 50 GB/sec of egress — which is why this
+  traffic is served from regional edge servers close to players, not backhauled to one central region.</p>
+  <div class="table-scroll">
+    <table class="spec-table">
+      <thead><tr><th>Quantity</th><th>Assumption</th><th>Result</th></tr></thead>
+      <tbody>
+        <tr><td>Concurrent matches</td><td>5M players, 10/match</td><td>~500,000</td></tr>
+        <tr><td>Broadcast messages/sec (cluster-wide)</td><td>30 Hz tick x 10 players x 500k matches</td><td>~150,000,000</td></tr>
+        <tr><td>Payload per broadcast</td><td>delta-compressed, not full snapshot</td><td>~300-400 bytes</td></tr>
+        <tr><td>Aggregate egress</td><td>150M msgs/sec x ~350 bytes</td><td>on the order of 50 GB/sec</td></tr>
+        <tr><td>Game server processes needed</td><td>~75 matches/process within CPU budget</td><td>~6,700 processes</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h4>API design</h4>
+  <p>Gameplay traffic itself is a custom binary protocol over UDP, not REST — REST is only used for the
+  control plane around matchmaking and server discovery.</p>
+  <pre><code>POST /matchmaking/queue { playerId, mode, region } -> { matchId }
+GET  /matches/{id}/endpoint                        -> { ip, port, sessionToken }
+
+Gameplay protocol (UDP, binary):
+  CLIENT_INPUT     { tick, inputBits, sequenceNum }
+  SERVER_SNAPSHOT  { tick, deltaEntities: [...], ackedInputSeq }
+  RELIABLE_EVENT   { type, payload }   // layered ack/retransmit for
+                                        // things that must not be dropped,
+                                        // e.g. "picked up item"</code></pre>
+
+  <h4>High-level design</h4>
+  <div class="diagram" data-diagram='{
+    "title": "Multiplayer game state sync: matchmaking, authoritative server, and edge",
+    "nodes": [
+      {"id":"clientA","x":30,"y":40,"w":150,"h":60,"kind":"external","label":"Player Client A"},
+      {"id":"clientB","x":30,"y":300,"w":150,"h":60,"kind":"external","label":"Player Client B"},
+      {"id":"matchmaker","x":230,"y":170,"w":170,"h":60,"kind":"compute","label":"Matchmaking Service","sub":"region + skill based"},
+      {"id":"fleet","x":230,"y":430,"w":170,"h":60,"kind":"compute","label":"Game Server Fleet Manager","sub":"allocates instances"},
+      {"id":"gameserver","x":460,"y":170,"w":190,"h":60,"kind":"compute","label":"Authoritative Game Server","sub":"ticks @30Hz"},
+      {"id":"telemetry","x":460,"y":40,"w":190,"h":60,"kind":"queue","label":"Telemetry / Anti-Cheat Pipeline"},
+      {"id":"matchdb","x":460,"y":430,"w":190,"h":60,"kind":"storage","label":"Match History Store"},
+      {"id":"profiledb","x":730,"y":430,"w":170,"h":60,"kind":"storage","label":"Player Profile DB"},
+      {"id":"edgepop","x":730,"y":170,"w":170,"h":60,"kind":"compute","label":"Regional Edge PoP","sub":"cuts round-trip time"}
+    ],
+    "edges": [
+      {"from":"clientA","to":"matchmaker","label":"queue for match"},
+      {"from":"clientB","to":"matchmaker","label":"queue for match"},
+      {"from":"matchmaker","to":"fleet","label":"allocate server"},
+      {"from":"fleet","to":"gameserver","label":"spin up instance"},
+      {"from":"matchmaker","to":"profiledb","label":"skill rating lookup"},
+      {"from":"clientA","to":"edgepop","label":"UDP via nearest PoP"},
+      {"from":"edgepop","to":"gameserver"},
+      {"from":"clientB","to":"gameserver","label":"UDP input"},
+      {"from":"gameserver","to":"clientB","label":"delta snapshot"},
+      {"from":"gameserver","to":"telemetry","label":"events + anti-cheat signals"},
+      {"from":"gameserver","to":"matchdb","label":"match result"}
+    ]
+  }'></div>
+
+  <h4>Deep dive</h4>
+  <p><strong>Client-side prediction and reconciliation.</strong> If a client waited for a full server round
+  trip before showing the result of your own keypress, every game would feel like it was running on a bad
+  internet connection, even on a good one. Instead, the client applies its own input immediately and
+  renders the predicted result, then keeps the last few unacknowledged inputs in a small buffer. When the
+  authoritative snapshot arrives from the server, the client checks whether its prediction matches; if it
+  does not, the client resets to the server's state and re-applies the inputs that server has not
+  acknowledged yet, on top of the corrected state. This "rewind and replay" pattern is the standard answer
+  to "how do you make a game feel instant despite 80ms of latency," and it is documented in detail in
+  classic first-person-shooter networking write-ups such as Valve's Source engine networking model.</p>
+  <p><strong>Interest management (spatial filtering).</strong> Broadcasting every entity in the world to
+  every client does not scale once a map holds 100+ players, and it is also a cheating vector — a modified
+  client that receives full-world data can build "wallhacks" that see through walls. The server instead
+  only sends each client the subset of entities within that client's area of interest, commonly computed
+  with a spatial grid or quadtree, which both shrinks bandwidth and removes information the client was
+  never supposed to have.</p>
+  <p><strong>Lag compensation.</strong> If two players have different ping, a naive "resolve the shot using
+  the state right now" rule systematically favors the player with lower latency. Server-side lag
+  compensation rewinds the server's own history to the timestamp the shooting client actually saw when they
+  fired, and resolves the hit against that rewound state. This makes shooting feel fair for high-ping
+  players, at the cost of an occasional "I got shot from behind a wall I was already behind" complaint from
+  the target, because the world has moved on since the moment being checked.</p>
+
+  <h4>Trade-offs</h4>
+  <div class="callout tradeoff"><p>At 10x the players per match (say, going from a 10-player arena to a
+  100-player battle royale), naive full broadcasts are the first thing to break, because per-client
+  bandwidth and per-tick CPU both grow roughly with player count. Interest management and delta compression
+  buy you a lot of headroom, but eventually a single server process runs out of CPU to simulate everyone at
+  once, and you have to shard the world itself across multiple server processes with a hand-off protocol at
+  the seams — the same "who owns this piece of shared state" problem that shows up whenever you shard
+  anything, just applied to physical space instead of a hash range.</p></div>
+
+  <h4>Say this</h4>
+  <div class="callout say-this"><p>"The server stays the single source of truth for what actually happened,
+  but the client does not wait for it. The client predicts its own input locally, and only rewinds and
+  replays when the server's snapshot disagrees with what it guessed. That is what makes a 30 Hz tick rate
+  over an 80ms connection still feel instant to the player."</p></div>
+
+  <h4>Final design</h4>
+  <p>If you had to draw one picture: clients send input over UDP to a matchmaker-assigned, authoritative
+  game server that ticks the world at a fixed rate, filters each outgoing snapshot down to what that client
+  actually needs to see, and sends delta-compressed updates back; clients predict locally and reconcile
+  against those snapshots; a separate telemetry pipeline captures raw events for anti-cheat and replay,
+  decoupled from the latency-critical gameplay path.</p>
+
+  <h4>EM-level follow-up</h4>
+  <div class="callout em-angle"><p>Build vs. buy: very few teams should hand-roll their own UDP netcode and
+  server-fleet orchestration from day one. Managed multiplayer backends (AWS GameLift, or Agones running on
+  top of Kubernetes) handle server allocation and fleet scaling well, letting your team focus engineering
+  effort on the gameplay-specific state-sync logic that actually differentiates the game. Anti-cheat is a
+  security-adjacent investment that tends to need its own dedicated owner rather than living inside the
+  gameplay team, and rollout to a new region is not just a deploy — it needs a new point of presence, because
+  latency is core gameplay feel here, not a background metric.</p></div>
+</article>
+
+<article class="problem">
+  <h3>Design a Live Customer-Support Chat / Helpdesk System</h3>
+
+  <h4>Problem framing</h4>
+  <p>This is real-time messaging between a customer and a support agent, but the hard part is not moving
+  text around — it is deciding <em>which agent</em> gets each conversation, tracking how long people have
+  been waiting, and handing a chat off cleanly between a bot, a queue, and a human, all while producing a
+  durable record that becomes a support ticket afterward.</p>
+
+  <h4>Clarifying questions</h4>
+  <ul>
+    <li><strong>Is there a chatbot/AI triage step before a human agent?</strong> — this adds a bot service
+    into the routing pipeline and changes what "queue position" even means for the customer.</li>
+    <li><strong>Do we unify multiple channels (web widget, in-app, WhatsApp, email) into one inbox?</strong>
+    — this turns the system into an omnichannel router rather than a single-channel chat app.</li>
+    <li><strong>What SLA do we need to hit?</strong> — a "first response within 2 minutes" commitment
+    requires real-time wait-time estimation and automatic escalation, not just delivery.</li>
+    <li><strong>Can one agent handle multiple chats at once?</strong> — a concurrency cap per agent (e.g. 3
+    chats at a time) changes the routing algorithm from simple round robin to something closer to
+    least-loaded assignment.</li>
+    <li><strong>What are our transcript retention requirements?</strong> — compliance-driven retention
+    (commonly 1-2+ years) shapes storage choice and cost far more than raw message volume does.</li>
+  </ul>
+
+  <h4>Requirements</h4>
+  <p><strong>Functional:</strong> a customer opens a chat and is queued and routed to an available,
+  qualified agent (or a bot first); messages flow in both directions in real time; the agent sees relevant
+  customer context (past tickets, account status) alongside the live chat; a chat can be transferred or
+  escalated to another agent or queue without the customer noticing a dropped connection; the finished
+  conversation is saved as a ticket with the full transcript attached.</p>
+  <p><strong>Non-functional:</strong> message delivery latency under roughly 1 second; high availability,
+  since for many businesses this chat is the primary channel for saving a transaction before a customer
+  abandons it; the ability to absorb sudden spikes (a service outage drives a burst of support chats at
+  once); durable, auditable transcript storage; and live presence and typing indicators so customers know a
+  human is actually there.</p>
+
+  <h4>Capacity estimate</h4>
+  <p>Assume 200,000 customer chats initiated per day, each lasting about 8 minutes with roughly 20 messages
+  exchanged (10 each direction). That is about 4 million messages/day system-wide — modest compared to a
+  consumer messaging app, because support chat volume is bounded by staffing, not by a billion-user base.
+  Support traffic concentrates heavily in business hours, so assume peak load runs about 3x the daily
+  average: average new-chat rate is 200,000 / 86,400 seconds ≈ 2.3 chats/sec, so peak is roughly 7 new chats
+  starting per second, and peak message rate is around 4,000,000 x 3 / 86,400 ≈ 140 messages/sec. The number
+  that actually drives headcount and design is concurrency: assume 5,000 chats open at once at peak. If each
+  agent can handle 3 concurrent chats, you need 5,000 / 3 ≈ 1,700 agents online simultaneously — a staffing
+  constraint the routing engine has to respect, not just an infra number. Storage is cheap: 4 million
+  messages/day at roughly 200 bytes each is about 800 MB/day of raw text, and even a 2-year retention window
+  is only about 800 MB x 730 ≈ 580 GB total — trivial for any document store or blob storage.</p>
+  <div class="table-scroll">
+    <table class="spec-table">
+      <thead><tr><th>Quantity</th><th>Assumption</th><th>Result</th></tr></thead>
+      <tbody>
+        <tr><td>New chats/day</td><td>-</td><td>200,000</td></tr>
+        <tr><td>Messages/day</td><td>~20 msgs/chat</td><td>~4,000,000</td></tr>
+        <tr><td>Peak message rate</td><td>3x avg during business hours</td><td>~140 msgs/sec</td></tr>
+        <tr><td>Concurrent agents needed</td><td>5,000 concurrent chats / 3 per agent</td><td>~1,700 agents online</td></tr>
+        <tr><td>2-year transcript storage</td><td>800 MB/day x 730 days</td><td>~580 GB</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h4>API design</h4>
+  <pre><code>POST /chats { customerId, channel } -> { chatId, queuePosition }
+WS   wss://chat.example.com/sessions/{chatId}
+POST /chats/{id}/messages { senderId, text }   // also used as a
+                                                // webhook ingestion path
+                                                // for channels like WhatsApp
+POST /chats/{id}/transfer { toAgentId | toQueue }
+GET  /agents/{id}/queue -> [ assigned and pending chats ]
+POST /tickets   // fired on chat close, with transcript attached</code></pre>
+
+  <h4>High-level design</h4>
+  <div class="diagram" data-diagram='{
+    "title": "Support chat: routing, presence, and durable transcripts",
+    "nodes": [
+      {"id":"customer","x":30,"y":40,"w":150,"h":60,"kind":"external","label":"Customer Widget/App"},
+      {"id":"agent","x":30,"y":430,"w":150,"h":60,"kind":"external","label":"Agent Desktop"},
+      {"id":"gateway","x":230,"y":230,"w":160,"h":60,"kind":"compute","label":"WS/API Gateway"},
+      {"id":"chatsvc","x":450,"y":100,"w":180,"h":60,"kind":"compute","label":"Chat Session Service","sub":"owns chatId state"},
+      {"id":"routing","x":450,"y":330,"w":180,"h":60,"kind":"compute","label":"Routing/Queue Engine","sub":"skill + priority match"},
+      {"id":"presence","x":450,"y":460,"w":180,"h":60,"kind":"storage","label":"Agent Presence (Redis)"},
+      {"id":"broker","x":690,"y":100,"w":170,"h":60,"kind":"queue","label":"Message Broker (Kafka)"},
+      {"id":"msgstore","x":690,"y":230,"w":170,"h":60,"kind":"storage","label":"Transcript Store"},
+      {"id":"ticketsvc","x":690,"y":460,"w":170,"h":60,"kind":"compute","label":"Ticket/CRM Service"}
+    ],
+    "edges": [
+      {"from":"customer","to":"gateway","label":"open chat session"},
+      {"from":"agent","to":"gateway","label":"agent WS connection"},
+      {"from":"gateway","to":"chatsvc","label":"route message"},
+      {"from":"chatsvc","to":"routing","label":"new chat needs agent"},
+      {"from":"routing","to":"presence","label":"check capacity"},
+      {"from":"routing","to":"chatsvc","label":"assign agent"},
+      {"from":"chatsvc","to":"broker","label":"publish message event"},
+      {"from":"broker","to":"msgstore","label":"persist transcript"},
+      {"from":"broker","to":"ticketsvc","label":"create/update ticket"}
+    ]
+  }'></div>
+
+  <h4>Deep dive</h4>
+  <p><strong>The routing/matching engine is the actual hard part.</strong> This is not a generic pub-sub
+  fan-out problem the way group chat delivery is — it is a constrained matching problem. You need to
+  consider agent skill tags (billing vs. technical support), each agent's current concurrency load, and
+  priority (a paying enterprise customer might skip the general queue). The common design is a priority
+  queue per skill group, with a scheduler that assigns the oldest-waiting compatible chat to the
+  next-available agent — conceptually similar to a load balancer's least-connections algorithm, but with
+  skill constraints layered on top of pure load.</p>
+  <p><strong>Queue-position estimates and SLA breach alerts.</strong> Customers expect to see something like
+  "3rd in queue, about 5 minutes." That requires tracking live queue depth per skill group and a rolling
+  average handle time, recomputed on every queue mutation. SLA breach detection (a chat has waited longer
+  than its target response time and no agent has answered) needs either a periodic sweep or a delayed-queue
+  mechanism that fires an escalation event — the same scheduled-delivery idea used by the notification
+  system problem elsewhere in this chapter, just triggering an internal alert instead of a customer-facing
+  message.</p>
+  <p><strong>Handoff continuity.</strong> When a chat moves from bot to human, or from one agent to another,
+  the customer's WebSocket connection should never notice — only the backend's idea of who currently owns
+  that chatId changes. That means the chat service needs a stable, quickly-updatable chatId-to-current-owner
+  mapping, typically in Redis, that every routing hop consults before delivering a message. This is the same
+  "the logical session outlives the physical connection" pattern used for presence and typing indicators.</p>
+
+  <h4>Trade-offs</h4>
+  <div class="callout tradeoff"><p>At 10x scale, the routing engine breaks before the message pipe does. A
+  single-process, priority-queue-per-skill design that is fine at 5,000 concurrent chats becomes a lock
+  contention bottleneck at 50,000, because every new chat and every agent status change touches shared queue
+  state. Partitioning the routing engine (by skill group or by region) fixes the contention but reintroduces
+  a load-imbalance trade-off: an idle agent pool sitting in one partition cannot absorb a backlog building up
+  in another partition unless you add cross-partition rebalancing, which adds its own complexity.</p></div>
+
+  <h4>Say this</h4>
+  <div class="callout say-this"><p>"I would put a durable broker like Kafka between the chat service and
+  transcript storage, instead of writing to the database synchronously on every message. That way a slow
+  storage write never blocks message delivery to the agent — the agent sees the message instantly, and
+  persistence catches up asynchronously behind it."</p></div>
+
+  <h4>Final design</h4>
+  <p>If you had to draw one picture: customer and agent both hold a WebSocket to a gateway; a chat session
+  service owns each conversation's live state; a routing engine matches waiting chats to available,
+  qualified agents using presence data; every message is also published to a durable broker that
+  asynchronously persists the transcript and, on chat close, opens or updates a ticket in the CRM.</p>
+
+  <h4>EM-level follow-up</h4>
+  <div class="callout em-angle"><p>Build vs. buy: most companies should buy a helpdesk chat platform
+  (Zendesk, Intercom, Salesforce Service Cloud) rather than build this. Building in-house is only justified
+  when chat is a core product differentiator, or when you need routing logic too custom for off-the-shelf
+  tools — for example, blending human agents with an in-house AI triage bot in a way a vendor's product
+  cannot express. On rollout: this system touches CRM and customer data, so shipping it needs data-privacy
+  sign-off and integration work with whichever team owns the CRM, not just an infra deploy.</p></div>
+</article>
+
+<article class="problem">
+  <h3>Design a Collaborative Whiteboard (Figma-style)</h3>
+
+  <h4>Problem framing</h4>
+  <p>Multiple people see and edit a shared 2D canvas of shapes, text, and drawings at the same time, each
+  seeing everyone else's cursor and edits live, and every editor's canvas converges to the same final state
+  even when two people edit at once without coordinating. It is the same core problem as Google-Docs-style
+  collaborative editing — a shared mutable document with many concurrent writers — but the objects are
+  independent graphical shapes instead of a single linear string of characters, which changes which
+  conflict-resolution technique fits best.</p>
+
+  <h4>Clarifying questions</h4>
+  <ul>
+    <li><strong>Do we need offline editing that syncs later?</strong> — this pushes hard toward a CRDT
+    (conflict-free replicated data type, a data structure designed so concurrent edits always merge to the
+    same result without a central coordinator) rather than OT (operational transformation, which usually
+    needs a central server to sequence operations).</li>
+    <li><strong>What is the largest realistic canvas — hundreds of objects, or tens of thousands?</strong> —
+    this decides whether we can keep an entire document in memory on one session server or need spatial
+    indexing.</li>
+    <li><strong>Do we need version history or time-travel through past states?</strong> — this decides
+    whether we need to keep a full operation log, not just current state.</li>
+    <li><strong>Do we show live cursors and per-user selection highlighting?</strong> — this adds a
+    lightweight, non-durable broadcast channel on top of the durable edit stream.</li>
+    <li><strong>Do we need comments anchored to objects that can move or resize?</strong> — this affects the
+    data model for how a comment stays attached to a shape as it changes.</li>
+  </ul>
+
+  <h4>Requirements</h4>
+  <p><strong>Functional:</strong> multiple users open the same document and see the same canvas; edits
+  (create, move, resize, delete a shape, edit text) propagate to every other viewer within roughly a second;
+  every viewer sees other users' live cursor positions; concurrent conflicting edits converge automatically
+  without a manual merge step; undo/redo affects only the user who triggered it, not everyone else's edits;
+  the document persists and can be reopened later with its full history intact.</p>
+  <p><strong>Non-functional:</strong> low latency for propagation — roughly under 150 ms for cursor
+  movement and under 1 second for durable edits; eventual consistency across replicas is acceptable, because
+  availability matters more than strict consistency here — an editor should never be blocked from typing
+  while the system reaches agreement; scale to a few hundred concurrent editors on any single document, but
+  many thousands of documents open concurrently platform-wide.</p>
+
+  <h4>Capacity estimate</h4>
+  <p>Assume 2 million daily active users with an average session length of 20 minutes. Using a Little's-Law
+  style estimate with a 3x peak concentration factor, concurrent users at peak are roughly
+  2,000,000 x (20/1,440) x 3 ≈ 83,000. Assuming an average of 3 concurrent editors per open document at peak
+  gives roughly 28,000 concurrently-open documents. Each edit operation (say, moving a shape) serializes to
+  roughly 100-300 bytes — an object ID plus a small delta. An actively-dragging editor generates on the
+  order of 2 operations/sec after client-side throttling (you do not send an update per pixel moved), so
+  83,000 active editors x 2 ops/sec ≈ 166,000 operations/sec platform-wide, and each operation fans out to
+  the roughly 2 other co-editors on that same document, giving about 332,000 fan-out messages/sec. That is a
+  message-rate problem, not a bandwidth problem: at ~300 bytes each, aggregate bandwidth is only about 100
+  MB/sec. Storage is dominated by history, not live state: assume an average document, including its full
+  operation log, lands around 500 KB, and the platform stores 20 million documents total — that is
+  20,000,000 x 500 KB ≈ 10 TB, comfortably handled by blob storage.</p>
+  <div class="table-scroll">
+    <table class="spec-table">
+      <thead><tr><th>Quantity</th><th>Assumption</th><th>Result</th></tr></thead>
+      <tbody>
+        <tr><td>Concurrent editors at peak</td><td>2M DAU, 20-min sessions, 3x peak factor</td><td>~83,000</td></tr>
+        <tr><td>Concurrently open documents</td><td>~3 editors/doc at peak</td><td>~28,000</td></tr>
+        <tr><td>Platform-wide op rate</td><td>2 ops/sec/active editor</td><td>~166,000 ops/sec</td></tr>
+        <tr><td>Fan-out message rate</td><td>~2 co-editors per doc</td><td>~332,000 msgs/sec</td></tr>
+        <tr><td>Total document storage</td><td>20M docs x ~500 KB (incl. history)</td><td>~10 TB</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h4>API design</h4>
+  <pre><code>POST /docs                      -> { docId }
+GET  /docs/{id}/snapshot        -> latest merged state (for a fresh join)
+GET  /docs/{id}/history?range=  -> op log slice, for time-travel
+
+WS wss://board.example.com/docs/{docId}
+  -> OP              { opId, type: create|update|delete|move,
+                        objectId, payload, clock }
+  -> CURSOR          { userId, x, y }        // ephemeral, never persisted
+  &lt;- PRESENCE_JOIN / PRESENCE_LEAVE
+  &lt;- SNAPSHOT_REQUEST / SNAPSHOT</code></pre>
+
+  <h4>High-level design</h4>
+  <div class="diagram" data-diagram='{
+    "title": "Collaborative whiteboard: durable ops vs ephemeral presence",
+    "nodes": [
+      {"id":"userA","x":30,"y":40,"w":150,"h":60,"kind":"external","label":"Editor A"},
+      {"id":"userB","x":30,"y":300,"w":150,"h":60,"kind":"external","label":"Editor B"},
+      {"id":"wsgw","x":230,"y":170,"w":160,"h":60,"kind":"compute","label":"WS Gateway"},
+      {"id":"sessionsvc","x":450,"y":100,"w":190,"h":60,"kind":"compute","label":"Document Session Server","sub":"holds live CRDT state"},
+      {"id":"cursorpubsub","x":450,"y":330,"w":190,"h":60,"kind":"storage","label":"Cursor/Presence Pub-Sub","sub":"ephemeral, not persisted"},
+      {"id":"oplog","x":700,"y":40,"w":170,"h":60,"kind":"queue","label":"Op Log (append-only)"},
+      {"id":"snapshotstore","x":700,"y":200,"w":170,"h":60,"kind":"storage","label":"Snapshot Store"},
+      {"id":"metadb","x":700,"y":360,"w":170,"h":60,"kind":"storage","label":"Doc Metadata DB"}
+    ],
+    "edges": [
+      {"from":"userA","to":"wsgw"},
+      {"from":"userB","to":"wsgw"},
+      {"from":"wsgw","to":"sessionsvc","label":"durable ops"},
+      {"from":"wsgw","to":"cursorpubsub","label":"live cursor (fire-and-forget)"},
+      {"from":"sessionsvc","to":"oplog","label":"append op"},
+      {"from":"oplog","to":"snapshotstore","label":"periodic compaction"},
+      {"from":"sessionsvc","to":"snapshotstore","label":"fetch on join"},
+      {"from":"sessionsvc","to":"metadb","label":"permissions/ownership"}
+    ]
+  }'></div>
+
+  <h4>Deep dive</h4>
+  <p><strong>CRDT fits this shape better than OT.</strong> Linear text is naturally suited to OT, because
+  every character has a position that shifts when something earlier in the string changes, and OT usually
+  needs a central server to sequence those shifts consistently (see the Google-Docs-style problem elsewhere
+  in this chapter for that case). A whiteboard's shapes are independent objects with their own properties —
+  position, size, color, z-order — so each property maps naturally onto a CRDT like a last-writer-wins
+  register, tie-broken by a Lamport timestamp (a logical clock that orders events without needing
+  synchronized wall-clock time) combined with the client ID. Object existence itself is tracked with an
+  OR-Set (observed-remove set), a CRDT that supports both adding and removing members without the removes
+  and adds racing each other into an inconsistent state. Neither of these needs a central sequencer, which
+  is why CRDTs also tolerate offline editing and session-server restarts gracefully.</p>
+  <p><strong>Conflicts that are not simple property overwrites.</strong> Two users resizing the same shape
+  from opposite corners at once is handled fine by last-writer-wins per property — it looks slightly jumpy
+  but converges to one consistent result. The harder case is one user deleting a shape while another is
+  moving it. The common rule is "delete wins, but only if the deleting client had actually observed the
+  object" — implemented with a tombstone in the OR-Set — so a move that arrives for an already-tombstoned
+  object is simply dropped, and the deleting user's screen correctly shows the object gone regardless of the
+  race.</p>
+  <p><strong>Snapshot and op-log compaction.</strong> Replaying every operation since a two-year-old
+  document's creation every time someone opens it would make loading unbearably slow. The session server
+  periodically writes a compacted snapshot of the fully-merged state to blob storage; a client joining fresh
+  only needs the latest snapshot plus the handful of operations since it. The complete, uncompacted operation
+  log is kept separately in cold storage to still support full version history and time-travel.</p>
+
+  <h4>Trade-offs</h4>
+  <div class="callout tradeoff"><p>At 10x scale on a single document — say, a company all-hands brainstorm
+  board going from 3 concurrent editors to 30+ — the in-memory, one-session-server-per-document model
+  becomes a hotspot. That one process now has to broadcast every operation to 30 sockets and merge 30x the
+  operation rate, and if it lives on one machine, that machine's CPU and network become the ceiling for that
+  single document, no matter how idle the rest of the fleet is. The practical fixes are capping effective
+  concurrent editors per canvas region (spatial partitioning of very large boards) or simply accepting this
+  as a vertical-scaling problem for that one hot document, rather than pretending it is horizontally
+  scalable like the rest of the fleet.</p></div>
+
+  <h4>Say this</h4>
+  <div class="callout say-this"><p>"I would pick a CRDT over operational transformation here specifically
+  because whiteboard objects are independent of each other, unlike text where every character's position
+  depends on everything before it. That means I do not need a central sequencing server, and a session
+  server restart cannot break convergence — every client's CRDT state merges back to the same result on its
+  own."</p></div>
+
+  <h4>Final design</h4>
+  <p>If you had to draw one picture: editors hold a WebSocket to a document session server that keeps the
+  live CRDT state in memory; durable edits go through an append-only op log that is periodically compacted
+  into snapshots for fast reload and full history is retained for time-travel; live cursors travel over a
+  completely separate, ephemeral pub-sub channel that never touches durable storage, because nobody needs a
+  five-second-old cursor position.</p>
+
+  <h4>EM-level follow-up</h4>
+  <div class="callout em-angle"><p>Build vs. buy: a team building an internal tool should almost always
+  reach for an existing CRDT library (Yjs, Automerge) rather than writing a merge engine from scratch — that
+  is only worth building in-house when real-time collaboration is the product's core differentiator, the
+  way it is for Figma. On rollout: changing a conflict-resolution rule, like how delete-vs-edit races
+  resolve, is a compatibility risk, not just a code change — an old client with an outdated CRDT
+  implementation talking to a new session server can silently diverge from everyone else, so this kind of
+  change needs careful client-version gating, which is a cross-team rollout concern involving whoever owns
+  client release cadence.</p></div>
+</article>
+<article class="problem">
+  <h3>Design a Presence System (Online/Offline/Typing Indicators)</h3>
+
+  <h4>Problem framing</h4>
+  <p>This is the small green dot next to a contact's name, the "last seen 2 hours ago" text, and the "Alex is typing..." bubble. Stripped of buzzwords: track whether each user is currently connected, broadcast that state to the small set of other people who care, and do it as a standalone service that chat, collaborative docs, and any other product can plug into, instead of re-building it inside each one.</p>
+
+  <h4>Clarifying questions</h4>
+  <ul>
+    <li><strong>Which products consume this presence data?</strong> — why it matters: if only chat needs it, presence can live inside the chat service. If docs, whiteboards, and chat all need it, presence should be its own shared service with a stable API, which changes the design from a feature into a platform.</li>
+    <li><strong>How stale can "online" be before it is wrong enough to matter?</strong> — why it matters: a 1-2 second lag is invisible to a human; a 10-minute lag makes the feature look broken. This sets the heartbeat interval and the grace period before marking someone offline.</li>
+    <li><strong>Do we need a durable "last seen" timestamp, or only live state?</strong> — why it matters: live state can live entirely in a fast in-memory store with no durability guarantees. "Last seen 3 days ago" requires an actual durable write path.</li>
+    <li><strong>Is subscription per-contact (a friends/DM list) or per-group (everyone in a channel)?</strong> — why it matters: a busy 10,000-member channel showing "who's online" is a very different fan-out shape than a person with 150 contacts — it pushes the design toward aggregated counts instead of per-user pushes for large groups.</li>
+    <li><strong>Do typing indicators need to survive a page reload or reconnect?</strong> — why it matters: if not, they can be pure, unpersisted, best-effort state with a short TTL, which massively simplifies the design.</li>
+  </ul>
+
+  <h4>Requirements</h4>
+  <p><strong>Functional:</strong> a client reports itself online implicitly by holding an open connection; a user can set an explicit status (away, do-not-disturb, invisible); the system auto-marks a user offline after their connection drops and stays dropped past a grace period; any client can subscribe to a list of user IDs and receive both the current snapshot and future updates; typing-start/typing-stop events scope to one conversation and auto-expire; last-seen time is available for offline users.</p>
+  <p><strong>Non-functional:</strong> updates should reach subscribers within a couple of seconds, not necessarily faster; the system must survive massive fan-out spikes (a popular account coming online) without falling over; presence data is allowed to be eventually consistent — a few seconds of a stale "online" dot is an acceptable, expected trade, not a bug; presence being down must never take down the host chat product itself.</p>
+
+  <h4>Capacity estimate</h4>
+  <p>Assume this backs a large chat product: 500M daily active users, with roughly 15% concurrently connected at peak — that is 75M concurrent connections.</p>
+  <p><strong>Heartbeats:</strong> each connection pings every 30 seconds to prove it is still alive. 75M / 30s ≈ 2.5M heartbeats/sec hitting the presence layer at peak.</p>
+  <p><strong>State transitions:</strong> people open and close the app constantly. Assume 8% of concurrently-online users transition state (connect, disconnect, go idle) within any given minute: 0.08 × 75M = 6M transitions/minute ≈ 100,000 transitions/sec.</p>
+  <p><strong>Fan-out:</strong> assume an average user has 150 contacts, and at any moment about 20% of those contacts are themselves online and subscribed (the rest will just see the correct state on their next reconnect, for free, with no push needed). Fan-out per transition ≈ 150 × 0.2 = 30 pushes. Total push volume = 100,000/sec × 30 ≈ 3,000,000 presence-push messages/sec at peak. This number, not the heartbeat count, is the real bottleneck — it is what has to move through the WebSocket gateway layer.</p>
+  <p><strong>Storage:</strong> presence state is small — status enum, last-seen timestamp, and which gateway shard owns the connection, roughly 100 bytes/user. Only recently-active users need to be resident in a fast store; assume a rolling window of 200M "seen in the last 24h" users at 100 bytes each ≈ 20GB, comfortably inside a modest Redis cluster. Durable last-seen timestamps for the full user base, written asynchronously, are roughly 50 bytes/row — well under 100GB for a billion-plus users, trivial for a wide-column store.</p>
+  <p><strong>Typing indicators:</strong> much higher event rate, but tiny fan-out scope — only the people in one open conversation, not a contact list. Assume 5M concurrently open conversations platform-wide, with 2% having someone actively typing at any instant: 100,000 concurrent typing states, each fanned out to at most a few hundred participants (usually 2, for a DM). Total typing fan-out volume stays well under the presence fan-out number above, which is why it is safe to route typing events over the same per-conversation channel chat messages already use, instead of building a separate pipeline for them.</p>
+
+  <h4>API design</h4>
+  <p>Presence is a streaming problem, so most of the surface is WebSocket control frames, not REST:</p>
+  <pre><code>WS CONNECT                      -> implicit ONLINE for this user
+WS HEARTBEAT (ping/pong, 30s)
+WS SUBSCRIBE {user_ids: [...]}  -> returns current snapshot + future pushes
+WS UNSUBSCRIBE {user_ids: [...]}
+WS SET_STATUS {status: online|away|dnd|invisible}
+WS TYPING_START {conversation_id}   (auto-expires ~8s without a follow-up)
+WS TYPING_STOP {conversation_id}
+
+Server push:
+WS PRESENCE_UPDATE {user_id, status, last_seen}
+
+REST fallback (clients that cannot hold a socket):
+GET /presence?user_ids=1,2,3 -> [{user_id, status, last_seen}, ...]</code></pre>
+
+  <h4>High-level design</h4>
+  <div class="diagram" data-diagram='{
+    "title": "Presence system: sharded state + selective push fan-out",
+    "nodes": [
+      {"id":"clienta","x":20,"y":20,"w":190,"h":60,"kind":"external","label":"Client A","sub":"connect + heartbeat"},
+      {"id":"clientb","x":20,"y":460,"w":190,"h":60,"kind":"external","label":"Client B","sub":"typing in conv X"},
+      {"id":"gw1","x":260,"y":20,"w":190,"h":60,"kind":"compute","label":"WS Gateway","sub":"terminates connections"},
+      {"id":"presence","x":260,"y":140,"w":190,"h":60,"kind":"compute","label":"Presence Service","sub":"sharded by user_id"},
+      {"id":"redis","x":260,"y":260,"w":190,"h":60,"kind":"storage","label":"Redis","sub":"state, TTL 45s"},
+      {"id":"reaper","x":260,"y":380,"w":190,"h":60,"kind":"compute","label":"Grace-Period Reaper","sub":"scans expired heartbeats"},
+      {"id":"pubsub","x":520,"y":140,"w":190,"h":60,"kind":"queue","label":"Shard Pub/Sub","sub":"per presence shard"},
+      {"id":"gw2","x":520,"y":20,"w":190,"h":60,"kind":"compute","label":"WS Gateway","sub":"subscriber connection"},
+      {"id":"db","x":520,"y":380,"w":190,"h":60,"kind":"storage","label":"Last-Seen Store","sub":"async write, wide-column"},
+      {"id":"subscriber","x":790,"y":20,"w":190,"h":60,"kind":"external","label":"Subscribed Contact"}
+    ],
+    "edges": [
+      {"from":"clienta","to":"gw1","label":"heartbeat every 30s"},
+      {"from":"clientb","to":"gw1","label":"typing_start(conv X)"},
+      {"from":"gw1","to":"presence","label":"mark online / relay typing"},
+      {"from":"presence","to":"redis","label":"SET state, TTL 45s"},
+      {"from":"presence","to":"pubsub","label":"publish PRESENCE_UPDATE"},
+      {"from":"presence","to":"db","label":"async last_seen write"},
+      {"from":"reaper","to":"redis","label":"scan expired keys"},
+      {"from":"reaper","to":"pubsub","label":"publish OFFLINE"},
+      {"from":"pubsub","to":"gw2","label":"fan out to online subscribers only"},
+      {"from":"gw2","to":"subscriber","label":"push update"}
+    ],
+    "groups": [
+      {"x":245,"y":115,"w":485,"h":345,"label":"Presence service: owns state + its own pub/sub, sharded"}
+    ]
+  }'></div>
+
+  <h4>Deep dive</h4>
+  <p><strong>1) Push-vs-pull fan-out efficiency.</strong> Shard the presence service by <code>user_id</code> using consistent hashing (see Ch.5) so a given user's state and the pub/sub for their shard live on the same node — a status write and its fan-out never cross an extra network hop. Track which subscribers currently hold an open connection in a connection registry, and only push to those. Offline subscribers get the correct state for free the next time they reconnect and pull a snapshot, so the system never spends fan-out cost pushing into a socket nobody is listening on.</p>
+  <p><strong>2) Flicker suppression.</strong> Mobile networks drop and reconnect constantly. Marking a user offline the instant their socket drops, then online again two seconds later, spams every contact with two updates for something that was never really a state change. The fix is a grace period: do not broadcast OFFLINE until N seconds (commonly 30-45s) pass with no heartbeat, and cancel the pending broadcast if a reconnect lands inside that window. This is the same debounce idea used for noisy UI input, applied to distributed state.</p>
+  <p><strong>3) Typing indicators as deliberately lossy state.</strong> Store each as a Redis key scoped to <code>conversation_id + user_id</code> with a short TTL (5-8s) and no durability at all. If a push is dropped, nobody notices or cares — unlike a chat message, where the WhatsApp/Messenger problem elsewhere in this chapter cares a great deal about at-least-once delivery. Riding on the conversation's existing WebSocket channel, instead of a dedicated one, also avoids doubling the connection count per user.</p>
+
+  <h4>Trade-offs</h4>
+  <div class="callout tradeoff"><p>At 10x scale, the online-only push filter above still breaks for outlier accounts: a public figure with 50,000 contacts going online fans out 50,000 pushes in one shot from a single state change, no matter how efficient the filter is. The fix is to cap fan-out for very-high-contact accounts and fall back to pull-on-view for their followers, which trades a little staleness for protecting the whole gateway tier from one account's blast radius.</p></div>
+
+  <h4>Say this</h4>
+  <div class="callout say-this"><p>"I'd treat presence as eventually consistent on purpose — a green dot that's two seconds stale is invisible to a user, but a state-change grace period of 30-45 seconds before I broadcast OFFLINE saves me from spamming every contact every time someone's phone loses signal for a moment on the subway."</p></div>
+
+  <h4>Final design</h4>
+  <p>WebSocket gateways terminate client connections. A presence service, sharded by user ID, owns both the state and the pub/sub for its shard, so heartbeats update Redis and trigger fan-out in one local hop. A reaper scans for expired heartbeats and emits OFFLINE after the grace period. Fan-out pushes only to subscribers who are themselves online right now; everyone else picks up the correct state on reconnect. Last-seen timestamps are written asynchronously to a durable store so the hot path never blocks on durability.</p>
+
+  <h4>EM-level follow-up</h4>
+  <div class="callout em-angle"><p>Presence should be pitched as a shared platform capability other product teams (chat, docs, whiteboard) consume through one API, not something each team rebuilds. For an early-stage product, a managed real-time service like PubNub, Ably, or Firebase Realtime Database already ships presence out of the box — building it in-house is worth the investment only once connection volume and fan-out cost justify owning it. And presence must degrade as an optional layer: if the presence service goes down, chat itself keeps working, just without the green dot — that is the bulkhead pattern from Ch.15 applied to a "nice to have" feature.</p></div>
+</article>
+
+<article class="problem">
+  <h3>Design a Gmail-Style Email Service</h3>
+
+  <h4>Problem framing</h4>
+  <p>Stripped of buzzwords, an email service does four things: accept mail addressed to a user from anywhere on the internet, let a user send mail to anywhere on the internet, store and organize a growing pile of messages per mailbox, and let the user search and read that pile fast. The protocol that moves mail between mail servers, SMTP (Simple Mail Transfer Protocol), is decades old and not something you redesign — the interesting system-design work is everything around it: storage, dedup, indexing, and spam defense.</p>
+
+  <h4>Clarifying questions</h4>
+  <ul>
+    <li><strong>Are we building the full mail-transfer stack (accepting inbound SMTP from the public internet), or just the mailbox product on top of an existing sending provider?</strong> — why it matters: running your own inbound MTA (mail transfer agent, the server that speaks SMTP) means owning spam filtering, DNS/MX configuration, and abuse defense. Many real products skip this and only send, via a service like SES or SendGrid.</li>
+    <li><strong>What scale — a personal product at millions of users, or a Gmail/Outlook-scale product at a billion-plus mailboxes?</strong> — why it matters: it changes whether a single sharded metadata store is enough or whether you need per-mailbox isolation for both storage and search.</li>
+    <li><strong>Do we need full-text search across a mailbox's entire history?</strong> — why it matters: this adds a whole indexing pipeline (Ch.11's inverted index) on top of plain storage.</li>
+    <li><strong>Labels (a message can carry many) or folders (a message lives in exactly one)?</strong> — why it matters: this is the single biggest data-model decision in a mail product and changes both the metadata schema and the UI.</li>
+    <li><strong>What's the durability bar?</strong> — why it matters: unlike a social feed, losing an email is treated as a serious incident by users, so the durability requirement here is closer to a banking ledger than to a Twitter timeline.</li>
+  </ul>
+
+  <h4>Requirements</h4>
+  <p><strong>Functional:</strong> compose and send mail; receive mail addressed to the user's domain; label/organize messages; group messages into conversation threads; full-text search across a mailbox; handle attachments; filter spam and malware before a message reaches an inbox.</p>
+  <p><strong>Non-functional:</strong> durability close to "never lose a delivered message"; read latency under a few hundred milliseconds for inbox load; availability high enough that mail delivery keeps working during a regional outage; storage has to grow smoothly for years, not months, without a redesign; search can be eventually consistent — a message showing up in search a few seconds after it's stored is fine.</p>
+
+  <h4>Capacity estimate</h4>
+  <p>Assume 300M daily active mailboxes, averaging 25 received messages/day each (a mix of personal mail and a lot of automated and marketing mail): 300M × 25 = 7.5B messages received/day ≈ 86,800/sec average, and roughly 350,000/sec at a 4x business-hours peak. Sends are far fewer — most received mail is one-to-many automated mail, not a reply — call it 940M sends/day ≈ 11,000/sec average.</p>
+  <p><strong>Storage:</strong> most messages are small text, but a meaningful minority carry attachments. Assume 90% average 15KB (plain text plus light HTML) and 10% average 500KB (attachments, photos, PDFs): weighted average ≈ 0.9×15KB + 0.1×500KB ≈ 63.5KB/message raw. 7.5B/day × 63.5KB ≈ 476TB/day of raw body bytes before any dedup.</p>
+  <p>Here's the important real-architecture detail: one message sent to many recipients does not need to be physically copied into every mailbox. Storing the raw body once, keyed by a content hash, and pointing every recipient's mailbox at that one copy via metadata cuts effective new-blob storage by roughly 40% in this estimate — call it ~286TB/day of net new blob storage. Over a year that is over 100PB, which is why any real mail service tiers storage: recent mail on fast disks, older mail on cheap archival storage.</p>
+  <p><strong>Metadata:</strong> even with shared blobs, every recipient still needs their own metadata row — labels, read state, thread pointer — because two recipients can label or delete "the same" message independently. That's roughly one row per delivery, not per unique blob: 7.5B deliveries/day × ~300 bytes/row ≈ 2.25TB/day of metadata, small next to blob storage but still far too much for a single-node relational database — it needs to be sharded by mailbox (Ch.6).</p>
+
+  <h4>API design</h4>
+  <p>Ingress and egress for mail between servers is SMTP itself, not a REST API — an MX-advertised server accepts inbound mail on port 25 from any sender on the internet, and a separate authenticated submission endpoint on port 587 accepts outbound mail from the product's own logged-in users. The client-facing API on top of storage looks like:</p>
+  <pre><code>POST /messages/send        {to, cc, bcc, subject, body, attachments[]}
+GET  /threads?labelId=INBOX&pageToken=...
+GET  /threads/{threadId}   -> ordered messages in the conversation
+POST /messages/{id}/labels {add: [...], remove: [...]}
+GET  /search?q=from:alice has:attachment
+      (IMAP/POP3 gateways expose the same mailbox to third-party clients)</code></pre>
+
+  <h4>High-level design</h4>
+  <div class="diagram" data-diagram='{
+    "title": "Gmail-style architecture: single-copy storage, per-recipient metadata",
+    "nodes": [
+      {"id":"sender","x":20,"y":20,"w":190,"h":60,"kind":"external","label":"Sender Mail Client"},
+      {"id":"submit","x":250,"y":20,"w":190,"h":60,"kind":"compute","label":"SMTP Submission (587)","sub":"auth + rate limit"},
+      {"id":"outq","x":480,"y":20,"w":170,"h":60,"kind":"queue","label":"Outbound Queue"},
+      {"id":"mtaout","x":700,"y":20,"w":190,"h":60,"kind":"compute","label":"Outbound MTA","sub":"MX lookup, backoff retries"},
+      {"id":"internet","x":20,"y":140,"w":190,"h":60,"kind":"external","label":"Internet / Remote MTAs"},
+      {"id":"spam","x":250,"y":140,"w":190,"h":60,"kind":"compute","label":"Spam/Virus Scan"},
+      {"id":"blob","x":480,"y":140,"w":190,"h":60,"kind":"storage","label":"Blob Store","sub":"content-hash, single copy"},
+      {"id":"metadb","x":700,"y":140,"w":190,"h":60,"kind":"storage","label":"Metadata DB","sub":"per-recipient labels, thread"},
+      {"id":"indexq","x":480,"y":260,"w":190,"h":60,"kind":"queue","label":"Indexing Queue"},
+      {"id":"searchidx","x":700,"y":260,"w":190,"h":60,"kind":"storage","label":"Search Index","sub":"sharded per mailbox"},
+      {"id":"client","x":20,"y":380,"w":190,"h":60,"kind":"external","label":"Webmail / Mobile Client"},
+      {"id":"apigw","x":250,"y":380,"w":190,"h":60,"kind":"compute","label":"Mail API / IMAP Gateway"},
+      {"id":"push","x":480,"y":380,"w":190,"h":60,"kind":"compute","label":"New-Mail Push","sub":"WS / FCM / APNs"}
+    ],
+    "edges": [
+      {"from":"sender","to":"submit","label":"authenticated send"},
+      {"from":"submit","to":"outq","label":"enqueue for delivery"},
+      {"from":"outq","to":"mtaout","label":"dequeue, retry with backoff"},
+      {"from":"mtaout","to":"internet","label":"deliver via MX (SMTP 25)"},
+      {"from":"internet","to":"spam","label":"inbound mail via MX"},
+      {"from":"spam","to":"blob","label":"store raw MIME once"},
+      {"from":"spam","to":"metadb","label":"one metadata row per recipient"},
+      {"from":"blob","to":"indexq","label":"enqueue for indexing"},
+      {"from":"indexq","to":"searchidx","label":"build inverted index"},
+      {"from":"metadb","to":"apigw","label":"thread / label list"},
+      {"from":"blob","to":"apigw","label":"message body"},
+      {"from":"metadb","to":"push","label":"new-mail trigger"},
+      {"from":"apigw","to":"client","label":"response"},
+      {"from":"push","to":"client","label":"push notification"}
+    ]
+  }'></div>
+
+  <h4>Deep dive</h4>
+  <p><strong>1) Reliable delivery between mail servers.</strong> SMTP delivery is store-and-forward: the outbound MTA looks up the recipient domain's MX (Mail Exchange) DNS record to find where to deliver, and if that server is briefly unreachable or returns a temporary (4xx) error, the message sits in an outbound queue and retries with exponential backoff for hours or days before giving up and bouncing. This is exactly the "queue as a durable buffer" idea from Ch.14, applied at internet scale between organizations that don't trust or control each other's uptime.</p>
+  <p><strong>2) Single-copy storage with per-recipient metadata.</strong> The real Gmail-style design choice is to never physically duplicate a message body per recipient. The body is written once to a content-addressed blob store (its storage key is derived from a hash of its contents), and every recipient mailbox gets its own lightweight metadata row pointing at that one blob, carrying that recipient's own labels, thread assignment, and read state independently. This is also why Gmail models organization as labels (many-to-many tags) rather than folders (one exclusive location) — a message can be both "Work" and "Starred" without being duplicated into two places.</p>
+  <p><strong>3) Search sharded per mailbox, not global.</strong> A single global full-text index across every user's mail would leak query patterns across tenants and would put every user's search behind one giant, contended index. Instead, each mailbox gets its own index shard (see Ch.11 on Elasticsearch's inverted index), built asynchronously off the same indexing queue that processes new mail. This keeps one mailbox's indexing backlog from ever slowing down another user's search.</p>
+
+  <h4>Trade-offs</h4>
+  <div class="callout tradeoff"><p>At 10x scale, a single company-wide email with 50,000 recipients turns "one send" into 50,000 metadata writes fired from one MTA hop. That fan-out write, not blob storage, is what saturates the metadata database first. The fix is to make recipient fan-out itself async — the sending MTA hands off to a queue, and a pool of workers creates the 50,000 metadata rows over the next few seconds — trading a small, invisible delay for never blocking the sender on 50,000 synchronous writes.</p></div>
+
+  <h4>Say this</h4>
+  <div class="callout say-this"><p>"I'd store the message body once, content-addressed, and give every recipient their own metadata row pointing at it — that avoids duplicating storage on every send. But for a large recipient list, I'd make that per-recipient metadata write itself asynchronous through a queue, because the fan-out write volume, not the storage, is what breaks first at scale."</p></div>
+
+  <h4>Final design</h4>
+  <p>Inbound mail arrives via MX-advertised SMTP, passes spam/virus scanning, and its body is written once to content-addressed blob storage. A fan-out step writes one metadata row per recipient mailbox. An async indexing pipeline builds a per-mailbox search index off the same event. Outbound mail goes through an authenticated submission endpoint into a retry queue that delivers via SMTP to the recipient's MX. Clients read through an API/IMAP gateway that joins metadata, blob bodies, and search, and get push-notified on new mail.</p>
+
+  <h4>EM-level follow-up</h4>
+  <div class="callout em-angle"><p>This is a build-vs-buy call before it's an implementation detail. Very few companies run their own inbound MTA and spam stack — most either buy the whole mailbox product (Google Workspace, Microsoft 365) or, if only sending a feature's transactional mail, buy sending infrastructure (SES, SendGrid) and skip receiving entirely. Building a full Gmail-equivalent is realistically only justified at the scale of the handful of companies who already run one. Cross-team impact matters too: deliverability — whether other mail providers trust your outbound IPs — is a shared reputation resource across every team that sends mail from the platform, so one team's careless marketing blast can get everyone's transactional email flagged as spam. That's an org-design problem, not just an engineering one.</p></div>
+</article>
+
+<article class="problem">
+  <h3>Design an SMS/OTP Delivery System</h3>
+
+  <h4>Problem framing</h4>
+  <p>This is the system behind the six-digit code a user gets by text to log in, confirm a payment, or reset a password. Stripped of buzzwords: generate a short-lived one-time code, hand it to a telecom partner to deliver as an SMS, and verify what the user types back against it — reliably, cheaply, and without letting attackers use it to guess passwords or bomb strangers with texts.</p>
+
+  <h4>Clarifying questions</h4>
+  <ul>
+    <li><strong>Is SMS the only channel, or is there a fallback/primary like app push or WhatsApp?</strong> — why it matters: SMS costs real money per message and has carrier-dependent delivery delays; a free push-notification channel as the default with SMS as fallback changes both cost and latency dramatically.</li>
+    <li><strong>Single country or global delivery?</strong> — why it matters: global delivery means routing through different telecom aggregators per country/region, each with different pricing, reliability, and local regulatory requirements (like sender-ID registration).</li>
+    <li><strong>What abuse protection is expected — is OTP-bombing (spamming a phone with unwanted codes) a known concern?</strong> — why it matters: without rate limiting per phone and per IP, this system becomes a free tool for harassment and a source of real cost (toll fraud), so this cannot be an afterthought.</li>
+    <li><strong>How many verify attempts and how long an expiry?</strong> — why it matters: a 4-6 digit code is a small keyspace; unlimited guesses turn OTP verification into a trivially brute-forceable lock.</li>
+    <li><strong>Do we need delivery receipts (confirmation the carrier actually delivered the SMS)?</strong> — why it matters: without them, the system can't distinguish "user hasn't typed the code yet" from "the SMS never arrived," which matters for support and for provider failover decisions.</li>
+  </ul>
+
+  <h4>Requirements</h4>
+  <p><strong>Functional:</strong> generate an OTP and send it via SMS; verify a submitted code against the stored one within an attempt limit and an expiry window; support a cooldown-gated resend; fail over automatically between multiple SMS providers; accept async delivery-receipt callbacks from providers; rate-limit requests per phone number and per IP/device.</p>
+  <p><strong>Non-functional:</strong> delivery should typically complete within a few seconds, understanding that final mile timing is carrier-dependent and outside this system's control; high availability, since a broken OTP flow blocks login/signup entirely; strong resistance to brute-force guessing and to bulk-send abuse; cost per message is a first-class concern here, unlike most systems in this book, because every single send has a real, non-trivial dollar cost.</p>
+
+  <h4>Capacity estimate</h4>
+  <p>Assume a product issuing 25M OTPs/day platform-wide (login, signup, password reset, payment confirmation combined, including resends). 25M / 86,400s ≈ 289/sec average; assume a 6x peak factor for daytime/business-hour clustering and campaign-driven signup spikes ≈ 1,800/sec peak.</p>
+  <p><strong>Cost:</strong> assume a blended cost of $0.008/SMS across providers and countries. 25M/day × $0.008 = $200,000/day ≈ $6M/month ≈ roughly $70M/year. This is a genuinely large, recurring operating cost most engineers underestimate — it's exactly why routing to the cheapest healthy provider per country and offering a free channel (app push, WhatsApp Business API) as the default matter as real levers, not nice-to-haves.</p>
+  <p><strong>Storage:</strong> OTP records are intentionally short-lived. Store <code>hash(otp)</code> — never the plaintext code — keyed by phone number and purpose in Redis with a 300-second (5-minute) TTL. At 1,800/sec issuance and a 300s TTL, steady-state resident keys ≈ 1,800 × 300 = 540,000 keys at any instant, each roughly 150 bytes (hash, purpose, attempt counter, expiry) ≈ 81MB. That fits comfortably in a single small Redis node with a replica for availability — this whole system's hot-path storage footprint is tiny; the hard part is everything around it, not the data.</p>
+  <p><strong>Rate limits:</strong> enforce something like 5 sends/hour per phone number and 20 sends/hour per IP/device to blunt bombing and toll fraud. These are the same sliding-window/token-bucket counters from Ch.5, just keyed by phone or IP instead of by API client.</p>
+
+  <h4>API design</h4>
+  <pre><code>POST /otp/send    {phone, purpose: login|signup|payment}
+                  -> {requestId, expiresInSec, resendAfterSec}
+POST /otp/verify  {requestId, code}
+                  -> {verified: true|false, attemptsRemaining}
+POST /otp/resend  {requestId}                (subject to cooldown)
+
+Internal provider abstraction (implementation detail, not client-facing):
+  send(phone, message) -> providerMessageId
+
+Provider webhook (async delivery receipt):
+POST /webhooks/dlr {providerMessageId, status: delivered|failed|unknown}</code></pre>
+
+  <h4>High-level design</h4>
+  <div class="diagram" data-diagram='{
+    "title": "OTP delivery: rate limiting, multi-provider routing, async delivery receipts",
+    "nodes": [
+      {"id":"client","x":20,"y":20,"w":190,"h":60,"kind":"external","label":"App / Web Client"},
+      {"id":"apigw","x":260,"y":20,"w":190,"h":60,"kind":"compute","label":"API Gateway + Rate Limiter","sub":"per-phone, per-IP"},
+      {"id":"fraud","x":20,"y":140,"w":190,"h":60,"kind":"compute","label":"Abuse/Fraud Guard","sub":"captcha, backoff"},
+      {"id":"otpsvc","x":260,"y":140,"w":190,"h":60,"kind":"compute","label":"OTP Service","sub":"generate + verify"},
+      {"id":"router","x":520,"y":140,"w":190,"h":60,"kind":"compute","label":"Provider Router","sub":"cost + health aware"},
+      {"id":"redis","x":260,"y":260,"w":190,"h":60,"kind":"storage","label":"Redis","sub":"hashed OTP, TTL 300s"},
+      {"id":"dlrq","x":520,"y":260,"w":190,"h":60,"kind":"queue","label":"DLR Webhook Queue","sub":"async delivery receipts"},
+      {"id":"providera","x":790,"y":60,"w":190,"h":60,"kind":"external","label":"Aggregator A"},
+      {"id":"providerb","x":790,"y":220,"w":190,"h":60,"kind":"external","label":"Aggregator B (fallback)"},
+      {"id":"phone","x":790,"y":380,"w":190,"h":60,"kind":"external","label":"User Phone"}
+    ],
+    "edges": [
+      {"from":"client","to":"apigw","label":"POST /otp/send"},
+      {"from":"client","to":"apigw","label":"POST /otp/verify"},
+      {"from":"apigw","to":"fraud","label":"check rate limit"},
+      {"from":"fraud","to":"otpsvc","label":"allow"},
+      {"from":"otpsvc","to":"redis","label":"store hash(otp), TTL 300s"},
+      {"from":"otpsvc","to":"router","label":"send(phone, message)"},
+      {"from":"router","to":"providera","label":"route: cheapest healthy"},
+      {"from":"router","to":"providerb","label":"failover on error/timeout"},
+      {"from":"providera","to":"phone","label":"SMS"},
+      {"from":"providerb","to":"phone","label":"SMS (fallback)"},
+      {"from":"providera","to":"dlrq","label":"delivery receipt"},
+      {"from":"providerb","to":"dlrq","label":"delivery receipt"},
+      {"from":"dlrq","to":"otpsvc","label":"update delivery status"}
+    ]
+  }'></div>
+
+  <h4>Deep dive</h4>
+  <p><strong>1) Multi-provider routing and failover.</strong> Keep a per-country table of provider preference by cost and by rolling health (recent success rate, latency). Route each send to the cheapest currently-healthy provider first, and use the circuit breaker pattern from Ch.15 to stop routing to a provider whose recent error rate has spiked, retrying it periodically to see if it recovered. On a send failure, retry through a different provider — but this must be idempotent: the retry must reuse the same stored OTP hash rather than generating a second, different code the user never asked for.</p>
+  <p><strong>2) Anti-abuse given a tiny keyspace.</strong> A 6-digit code has only a million possible values. Without limits, an attacker could brute-force it during its 5-minute lifetime with a fast enough script. The defenses stack: hash the OTP at rest so a database read never exposes the plaintext code; cap verify attempts (typically 3-5) before invalidating the code entirely; expire codes quickly (5 minutes is common); and rate-limit both send and verify per phone number and per IP, with a step-up to a CAPTCHA after repeated failures. No single layer is sufficient alone — it's the combination that makes brute force impractical.</p>
+  <p><strong>3) Atomic, exactly-once-feeling verification.</strong> Two concurrent verify requests with the same correct code, from a race in a flaky client retry, must not both succeed and both trigger a login. Implement verify as a single atomic operation — a Redis <code>GETDEL</code> or a small Lua script that checks the code and deletes the key in one round trip — so the second request always sees the code already consumed, rather than doing a separate GET-then-DELETE that leaves a race window open.</p>
+
+  <h4>Trade-offs</h4>
+  <div class="callout tradeoff"><p>At 10x scale, a single shared rate-limiter store becomes a hot-key bottleneck for very high-volume phone numbers or shared corporate IPs (the same counter-contention problem from Ch.5). And SMS cost scales linearly with volume with no economies of scale — you're a price-taker to telecom carriers, not a platform that gets cheaper by building more infrastructure. That combination is what forces provider contract renegotiation and channel-shifting toward free push-based OTP as the real lever at scale, not more clever engineering on the SMS path itself.</p></div>
+
+  <h4>Say this</h4>
+  <div class="callout say-this"><p>"I'd treat OTP security as defense in depth, not one control — hashed storage so a leaked database doesn't leak codes, a short expiry, a capped number of verify attempts given how small a 6-digit keyspace really is, and rate limits on both phone number and IP so no single layer has to carry the whole burden alone."</p></div>
+
+  <h4>Final design</h4>
+  <p>A client's send request passes through a rate limiter and fraud guard, then the OTP service hashes and stores the code in Redis with a short TTL and hands off to a provider router that picks the cheapest healthy aggregator, failing over to a second on error. Delivery receipts arrive asynchronously via webhook into a queue and update status without blocking the user. Verification is a single atomic check-and-invalidate operation, capped by attempt count and expiry.</p>
+
+  <h4>EM-level follow-up</h4>
+  <div class="callout em-angle"><p>Nobody builds their own telecom delivery network — you buy aggregator capacity and build the orchestration, routing, and anti-fraud layer in-house, which is where the actual engineering value is. Rollout is gated by compliance as much as by code: several countries (India's DLT sender-ID registration is a well-known example) require legal registration before you can send transactional SMS at all in that market, so launching a new country is a legal-and-ops task with an engineering dependency, not the reverse. Cross-team impact is real too — the thresholds for what counts as abusive send volume are usually owned jointly with a fraud/trust-and-safety team, not by the engineers alone.</p></div>
+</article>
+
+<article class="problem">
+  <h3>Design a Live Q&amp;A / Webinar Platform</h3>
+
+  <h4>Problem framing</h4>
+  <p>A small number of hosts and panelists broadcast audio and video to a large audience who mostly watch, plus can submit and upvote questions that a moderator triages live. Stripped of buzzwords: this is a one-to-many broadcast problem paired with a many-to-few write problem (the Q&amp;A), and the two need very different infrastructure — this is the key thing that separates it from the video-call signaling problem elsewhere in this chapter, which is built for a small number of people all talking to each other.</p>
+
+  <h4>Clarifying questions</h4>
+  <ul>
+    <li><strong>What's the audience scale — hundreds per event, or up to hundreds of thousands for a large town hall?</strong> — why it matters: below a few thousand concurrent viewers, a mesh or SFU (selective forwarding unit, the server that relays media between participants) style architecture can still work. Above that, video has to move to a CDN pull-based model instead.</li>
+    <li><strong>Do viewers only watch, or can some of them publish audio/video back (interactive Q&amp;A on camera)?</strong> — why it matters: pure view-only lets us broadcast over a CDN with a few seconds of delay. Letting viewers go on camera reintroduces a low-latency interactive path for just those few people, layered on top of the broadcast.</li>
+    <li><strong>How is the question queue moderated — upvote-sorted, host-picked, or both?</strong> — why it matters: this decides whether we need a ranked, frequently-updated data structure (upvote counts changing live) or just a simple ordered list.</li>
+    <li><strong>Is a delay of a few seconds between the host speaking and viewers seeing it acceptable?</strong> — why it matters: a broadcast is fundamentally latency-tolerant in a way a two-way call is not, and that tolerance is exactly what lets it scale.</li>
+    <li><strong>Does the event need to be recorded for later playback?</strong> — why it matters: recording adds a whole separate pipeline, covered as its own standalone problem elsewhere in this chapter.</li>
+  </ul>
+
+  <h4>Requirements</h4>
+  <p><strong>Functional:</strong> host/panelists publish audio and video; viewers watch the stream; viewers submit and upvote questions; a moderator sees a ranked queue and can mark questions answered or dismissed; viewers see a live (approximate) viewer count.</p>
+  <p><strong>Non-functional:</strong> must scale to tens or hundreds of thousands of concurrent viewers on a single event; a few seconds of video delay is acceptable; the video path and the Q&amp;A write path must be able to fail independently — a Q&amp;A traffic spike must never cause video rebuffering; moderation actions need to feel near-instant even though video does not.</p>
+
+  <h4>Capacity estimate</h4>
+  <p>Assume 8,000 concurrent live events at a global peak, averaging 250 viewers each: 2M concurrent viewers baseline. Add a handful of large town-hall-style events — assume 3 running simultaneously at 150,000 viewers each — adding 450,000 more, for roughly 2.45M concurrent viewers platform-wide at peak.</p>
+  <p><strong>Video egress:</strong> assume a blended adaptive-bitrate delivery of 2.5 Mbps per viewer (mixing lower-res mobile and higher-res desktop viewers). 2.45M × 2.5 Mbps ≈ 6.1 Tbps of egress at peak — far beyond what any origin server fleet should serve directly. This has to come from CDN edge caches (Ch.3), where one cached copy of each video segment serves every viewer hitting that edge node, instead of the origin re-sending per viewer.</p>
+  <p><strong>Q&amp;A write burst:</strong> take one 100,000-viewer town hall as the stress case. Assume 4% of viewers submit at least one question over the hour (4,000 questions) and each gets an average of 12 upvotes (48,000 upvote actions) — 52,000 writes over the hour, ≈14/sec on average, unremarkable. But real behavior is bursty: right after the host says "drop your questions now," assume 30% of that hourly volume lands in a 20-second window — 15,600 writes in 20s ≈ 780 writes/sec for that one event alone. With several large events overlapping, this burst can hit several thousand writes/sec system-wide for short windows, and it's this burst, not the hourly average, that the Q&amp;A path must be sized for.</p>
+  <p><strong>Viewer counts:</strong> a strongly consistent global counter would force every join/leave to serialize through one place. Instead, each CDN edge/gateway node keeps a local count and reports it upstream every 5-10 seconds; the platform sums these into an approximate total for the host — accurate to within a few seconds and a few percent, which is all a live viewer count actually needs to be.</p>
+
+  <h4>API design</h4>
+  <pre><code>GET  /events/{id}/manifest.m3u8         (HLS manifest, viewer pulls video)
+POST /events/{id}/questions             {text}
+POST /questions/{id}/upvote
+GET  /events/{id}/questions?sort=top
+POST /questions/{id}/answer             (moderator action)
+POST /questions/{id}/dismiss            (moderator action)
+
+WS/SSE channel: ranked question-list deltas + live viewer count</code></pre>
+
+  <h4>High-level design</h4>
+  <div class="diagram" data-diagram='{
+    "title": "Webinar platform: CDN broadcast path + isolated Q&A write path",
+    "nodes": [
+      {"id":"host","x":20,"y":20,"w":170,"h":60,"kind":"external","label":"Host / Panelist"},
+      {"id":"ingest","x":230,"y":20,"w":190,"h":60,"kind":"compute","label":"Media Ingest","sub":"RTMP / WebRTC"},
+      {"id":"transcode","x":460,"y":20,"w":190,"h":60,"kind":"compute","label":"Transcoder","sub":"ABR renditions"},
+      {"id":"package","x":690,"y":20,"w":190,"h":60,"kind":"compute","label":"Packager","sub":"HLS / DASH segments"},
+      {"id":"cdn","x":690,"y":140,"w":190,"h":60,"kind":"external","label":"CDN Edge","sub":"pull-based fan-out"},
+      {"id":"viewer","x":900,"y":80,"w":90,"h":160,"kind":"external","label":"Viewers (up to 100K+)"},
+      {"id":"ratelimit","x":20,"y":260,"w":190,"h":60,"kind":"compute","label":"Q&A Rate Limiter","sub":"isolated from video"},
+      {"id":"qasvc","x":250,"y":260,"w":190,"h":60,"kind":"compute","label":"Q&A Service"},
+      {"id":"qastore","x":480,"y":260,"w":190,"h":60,"kind":"storage","label":"Ranked Store","sub":"sorted set, ZINCRBY"},
+      {"id":"fanout","x":710,"y":260,"w":190,"h":60,"kind":"compute","label":"Realtime Fan-out","sub":"WS / SSE"},
+      {"id":"moderator","x":710,"y":380,"w":190,"h":60,"kind":"external","label":"Moderator Dashboard"}
+    ],
+    "edges": [
+      {"from":"host","to":"ingest","label":"publish audio/video"},
+      {"from":"ingest","to":"transcode","label":"raw stream"},
+      {"from":"transcode","to":"package","label":"ABR renditions"},
+      {"from":"package","to":"cdn","label":"segments"},
+      {"from":"cdn","to":"viewer","label":"pull manifest + segments"},
+      {"from":"viewer","to":"ratelimit","label":"submit question / upvote"},
+      {"from":"ratelimit","to":"qasvc","label":"allowed"},
+      {"from":"qasvc","to":"qastore","label":"ZADD / ZINCRBY"},
+      {"from":"qastore","to":"fanout","label":"ranked list changed"},
+      {"from":"fanout","to":"viewer","label":"push top questions + count"},
+      {"from":"fanout","to":"moderator","label":"push full queue"},
+      {"from":"moderator","to":"qasvc","label":"mark answered/dismissed"}
+    ],
+    "groups": [
+      {"x":10,"y":10,"w":1085,"h":230,"label":"Video path: CDN pull, a few seconds of delay is fine"},
+      {"x":10,"y":250,"w":900,"h":200,"label":"Q&A path: isolated infra, must survive its own burst alone"}
+    ]
+  }'></div>
+
+  <h4>Deep dive</h4>
+  <p><strong>1) One-to-many video needs CDN pull, not SFU push.</strong> An SFU relays media between a small number of participants and scales to maybe a few thousand connections before the forwarding fan-out itself becomes the bottleneck. A webinar with 100,000 viewers cannot be served that way. Instead, transcode the host's stream into HLS or DASH segments once, and let a CDN (Ch.3) cache and serve those segments to unlimited viewers by simply pulling from the nearest edge cache — the cost of one more viewer is a cache hit, not a new forwarding connection. The trade is a few seconds of added delay from segmenting and buffering, which is the correct trade for a broadcast, not a conversation.</p>
+  <p><strong>2) Ranking questions under heavy, live upvote contention.</strong> Re-sorting a full question list on every single upvote does not scale under a burst of hundreds of upvotes per second. Use a Redis sorted set keyed by upvote count, with tie-break by submission time, and apply upvotes as an incremental <code>ZINCRBY</code> rather than a read-modify-write of the whole list. Push only the delta (what changed in the top N) to viewers over the realtime channel instead of re-sending the entire ranked list on every change.</p>
+  <p><strong>3) Approximate, not exact, live viewer counts.</strong> Forcing every viewer join/leave through one strongly consistent counter would recreate a single point of contention under the exact conditions — a viral event — where it matters most. Local per-edge counting with periodic aggregation, the same tension as the presence-system problem elsewhere in this chapter, gives a count that is close enough and never becomes a bottleneck.</p>
+
+  <h4>Trade-offs</h4>
+  <div class="callout tradeoff"><p>At 10x scale — a global event with millions of concurrent viewers — even CDN pull needs multiple CDN vendors and regional origin shields (Ch.3), so a single CDN's outage doesn't take the whole event offline. And the Q&amp;A burst path must be fully decoupled — its own queue, its own rate limiter, its own compute — from the video path, because sharing infrastructure means a Q&amp;A traffic spike can starve the video pipeline of resources at the exact moment the host is asking everyone to submit questions.</p></div>
+
+  <h4>Say this</h4>
+  <div class="callout say-this"><p>"Past a few thousand concurrent viewers, I'd stop trying to push video peer-to-peer or through an SFU and switch to CDN-distributed HLS — trading a few seconds of latency, which a broadcast audience doesn't notice, for fan-out that scales to hundreds of thousands of viewers without the origin doing any more work per viewer."</p></div>
+
+  <h4>Final design</h4>
+  <p>The host's stream is ingested, transcoded into adaptive-bitrate renditions, packaged into HLS/DASH segments, and pulled by viewers through a CDN — a broadcast path tolerant of a few seconds of delay. Separately, viewer questions and upvotes flow through their own rate-limited service into a Redis sorted set, with ranked deltas pushed over a realtime channel to both viewers and a moderator dashboard — a path that must never share failure domains with video.</p>
+
+  <h4>EM-level follow-up</h4>
+  <div class="callout em-angle"><p>A sensible rollout tiers by scale: small, truly interactive webinars can run on a WebRTC SFU for low latency, and the platform auto-promotes to CDN/HLS broadcast once viewer count crosses a threshold (a few hundred). On build-vs-buy: platforms like Mux, AWS IVS, or Cloudflare Stream provide ingest, transcode, and CDN distribution out of the box, and building your own live-video stack from scratch is rarely worth it before you have a very large, dedicated video-infrastructure need — the engineering effort is better spent on the Q&amp;A and moderation layer, which is the actual product differentiation.</p></div>
+</article>
+
+<article class="problem">
+  <h3>Design a Video-Conferencing Recording and Playback Pipeline</h3>
+
+  <h4>Problem framing</h4>
+  <p>Given a live video call already in progress, capture what was said and shown, store it durably, and turn it into something a person can open weeks later, seek around in, and read captions for. Stripped of buzzwords: this is the archive-and-VOD (video-on-demand) half of a conferencing product, distinct from the live signaling and media-relay problem covered elsewhere in this chapter — recording must never be allowed to make the live call worse for the people actually on it.</p>
+
+  <h4>Clarifying questions</h4>
+  <ul>
+    <li><strong>Composite recording (one mixed video, like what a viewer saw) or separate per-participant tracks?</strong> — why it matters: a composite is what most viewers want and is far cheaper to store; separate tracks are needed for advanced editing but multiply storage per meeting.</li>
+    <li><strong>Where does capture happen — server-side, or does each client upload its own recording?</strong> — why it matters: server-side capture guarantees a recording exists even if a participant's device crashes mid-call, at the cost of running dedicated recording infrastructure.</li>
+    <li><strong>Do we need transcription/captions and a searchable transcript?</strong> — why it matters: this adds a speech-to-text stage and a whole separate storage/search concern on top of the raw video pipeline.</li>
+    <li><strong>What's the retention policy — indefinite, or a fixed window like 30-90 days?</strong> — why it matters: retention is the single biggest lever on long-run storage cost; "forever" and "90 days" produce wildly different steady-state storage numbers.</li>
+    <li><strong>What's the expected playback scale — mostly the meeting's own participants replaying it, or wide sharing across an organization?</strong> — why it matters: it decides whether playback can be served from a modest cache or needs full CDN distribution.</li>
+  </ul>
+
+  <h4>Requirements</h4>
+  <p><strong>Functional:</strong> start/stop a server-side recording of a live meeting; capture a composite (mixed) stream at minimum; store it durably; transcode to formats suitable for on-demand streaming; generate captions and a transcript; support seeking/scrubbing during playback; support access control on who can view a recording.</p>
+  <p><strong>Non-functional:</strong> recording must never drop frames or lose audio/video sync, even if the recording pipeline is under load; recorded data must be as durable as the product's most important user data — losing a recording after the meeting ended is unrecoverable; playback should start quickly, even if full processing hasn't finished; storage cost must be manageable at a scale of many concurrent meetings recording simultaneously; the recording pipeline must be isolated enough that it can never degrade the live call it's recording.</p>
+
+  <h4>Capacity estimate</h4>
+  <p>Assume a conferencing platform running 8M meetings/day, with roughly 400,000 concurrent live meetings at peak. Assume 6% of meetings are recorded: 480,000 recordings/day, and at peak concurrency, 6% of 400,000 ≈ 24,000 concurrent active recording sessions.</p>
+  <p><strong>Recording size:</strong> assume an average recorded meeting length of 35 minutes, composite output at 720p around 1.5 Mbps. Raw size per recording ≈ 1.5 Mbps × 2,100 seconds ÷ 8 bits/byte ≈ 394MB, call it ~400MB. 480,000/day × 400MB ≈ 192TB/day of raw composite ingest.</p>
+  <p><strong>Post-processing overhead:</strong> producing 2-3 additional adaptive-bitrate renditions (e.g. 480p, 360p, alongside the 720p source) plus thumbnails roughly doubles stored bytes per recording — call it ~390TB/day of effective stored bytes across all renditions.</p>
+  <p><strong>Retention:</strong> many products default to 30-90 days of retention rather than forever, driven by both cost and compliance. At a 90-day rolling retention, steady-state footprint stabilizes around 390TB/day × 90 ≈ 35PB — not an unbounded number that keeps climbing every year, which is worth stating explicitly in an interview, because it shows retention policy is a deliberate cost lever, not an afterthought.</p>
+  <p><strong>Transcode compute:</strong> assume roughly 0.3 core-minutes of transcode work per minute of recorded video (achievable on modern hardware, especially with hardware encoders). 480,000 recordings × 35 min × 0.3 ≈ 5.04M core-minutes/day. Spread evenly across the day (÷1,440 minutes/day), that is an average of ~3,500 cores running continuously — the baseline fleet size before accounting for peak. In core-hours that same 5.04M core-minutes/day is ≈84,000 core-hours/day sustained. Because recordings cluster around each region's business hours, peak transcode demand is several times the daily average — that peak, not the average, is what sizes the autoscaled transcode fleet.</p>
+
+  <h4>API design</h4>
+  <pre><code>POST /meetings/{id}/recording/start
+POST /meetings/{id}/recording/stop
+GET  /recordings/{id}                    (metadata + processing status)
+GET  /recordings/{id}/playback-manifest  (signed URL, HLS/DASH manifest)
+GET  /recordings/{id}/transcript
+POST /recordings/{id}/share              {scope, expiresAt}</code></pre>
+
+  <h4>High-level design</h4>
+  <div class="diagram" data-diagram='{
+    "title": "Recording pipeline: isolated capture, async post-processing, fast-then-final playback",
+    "nodes": [
+      {"id":"call","x":20,"y":20,"w":190,"h":60,"kind":"external","label":"Live Call (SFU)","sub":"from signaling system"},
+      {"id":"recorder","x":250,"y":20,"w":190,"h":60,"kind":"compute","label":"Recording Worker","sub":"isolated pool, composites tracks"},
+      {"id":"localbuf","x":480,"y":20,"w":190,"h":60,"kind":"storage","label":"Local Disk Buffer","sub":"2-6s chunks"},
+      {"id":"blob","x":710,"y":20,"w":190,"h":60,"kind":"storage","label":"Blob Storage","sub":"durable, chunk on close"},
+      {"id":"chunkq","x":480,"y":140,"w":190,"h":60,"kind":"queue","label":"Post-Process Queue"},
+      {"id":"transcode","x":710,"y":140,"w":190,"h":60,"kind":"compute","label":"Transcode Workers","sub":"ABR + thumbnails"},
+      {"id":"caption","x":710,"y":260,"w":190,"h":60,"kind":"compute","label":"Speech-to-Text","sub":"captions/transcript"},
+      {"id":"metadb","x":480,"y":260,"w":190,"h":60,"kind":"storage","label":"Recording Metadata DB","sub":"recording/processing/ready"},
+      {"id":"playbackapi","x":20,"y":380,"w":190,"h":60,"kind":"compute","label":"Playback API","sub":"signed URLs, ACL"},
+      {"id":"cdn","x":480,"y":380,"w":190,"h":60,"kind":"external","label":"CDN"},
+      {"id":"viewer","x":250,"y":380,"w":190,"h":60,"kind":"external","label":"Playback Client","sub":"seek/scrub"}
+    ],
+    "edges": [
+      {"from":"call","to":"recorder","label":"subscribe to all tracks"},
+      {"from":"recorder","to":"localbuf","label":"write 2-6s chunks"},
+      {"from":"localbuf","to":"blob","label":"upload chunk on close"},
+      {"from":"blob","to":"chunkq","label":"enqueue chunk ready"},
+      {"from":"chunkq","to":"transcode","label":"mux + transcode to ABR"},
+      {"from":"chunkq","to":"caption","label":"speech-to-text"},
+      {"from":"transcode","to":"blob","label":"write renditions"},
+      {"from":"transcode","to":"metadb","label":"status: ready"},
+      {"from":"caption","to":"metadb","label":"attach transcript"},
+      {"from":"metadb","to":"playbackapi","label":"status + manifest lookup"},
+      {"from":"playbackapi","to":"viewer","label":"signed manifest URL"},
+      {"from":"blob","to":"cdn","label":"origin for playback"},
+      {"from":"cdn","to":"viewer","label":"stream segments"}
+    ],
+    "groups": [
+      {"x":10,"y":10,"w":900,"h":90,"label":"Capture: isolated from live signaling load"},
+      {"x":470,"y":130,"w":430,"h":210,"label":"Async post-processing"}
+    ]
+  }'></div>
+
+  <h4>Deep dive</h4>
+  <p><strong>1) Recording without dropping frames under load.</strong> Run the recorder as its own dedicated worker pool, entirely separate from the interactive SFU/signaling path that live participants depend on — so recording load can never introduce jitter into the actual call. The recorder writes short local-disk chunks (2-6 seconds each) and uploads each chunk to durable blob storage as soon as it closes, rather than holding a growing file in memory for the whole meeting. This bounds data loss on a crash to a single unwritten chunk, and decouples capture from the transcode step using a queue (Ch.14) — the same store-and-forward idea used everywhere else in this book.</p>
+  <p><strong>2) Keeping audio/video in sync across uneven networks.</strong> Participants join over wildly different network conditions, so their packets arrive with different jitter and occasional loss. The recorder needs one authoritative timestamp source per track — typically supplied by the SFU itself — so the composite mixer lines up frames against a shared clock. A dropped or late packet from one participant should make the mixer fill that gap locally, never shift the whole recording's timeline, or every other participant's audio would drift out of sync with the video too.</p>
+  <p><strong>3) Fast "good enough now," full quality later.</strong> Waiting for full ABR transcoding and captioning before a recording is playable at all means a multi-minute wait right when a user most wants to review a meeting. Publish a single lower-quality rendition quickly — often within a minute of the meeting ending — and update the manifest in place once the full set of renditions and captions finish processing asynchronously. This is the same "ship something usable now, improve it in the background" trade every video-on-demand pipeline makes.</p>
+
+  <h4>Trade-offs</h4>
+  <div class="callout tradeoff"><p>At 10x scale, both storage and transcode compute grow roughly linearly with total recorded minutes, so the real bottleneck is peak transcode fleet capacity during each region's business hours, not the daily average. That needs an autoscaled transcode worker pool sitting behind a durable queue (Ch.14) that absorbs the burst — dropping or indefinitely delaying a recording job is not acceptable, so the queue, not more raw compute, is what has to grow to absorb spikes cheaply.</p></div>
+
+  <h4>Say this</h4>
+  <div class="callout say-this"><p>"I'd run the recorder as its own isolated worker pool so a spike in recording load can never cause jitter on the live call it's recording — and I'd publish a fast, lower-quality rendition within a minute of the meeting ending, while full adaptive-bitrate transcoding and captioning finish in the background."</p></div>
+
+  <h4>Final design</h4>
+  <p>A dedicated recording worker subscribes to all tracks of a live call and writes short local chunks that upload to durable blob storage as they close. A queue triggers transcode and speech-to-text workers to produce adaptive-bitrate renditions, thumbnails, and a transcript, flipping the recording's status to ready in a metadata database once complete. Playback goes through a signed-URL API backed by a CDN, with an early lower-quality rendition available well before full processing finishes.</p>
+
+  <h4>EM-level follow-up</h4>
+  <div class="callout em-angle"><p>Recording is usually rolled out as an opt-in, often tiered/paid feature, precisely because of its storage and compliance cost — this is a product decision as much as a technical one. On build-vs-buy: cloud media services like AWS Elemental MediaConvert give you transcoding without operating your own FFmpeg fleet, and are typically cheaper at low-to-moderate volume, while an owned fleet becomes cheaper only past a certain sustained volume — worth modeling explicitly rather than assuming either answer. Cross-team impact includes legal/compliance on retention policy (some regulated industries require years, not months, of retention) and the storage/infra team on capacity planning for a workload that grows with every additional recorded minute, indefinitely.</p></div>
+</article>
+<div class="flashcards" data-cards='[
+  {"q":"In WhatsApp-style group encryption, why use sender keys instead of a pairwise Double Ratchet session per member pair?","a":"Sender keys drop the per-message encryption cost from O(members) to O(1) — one key encrypts the message once and is distributed to members over their existing pairwise sessions — at the cost of rotating the sender key on every membership change, since a removed member could otherwise still decrypt with the old key."},
+  {"q":"Why can Slack/Discord post to a 100,000-member channel with a single O(1) write, while WhatsApp cannot?","a":"Slack stores one shared, append-only log per channel and gives each member their own read cursor into it, since the server is allowed to read the content. WhatsApp&#39;s end-to-end encryption means the server cannot decrypt-and-redistribute, so every device needs its own encrypted copy, making fan-out cost scale with recipient count."},
+  {"q":"Why does a notification system need physically separate queues per priority tier instead of a priority field on one shared queue?","a":"Under load, low-priority backlog (a 20-million-user marketing campaign) still starves high-priority messages (a login OTP) on a shared queue and worker pool. Separate failure domains are the only way to guarantee an OTP is never delayed behind a campaign."},
+  {"q":"What is the core trade-off between OT and CRDT for collaborative document editing?","a":"OT needs one authoritative server per document to transform and sequence every operation, which limits it under very high concurrency on one document. CRDT designs the data structure so concurrent operations commute and merge with no referee, enabling true offline and peer-to-peer editing, at the cost of permanent per-character metadata (tombstones) that can bloat storage well past the visible text size."},
+  {"q":"Why is a live-bidding system the one problem in this chapter that cannot use eventual consistency for its core value?","a":"Two bids milliseconds apart must be strictly ordered and the loser told immediately. The current-highest-bid value needs linearizable consistency, enforced with a single-writer-per-auction pattern (a Redis compare-and-set or a database row lock), because bid order, not just bid content, determines the winner."},
+  {"q":"In a video-call system, what is the practical difference between an SFU and an MCU?","a":"An SFU (Selective Forwarding Unit) forwards each participant&#39;s stream to others without decoding or re-encoding it, which is cheap on server CPU and is what most modern products use. An MCU (Multipoint Control Unit) decodes, mixes, and re-encodes every stream into one composite, which costs far more server CPU and is reserved for cases like producing a single recorded file."},
+  {"q":"How does a multiplayer game keep input feeling instant despite 50-150ms round-trip latency?","a":"The client applies its own input immediately (client-side prediction) and buffers unacknowledged inputs. When the authoritative server snapshot arrives, the client resets to the server state and replays the inputs the server has not yet acknowledged (reconciliation). The server stays the single source of truth throughout."},
+  {"q":"In a live customer-support chat system, what actually breaks first at 10x scale — the message pipe or the routing engine?","a":"The routing/matching engine. A single-process priority-queue-per-skill design becomes a lock-contention bottleneck once every new chat and every agent status change touches shared queue state, well before message delivery itself struggles."},
+  {"q":"Why does a Figma-style whiteboard favor CRDTs over OT, unlike plain linear text editing?","a":"Whiteboard objects (shapes, position, size, color) are independent of each other, so each property maps naturally onto a CRDT like a last-writer-wins register. No central sequencer is needed, unlike text, where every character&#39;s position depends on everything before it."},
+  {"q":"How does a presence system avoid spamming contacts every time a phone briefly loses signal?","a":"It uses a grace period, commonly 30-45 seconds, before broadcasting OFFLINE after a heartbeat stops, canceling the pending broadcast if the client reconnects inside that window. Presence is deliberately eventually consistent, since a few seconds of stale status is invisible to users."},
+  {"q":"What is the key storage decision in a Gmail-style email system when one message goes to many recipients?","a":"Store the message body once in content-addressed blob storage, keyed by a hash of its content, and give every recipient mailbox its own lightweight metadata row (labels, thread, read state) pointing at that one blob. Never duplicate the body per recipient."},
+  {"q":"What are the layered defenses an OTP system needs against brute force, given a 6-digit code has only a million possible values?","a":"Hash the OTP at rest, expire it quickly (commonly 5 minutes), cap verify attempts (typically 3-5), and rate-limit both send and verify per phone number and per IP. No single layer is sufficient alone — it is the combination that makes brute force impractical."},
+  {"q":"In a live Q&A/webinar platform, why must the video path and the Q&A write path be fully isolated infrastructure?","a":"Video tolerates a few seconds of delay and scales through CDN pull, where the cost of one more viewer is just a cache hit. The Q&A path is a bursty write problem, spiking right after the host asks everyone to submit questions. Sharing infrastructure means a Q&A burst can starve the video pipeline at the exact moment the host needs it most."},
+  {"q":"Why does a video-conferencing recording pipeline run its recorder as its own isolated worker pool?","a":"So a spike in recording load can never introduce jitter or frame drops into the live call it is recording. Capture is decoupled from the interactive SFU/signaling path, and recording is uploaded in short chunks so a crash only loses the last unwritten chunk."},
+  {"q":"Across this chapter, what decides whether a system needs a mailbox-per-recipient or a shared-log-with-a-cursor for fan-out?","a":"Whether content is encrypted per device. Encrypted content forces a copy per recipient, because the server cannot decrypt-and-redistribute. Unencrypted content can use one shared log that every reader tracks with their own cursor, making the write O(1) regardless of audience size."},
+  {"q":"What is the single test for choosing CRDT over OT across the collaborative-editing problems in this chapter?","a":"Ask whether operations commute. If concurrent edits can merge in any order to the same result (independent objects, or an offline-tolerant document), a CRDT needs no referee. If order itself determines the outcome, or edits are inherently sequential, you need a central sequencer instead — OT, or a single-writer pattern."},
+  {"q":"Why can a live auction never use a CRDT-style merge, unlike the collaborative-document and whiteboard problems in this chapter?","a":"Concurrent bids are not commutative — the order two bids arrive in determines who wins, so there is no way to merge two divergent states into one correct answer after the fact. That is why bidding needs a single-writer sequencer, much closer to OT&#39;s model than to a CRDT&#39;s."},
+  {"q":"Why do both the notification system and the OTP system need idempotency keys even though they sit on different event buses?","a":"Both consume from event buses that guarantee at-least-once delivery, so the same event (an order shipping, a retried OTP send) can arrive or be retried twice. An idempotency key, such as a hash of event ID, channel, and user ID, stops a duplicate delivery from becoming a duplicate, visible side effect for the user."}
+]'></div>

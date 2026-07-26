@@ -1,0 +1,334 @@
+<p class="lede">MySQL is the relational database most candidates already know a little about, which is exactly why interviewers dig deeper here. This chapter builds the mental models behind the questions that separate "I've used MySQL" from "I understand what MySQL is doing for me": how an index actually works and when it silently stops helping, what the four ACID guarantees really promise, how MVCC lets readers and writers stay out of each other's way, and what happens, step by step, when a MySQL primary dies.</p>
+
+<h2><span class="idx">01</span>Indexing: B-Tree Vs Hash, And What "Using An Index" Really Means</h2>
+<p>An <strong>index</strong> is a separate data structure the database keeps next to your table, built to answer one kind of question fast: "where are the rows with this value?" Without one, the database has to check every row in the table one by one — a <strong>full table scan</strong>. That's the same difference as using a book's index to jump straight to page 214 versus reading the whole book to find one paragraph.</p>
+
+<h3>B-tree indexes (what MySQL actually uses almost everywhere)</h3>
+<p>A <strong>B-tree</strong> — technically a <strong>B+-tree</strong> in MySQL's InnoDB storage engine — is a sorted, balanced tree of pages. A small root page points to internal pages, which point to more internal pages, until you reach the bottom-level <strong>leaf pages</strong>, which hold the actual sorted key values (and, for InnoDB's primary key index specifically, the whole row). Leaf pages are chained together in sorted order, so once you land on the right leaf, you can walk sideways for a range scan without climbing back up the tree.</p>
+<pre><code>Root page:            [ 50 | 100 ]
+                        /     |     \
+Internal pages:  [under 50][50-99][100 and up]
+                        \     |     /
+Leaf pages (sorted, chained left-to-right so range
+scans and ORDER BY never have to re-descend the tree):
+[10][22][31] → [55][61][78][95] → [100][120][144] ...</code></pre>
+<p>Because the tree stays balanced and shallow (roughly <code>log(n)</code> levels for <code>n</code> rows), a lookup costs about the same number of page reads whether the table has ten thousand rows or a hundred million. And because the structure is sorted, a B-tree index supports equality (<code>WHERE id = 5</code>), ranges (<code>WHERE id BETWEEN 5 AND 50</code>), prefix matches, and <code>ORDER BY</code> — which is why it's the default index type in almost every relational database, not just MySQL.</p>
+<p>InnoDB actually builds two kinds of B-tree index on every table: the <strong>clustered index</strong> on the primary key, whose leaf pages hold the complete row (the table's data <em>is</em> the primary key's index), and any number of <strong>secondary indexes</strong>, whose leaf pages hold the indexed column plus a copy of the primary key value — not a raw disk pointer. That means a secondary-index lookup is really two steps: find the primary key in the secondary index, then use it to look the full row up in the clustered index. This second hop is often called a <strong>bookmark lookup</strong>, and it's part of why an index that returns a lot of rows can still be slower than expected.</p>
+
+<h3>Hash indexes</h3>
+<p>A <strong>hash index</strong> runs the key through a hash function (a function that turns any input into a fixed-size number, scattered unpredictably across the output range) and uses that number to pick a bucket. Lookups are roughly O(1) — one hop straight to the bucket — for exact-match equality. The catch is that hashing destroys order on purpose: two keys that sort next to each other, like 100 and 101, can land in completely unrelated buckets. So a hash index can answer <code>WHERE x = 5</code> quickly but cannot answer a range query, an <code>ORDER BY</code>, or a prefix match at all — it has no idea what comes "near" any given key.</p>
+<p>In MySQL, you rarely get to choose this yourself. The <strong>MEMORY</strong> storage engine (in-memory, non-durable tables) lets you pick <code>USING HASH</code> when you create an index. <strong>InnoDB</strong> — the default engine for every table since MySQL 5.5, and the one almost every production MySQL table uses — does not support user-created hash indexes at all: write <code>CREATE INDEX ... USING HASH</code> against an InnoDB table and MySQL accepts the syntax but silently builds a B-tree anyway. The one hash structure InnoDB does have is internal and automatic: the <strong>Adaptive Hash Index (AHI)</strong>, an in-memory hash table InnoDB builds on its own over pages it notices are getting hit hard with equality lookups, purely to speed those up further underneath the B-tree. You don't design it, you can only turn it on or off (<code>innodb_adaptive_hash_index</code>).</p>
+
+<div class="table-scroll">
+  <table class="spec-table">
+    <caption>B-tree vs hash index, side by side</caption>
+    <thead><tr><th>Property</th><th>B-tree</th><th>Hash</th></tr></thead>
+    <tbody>
+      <tr><td>Equality lookup (<code>=</code>)</td><td>Fast — O(log n)</td><td>Faster — roughly O(1)</td></tr>
+      <tr><td>Range queries (<code>&gt;</code>, <code>BETWEEN</code>)</td><td>Supported — leaf pages are sorted and chained</td><td>Not supported — hashing destroys order</td></tr>
+      <tr><td><code>ORDER BY</code> on the indexed column</td><td>Free — leaf order matches sort order</td><td>Not supported</td></tr>
+      <tr><td>Prefix match (<code>LIKE 'abc%'</code>)</td><td>Supported</td><td>Not supported</td></tr>
+      <tr><td>Where you meet it in MySQL</td><td>InnoDB — every index, always</td><td>MEMORY engine tables; InnoDB's internal, automatic Adaptive Hash Index only</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<div class="callout"><p>Practical takeaway for MySQL specifically: you almost never pick between B-tree and hash yourself. You get a B-tree, and InnoDB tries to make hot equality lookups faster underneath it automatically. The real design decisions are which columns to index and in what order — covered next.</p></div>
+
+<h2><span class="idx">02</span>Four Ways A Perfectly Good Index Gets Ignored</h2>
+<p>Having an index on a column doesn't guarantee MySQL will use it. These four patterns are the ones that come up constantly in interviews, and in real slow-query logs.</p>
+
+<h3>A leading wildcard in LIKE</h3>
+<p><code>WHERE name LIKE '%smith'</code> cannot use a B-tree index on <code>name</code>, because a B-tree can only jump to a starting point using a known prefix — and here the prefix is unknown, it could be anything before "smith." MySQL has no choice but to scan every row. <code>WHERE name LIKE 'smith%'</code>, by contrast, <em>can</em> use the index: "smith" is a known prefix, so MySQL jumps straight to it in the sorted tree and reads forward until the prefix stops matching. If you genuinely need to search for text anywhere inside a column, the real fix isn't a clever index trick — it's a different tool: MySQL's own <code>FULLTEXT</code> index for word-level search, or a dedicated search engine like Elasticsearch (Ch.11) for substring and relevance-ranked search at scale.</p>
+
+<h3>Wrapping the indexed column in a function</h3>
+<p><code>WHERE YEAR(created_at) = 2024</code> or <code>WHERE UPPER(email) = 'A@X.COM'</code> can't use a plain index on <code>created_at</code> or <code>email</code>, even though those columns are indexed. The index stores the raw column values in sorted order; to compare against <code>YEAR(created_at)</code>, MySQL would have to compute that function on every single row before it could compare — which is exactly the full scan the index was supposed to avoid. The fix is almost always to rewrite the predicate so the raw column is compared directly: <code>WHERE created_at &gt;= '2024-01-01' AND created_at &lt; '2025-01-01'</code> uses the index normally. Since MySQL 5.7, there's a second fix: create a generated column that stores the function's result (<code>UPPER(email)</code>, say) and put a normal index on that generated column — the optimizer can already match a query using the same expression straight to that index in 5.7, and 8.0 works the same way. MySQL 8.0.13 added a more direct option on top of this: a <strong>functional index</strong>, which indexes an expression directly (<code>CREATE INDEX idx ON users ((UPPER(email)))</code>) without you having to add a visible generated column at all.</p>
+
+<h3>Indexing a low-selectivity column</h3>
+<p><strong>Selectivity</strong> is how many distinct values a column has relative to its row count. A <code>status</code> column with only three possible values across ten million rows has very low selectivity — any single value still matches roughly a third of the table. Even with an index, fetching that many rows means a lot of scattered bookmark lookups back to the clustered index (random I/O), which can end up costing more than simply scanning the table in order (sequential I/O). MySQL's query optimizer estimates this cost from table statistics, and it will happily ignore an index that exists if it decides a full scan is cheaper for that particular value — indexing a boolean or a handful-of-values column rarely helps on its own.</p>
+
+<h3>Skipping the leftmost prefix of a composite index</h3>
+<p>A composite (multi-column) index, like one on <code>(last_name, first_name, city)</code>, is one single B-tree sorted first by <code>last_name</code>, then by <code>first_name</code> within each <code>last_name</code>, then by <code>city</code> within each <code>first_name</code>. It's like a phone book sorted by last name first: you can efficiently find everyone named "Rao," or every "Rao, Asha," but you cannot efficiently find every "Asha" across all last names without reading the whole book — the book just isn't sorted that way. This is the <strong>leftmost prefix rule</strong>: this index can serve queries filtering on <code>last_name</code>, or on <code>last_name</code> + <code>first_name</code>, or all three columns, but a query that filters only on <code>first_name</code> or only on <code>city</code> — skipping <code>last_name</code> — gets no benefit from it at all.</p>
+
+<div class="callout say-this"><p>"If I see a slow query with <code>WHERE UPPER(email) = ...</code> on an indexed <code>email</code> column, I'd explain that the function wrap is the problem, not the index — MySQL has to compute <code>UPPER()</code> per row to compare, so it can't use the sorted index at all. I'd push to store or query the normalized form directly instead of wrapping it at read time."</p></div>
+
+<div class="callout tradeoff"><p>None of this is a reason to index everything defensively. Every index you add speeds up the reads it matches, but it also has to be updated on every <code>INSERT</code>, <code>UPDATE</code>, and <code>DELETE</code> that touches that column — so a table with ten indexes can look fast in read benchmarks and still be a write bottleneck in production.</p></div>
+
+<h2><span class="idx">03</span>ACID, One Letter At A Time</h2>
+<p>ACID is the set of guarantees a transaction gives you. A <strong>transaction</strong> is a group of one or more operations that the database treats as a single unit. Here's what each letter actually promises, tied to how InnoDB delivers it.</p>
+
+<h3>Atomicity — all or nothing</h3>
+<p>Every operation inside a transaction happens, or none of them do. If a transaction updates three rows and the connection drops after the second one, the database undoes that second change too, as if the transaction never started. InnoDB does this using its <strong>undo log</strong> — before changing a row, it records how to reverse the change, so a crash or an explicit <code>ROLLBACK</code> can walk the undo log backward and restore the previous state.</p>
+
+<h3>Consistency — every rule you defined still holds</h3>
+<p>A transaction must move the database from one valid state to another valid state, where "valid" means every constraint you've defined still holds: foreign keys point at rows that exist, unique columns stay unique, <code>CHECK</code> constraints stay satisfied. This is the letter people misunderstand most — the database doesn't magically know what "correct" means for your business. It only enforces the rules you told it about. Consistency is really Atomicity and Isolation put to work in service of whatever constraints you defined.</p>
+
+<h3>Isolation — concurrent transactions don't see each other's half-finished work</h3>
+<p>Transactions running at the same time should produce a result as if they ran one after another, even though they were actually interleaved for speed. How strictly MySQL enforces this is tunable — that's the isolation levels in the next section.</p>
+
+<h3>Durability — once committed, it survives a crash</h3>
+<p>After MySQL tells the client a transaction committed, that data must still be there even if the power goes out one millisecond later. InnoDB guarantees this with its <strong>redo log</strong>, a write-ahead log: every change is written to the redo log on disk (a small, sequential, fast write) before the commit is acknowledged. On restart after a crash, InnoDB replays the redo log to reconstruct any committed changes that hadn't yet been written back to the actual table's data pages. The setting <code>innodb_flush_log_at_trx_commit</code> controls exactly how aggressively that redo log write is flushed to disk per commit — it's the direct dial between "fully durable" and "faster but riskier on power loss."</p>
+
+<div class="callout say-this"><p>"I'd say the C in ACID isn't the database keeping your data correct by magic — it's the database enforcing whatever constraints you defined, even under concurrent transactions. The two letters actually doing engineering work are Atomicity and Isolation; Consistency is just those two, applied to your schema's rules."</p></div>
+
+<h2><span class="idx">04</span>Isolation Levels: What Each One Actually Stops</h2>
+<p>Isolation is tunable because perfect isolation is expensive. Weakening it trades correctness guarantees for concurrency and speed. Three anomalies define the trade-off:</p>
+<ul>
+  <li><strong>Dirty read</strong> — reading a row that another transaction changed but hasn't committed yet. If that other transaction rolls back, you read data that never really existed.</li>
+  <li><strong>Non-repeatable read</strong> — reading the same row twice inside one transaction and getting two different values, because another transaction changed and committed it in between your two reads.</li>
+  <li><strong>Phantom read</strong> — running the same range query twice inside one transaction and getting a different <em>set</em> of rows, because another transaction inserted or deleted rows that match your filter in between.</li>
+</ul>
+
+<div class="table-scroll">
+  <table class="spec-table">
+    <caption>Isolation level vs anomaly (SQL standard's minimum guarantee at each level)</caption>
+    <thead><tr><th>Isolation level</th><th>Dirty read</th><th>Non-repeatable read</th><th>Phantom read</th></tr></thead>
+    <tbody>
+      <tr><td>Read Uncommitted</td><td>Possible</td><td>Possible</td><td>Possible</td></tr>
+      <tr><td>Read Committed</td><td>Prevented</td><td>Possible</td><td>Possible</td></tr>
+      <tr><td>Repeatable Read</td><td>Prevented</td><td>Prevented</td><td>Possible</td></tr>
+      <tr><td>Serializable</td><td>Prevented</td><td>Prevented</td><td>Prevented</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<p>That table is the SQL standard's floor — the minimum each level has to guarantee. MySQL's InnoDB does better at its default level than the standard requires: <strong>Repeatable Read</strong> is InnoDB's default, and thanks to MVCC snapshots (next section) plus a locking technique called <strong>next-key locking</strong> (a lock on an index record plus the gap before it, which blocks other transactions from inserting a new row into that gap), InnoDB's Repeatable Read prevents phantom reads in nearly all practical cases too — stronger than what the standard demands at that level. <strong>Serializable</strong> goes further still: as long as autocommit is off — that is, you're inside an explicit transaction — InnoDB implicitly converts plain <code>SELECT</code> statements into locking reads, which is the closest thing to running every transaction one at a time — correct, but it can turn concurrent readers into a queue. (With autocommit on, a plain <code>SELECT</code> is its own self-contained read-only transaction and isn't converted this way.)</p>
+
+<div class="callout say-this"><p>"MySQL's default, Repeatable Read, already blocks phantom reads in almost every real case, thanks to next-key locking and MVCC snapshots — that's stronger than the SQL standard technically requires at that level. That's one reason production MySQL rarely needs to reach for Serializable; the default is already close to it for the cases that matter, at a fraction of the concurrency cost."</p></div>
+
+<h2><span class="idx">05</span>MVCC: How MySQL Reads Without Blocking Writers</h2>
+<p>The naive way to give transactions isolation is locking: a reader takes a lock so no writer can change the row underneath it, and a writer takes a lock so no reader sees a half-finished change. The problem is throughput — readers and writers now constantly block each other, and most real workloads are read-heavy, so this gets painful fast.</p>
+<p><strong>MVCC (multi-version concurrency control)</strong> solves this by keeping more than one version of a row around instead of just the current one. Every transaction gets a consistent <strong>snapshot</strong> (in InnoDB, called a <strong>read view</strong>) of the database as it looked at a fixed point in time, and it reads from that snapshot for its whole duration — it never has to wait for a writer, because it's reading a version that already existed and will never change again.</p>
+<p>Roughly how InnoDB does this: every row secretly carries a hidden transaction ID (which transaction last changed it) and a hidden <strong>roll pointer</strong> to an entry in the undo log holding the row's previous value. A transaction's read view is essentially a list of which other transactions were still uncommitted when the view was created. To read a row, InnoDB checks whether the current version was written by a transaction visible to that read view; if not, it follows the roll pointer back to the previous version in the undo log, and keeps walking backward until it finds a version that was already committed as far as this read view is concerned.</p>
+
+<div class="diagram" data-diagram='{
+  "title": "MVCC in InnoDB: readers walk the undo log chain instead of blocking on a lock",
+  "nodes": [
+    {"id":"txnA","x":30,"y":40,"w":240,"h":70,"kind":"compute","label":"Transaction A","sub":"read view fixed at start: sees up to txn 101"},
+    {"id":"txnB","x":30,"y":300,"w":240,"h":70,"kind":"compute","label":"Transaction B","sub":"starts later, updates the row (txn 103)"},
+    {"id":"current","x":430,"y":150,"w":260,"h":70,"kind":"storage","label":"Row: current version","sub":"value = 150, written by txn 103"},
+    {"id":"v2","x":430,"y":280,"w":260,"h":70,"kind":"storage","label":"Undo log entry: version 2","sub":"value = 120, written by txn 101"},
+    {"id":"v1","x":430,"y":410,"w":260,"h":70,"kind":"storage","label":"Undo log entry: version 1","sub":"value = 100, written by txn 98"}
+  ],
+  "edges": [
+    {"from":"current","to":"v2","label":"roll pointer"},
+    {"from":"v2","to":"v1","label":"roll pointer"},
+    {"from":"txnB","to":"current","label":"writes new version"},
+    {"from":"txnA","to":"v2","label":"reads this version, txn 103 isn&#39;t in its snapshot yet"}
+  ],
+  "groups": [
+    {"x":410,"y":130,"w":300,"h":370,"label":"InnoDB: one row&#39;s version chain (current + undo log)"}
+  ]
+}'></div>
+
+<p>Writers still take row locks and still create new versions when they write — MVCC doesn't remove locking for writes, it removes the need for reads to take any lock at all. That's the core trade it makes: readers never block writers, and writers never block readers, only writer-vs-writer contention on the same row still needs a lock.</p>
+<div class="callout"><p>Old versions can't be thrown away the moment a newer one exists — InnoDB has to keep every version that some transaction's read view might still need. A single long-running transaction (an open connection left idle mid-transaction, a slow report) can quietly block InnoDB's cleanup process (called <strong>purge</strong>) from ever discarding old versions, bloating the undo log until that transaction finally finishes. This is a real, common cause of unexplained disk growth in production MySQL.</p></div>
+
+<h2><span class="idx">06</span>Row-Level Vs Table-Level Locking</h2>
+<p>A <strong>table-level lock</strong> locks the entire table for the duration of the operation — simple to implement and track, but it means one write blocks every other read and write on that table, even ones touching completely unrelated rows. MySQL's older default engine, <strong>MyISAM</strong>, works this way; it's largely legacy today.</p>
+<p>A <strong>row-level lock</strong> locks only the specific rows a transaction actually touches, so two transactions updating different rows in the same table can run fully in parallel. <strong>InnoDB</strong> — the default engine since MySQL 5.5 — locks at the row level, which is a big part of why it replaced MyISAM as the default. The cost is complexity: InnoDB has to track locks per row instead of one flag per table, and two transactions that lock the same rows in a different order can end up in a <strong>deadlock</strong> — each waiting on a row the other one holds. InnoDB detects this automatically and forcibly rolls back one of the two transactions (the one with less work to undo) so the other can proceed.</p>
+
+<div class="table-scroll">
+  <table class="spec-table">
+    <caption>Row-level vs table-level locking</caption>
+    <thead><tr><th></th><th>Table-level</th><th>Row-level</th></tr></thead>
+    <tbody>
+      <tr><td>Concurrency</td><td>Low — any write blocks the whole table</td><td>High — only overlapping rows contend</td></tr>
+      <tr><td>Overhead per operation</td><td>Very low — one flag to check</td><td>Higher — must track locks per row</td></tr>
+      <tr><td>Used by</td><td>MyISAM (legacy)</td><td>InnoDB (default since MySQL 5.5)</td></tr>
+      <tr><td>New failure mode</td><td>None beyond queuing</td><td>Deadlocks between transactions locking rows in different orders</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<h2><span class="idx">07</span>Normalization Vs Denormalization: One Schema, Both Ways</h2>
+<p><strong>Normalization</strong> means organizing a schema so each fact is stored in exactly one place, avoiding data that has to be kept in sync by hand across many rows. Here's one flat, unnormalized order table:</p>
+
+<div class="table-scroll">
+  <table class="spec-table">
+    <caption>Unnormalized: orders_flat</caption>
+    <thead><tr><th>order_id</th><th>customer_name</th><th>customer_email</th><th>product_name</th><th>unit_price</th><th>quantity</th><th>order_date</th></tr></thead>
+    <tbody>
+      <tr><td>1001</td><td>Asha Rao</td><td>asha@example.com</td><td>Wireless Mouse</td><td>799</td><td>2</td><td>2026-01-04</td></tr>
+      <tr><td>1002</td><td>Asha Rao</td><td>asha@example.com</td><td>USB-C Cable</td><td>199</td><td>3</td><td>2026-01-04</td></tr>
+      <tr><td>1003</td><td>Ravi Shah</td><td>ravi@example.com</td><td>Wireless Mouse</td><td>799</td><td>1</td><td>2026-01-05</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<p>The problems are all redundancy problems. Asha's name and email are repeated on every row she ever orders — change her email and you must find and update every one of those rows, or the table starts disagreeing with itself (an <strong>update anomaly</strong>). "Wireless Mouse" and its price are repeated on every order for it too. And if a product has never been ordered, there's nowhere in this table to even record that it exists (an <strong>insertion anomaly</strong>).</p>
+<p>Normalizing pulls each repeated fact out into its own table, keyed by an ID, referenced by foreign key:</p>
+<pre><code>CREATE TABLE customers (
+  customer_id BIGINT PRIMARY KEY AUTO_INCREMENT,
+  name        VARCHAR(120) NOT NULL,
+  email       VARCHAR(160) NOT NULL UNIQUE
+);
+
+CREATE TABLE products (
+  product_id    BIGINT PRIMARY KEY AUTO_INCREMENT,
+  name          VARCHAR(160) NOT NULL,
+  current_price DECIMAL(10,2) NOT NULL
+);
+
+CREATE TABLE orders (
+  order_id    BIGINT PRIMARY KEY AUTO_INCREMENT,
+  customer_id BIGINT NOT NULL,
+  order_date  DATE NOT NULL,
+  FOREIGN KEY (customer_id) REFERENCES customers(customer_id)
+);
+
+CREATE TABLE order_items (
+  order_id          BIGINT NOT NULL,
+  product_id        BIGINT NOT NULL,
+  quantity          INT NOT NULL,
+  price_at_purchase DECIMAL(10,2) NOT NULL,
+  PRIMARY KEY (order_id, product_id),
+  FOREIGN KEY (order_id) REFERENCES orders(order_id),
+  FOREIGN KEY (product_id) REFERENCES products(product_id)
+);</code></pre>
+<p>Note the explicit <code>FOREIGN KEY (...) REFERENCES ...</code> table-level clause — MySQL parses inline column-level <code>REFERENCES</code> (like <code>customer_id BIGINT REFERENCES customers(customer_id)</code> with no <code>FOREIGN KEY</code> keyword) but silently ignores it: no constraint gets created, no index, and MySQL doesn't even check that the referenced table or column exists. The table-level form above is what actually gives you a real, enforced foreign key.</p>
+<p>Now Asha's name and email exist in exactly one row, no matter how many orders she places. A product's name and current price exist in exactly one row, no matter how many times it's sold. Note that <code>price_at_purchase</code> on <code>order_items</code> deliberately keeps its own copy of the price — that's not a normalization mistake, it's a separate fact (what the customer actually paid, at that moment) that has to live somewhere, since <code>current_price</code> keeps changing after the sale.</p>
+
+<p>Now the deliberate denormalization. Say an order-history screen (or a <code>GET /orders/:id</code> endpoint) gets hit on nearly every visit to the app. Rendering it means joining <code>orders</code> to <code>customers</code> for the name, and to <code>order_items</code> and <code>products</code> for each line item — a three- or four-way join on one of your hottest read paths. At real traffic, that join cost shows up directly in p95 latency and in how much CPU and buffer-pool memory that one screen eats. A common, deliberate fix: add a denormalized <code>customer_name</code> column directly onto <code>orders</code>, filled in at order-creation time, so the order-history read becomes a single-table lookup with no join at all.</p>
+
+<div class="callout tradeoff"><p>The cost of that denormalized <code>customer_name</code> column is that it can go stale — if Asha changes her display name next year, her old orders still show the old name unless you explicitly update them. For an order history, that's usually a feature, not a bug: an invoice should show the name as it was at the time of the order, not whatever the customer is called today. That's the general shape of the normalization-vs-denormalization call: normalize for correctness and low update cost, then denormalize specific, hot, read-heavy fields back once you can name the exact query it's slowing down and you've accepted what staleness it introduces.</p></div>
+
+<h2><span class="idx">08</span>Replication And Failover, MySQL Specifically</h2>
+<p>Chapter 6 introduced binlog-based replication and semi-sync vs async at a high level. Here's what's actually happening mechanically, and what a MySQL failover really does step by step.</p>
+
+<h3>How the binlog actually gets from primary to replica</h3>
+<p>The <strong>binlog</strong> (binary log) is an ordered record of every committed change on the primary (called the <strong>source</strong> in current MySQL terminology). Getting it onto a replica is two decoupled jobs, run by two separate threads: an <strong>I/O thread</strong> connects to the primary and copies binlog events into a local file on the replica called the <strong>relay log</strong>, and a separate <strong>SQL thread</strong> (or, in modern MySQL, a pool of parallel apply workers) reads the relay log and actually applies those changes to the replica's own data. Because these two jobs are decoupled, a replica can be fully caught up on <em>receiving</em> events while still behind on <em>applying</em> them — one of the concrete reasons replication lag exists.</p>
+<p>Modern MySQL tracks replication position with <strong>GTIDs</strong> (Global Transaction Identifiers) — a unique ID stamped on every transaction — instead of the older method of tracking a binlog filename plus a byte offset. GTIDs matter most during failover: a replica can figure out for itself exactly where to resume from against a <em>different</em> new primary, because it just asks "which GTIDs have I already applied," instead of a human working out the matching file-and-position by hand.</p>
+
+<h3>Semi-sync vs async, precisely</h3>
+<p>With plain <strong>asynchronous</strong> replication, the primary commits and replies to the client immediately, then ships the binlog to replicas whenever it gets to it — fast, but a crash right after commit can lose whatever hadn't shipped yet. MySQL's <strong>semi-synchronous</strong> replication (a plugin you install explicitly with <code>INSTALL PLUGIN</code>, in every version through at least 8.0/8.4) changes one thing: after committing locally, the primary waits for at least one replica to acknowledge it has <em>received</em> the binlog event (not necessarily applied it yet) before telling the client the write succeeded. This closes the "the only copy was on the machine that just died" gap for one round trip of extra latency. Semi-sync also has a safety valve: if no replica acknowledges within <code>rpl_semi_sync_master_timeout</code>, the primary automatically falls back to async for that period rather than hanging forever, then switches back to semi-sync once a replica catches back up — durability is best-effort, not a hard blocking guarantee.</p>
+
+<h3>What actually happens during failover</h3>
+<ol>
+  <li><strong>Detection</strong> — something monitoring the primary (an orchestration tool like Orchestrator or MHA, a managed service's own health checks, or Vitess's VTOrc from Ch.6) notices it's unreachable. Good setups check from more than one vantage point first, so a single node's network blip doesn't trigger a false failover.</li>
+  <li><strong>Choosing the new primary</strong> — among the surviving replicas, pick the one with the most up-to-date data (the most advanced GTID position). A semi-sync replica is the safest candidate, because it's guaranteed to hold at least the last transaction the old primary acknowledged as committed.</li>
+  <li><strong>Fencing the old primary</strong> — make sure the old primary can never accept another write again, even if it comes back online, usually by forcing it read-only or isolating it from the network. Skipping this risks <strong>split-brain</strong>: two nodes both accepting writes and diverging.</li>
+  <li><strong>Promotion</strong> — the chosen replica stops replicating and is reconfigured as writable.</li>
+  <li><strong>Repointing</strong> — every remaining replica is told to replicate from the new primary instead (<code>CHANGE REPLICATION SOURCE TO</code>), and the endpoint applications actually connect to — a virtual IP, a DNS record, or a proxy layer like ProxySQL or VTGate — is updated so writes route to the new primary with no application code change.</li>
+  <li><strong>Accepting the data-loss window, if any</strong> — any transaction that committed on the old primary but never reached any replica is gone for good once that old primary is fenced off. With pure async replication that window can be several seconds of writes; running at least one semi-sync replica is specifically what shrinks that window to effectively zero.</li>
+</ol>
+
+<div class="diagram" data-diagram='{
+  "title": "MySQL replication topology and who takes over when the primary dies",
+  "nodes": [
+    {"id":"app","x":30,"y":240,"w":160,"h":70,"kind":"compute","label":"Application"},
+    {"id":"primary","x":270,"y":240,"w":190,"h":70,"kind":"storage","label":"Primary (source)","sub":"accepts all writes, writes binlog"},
+    {"id":"semisync","x":560,"y":80,"w":220,"h":70,"kind":"storage","label":"Semi-sync Replica","sub":"must ACK receipt before commit returns"},
+    {"id":"asyncread","x":560,"y":240,"w":220,"h":70,"kind":"storage","label":"Async Replica (reads)","sub":"read-replica pool, may lag"},
+    {"id":"asyncdr","x":560,"y":400,"w":220,"h":70,"kind":"storage","label":"Async Replica (DR site)","sub":"cross-region copy"},
+    {"id":"orchestrator","x":830,"y":240,"w":150,"h":70,"kind":"compute","label":"Orchestrator","sub":"watches health, drives failover"}
+  ],
+  "edges": [
+    {"from":"app","to":"primary","label":"writes"},
+    {"from":"app","to":"asyncread","label":"reads, may be stale"},
+    {"from":"primary","to":"semisync","label":"binlog, must ACK before commit returns"},
+    {"from":"primary","to":"asyncread","label":"binlog, async"},
+    {"from":"primary","to":"asyncdr","label":"binlog, async, cross-region"},
+    {"from":"orchestrator","to":"primary","label":"health check"},
+    {"from":"orchestrator","to":"semisync","label":"promotes on failure"}
+  ],
+  "groups": [
+    {"x":540,"y":60,"w":260,"h":430,"label":"Replica set: one semi-sync + N async"}
+  ]
+}'></div>
+
+<div class="callout say-this"><p>"I'd run one semi-sync replica for durability and any number of plain async replicas for read scaling — you only pay the extra round trip of semi-sync latency on the write path, once, and you get a hard guarantee that a write surviving on only one machine never happens. The async replicas stay cheap and fast for reads, where a little staleness is fine."</p></div>
+
+<div class="callout em-angle"><p>An EM-level answer adds the build-vs-buy angle: everything in the failover steps above — detection, election, fencing, repointing — is exactly what managed offerings like Amazon RDS Multi-AZ or Aurora automate for you, typically completing a failover in well under a minute with no one paged. Running Orchestrator or MHA yourself gives more control (useful at very large fleets, or when you need cross-region topologies a managed product doesn't offer) but it's real operational surface a team has to own, test, and be ready to debug at 3 a.m.</p></div>
+
+<div class="specsheet">
+  <details>
+    <summary><span class="cat">Index</span> B-tree vs hash, quick facts</summary>
+    <div class="specbody">
+      <ul>
+        <li><strong>B-tree</strong> — sorted, balanced tree; supports equality, range, prefix, and ordering. InnoDB's only user-facing index type.</li>
+        <li><strong>Hash</strong> — O(1) equality only, no range/order/prefix. Available on MEMORY tables; InnoDB only builds one internally (Adaptive Hash Index), automatically.</li>
+        <li><strong>Clustered index</strong> — InnoDB's primary key index; leaf pages hold the full row.</li>
+        <li><strong>Secondary index</strong> — leaf pages hold the indexed column plus the primary key, so a lookup is index-then-clustered-index (a bookmark lookup).</li>
+      </ul>
+    </div>
+  </details>
+  <details>
+    <summary><span class="cat">Index miss</span> Four ways a query skips an index</summary>
+    <div class="specbody">
+      <ul>
+        <li><strong>Leading wildcard</strong> — <code>LIKE '%x'</code> has no known prefix to jump to; forces a full scan.</li>
+        <li><strong>Function-wrapped column</strong> — <code>WHERE YEAR(col) = ...</code> needs per-row computation; rewrite as a range on the raw column, or index a generated column.</li>
+        <li><strong>Low selectivity</strong> — a column with few distinct values matches too large a share of rows for the index to be worth the random I/O.</li>
+        <li><strong>Skipping the leftmost prefix</strong> — a composite index on <code>(a, b, c)</code> only helps queries filtering on <code>a</code>, or <code>a</code>+<code>b</code>, or all three, in that order.</li>
+      </ul>
+    </div>
+  </details>
+  <details>
+    <summary><span class="cat">ACID</span> One line per letter</summary>
+    <div class="specbody">
+      <ul>
+        <li><strong>Atomicity</strong> — all of a transaction's changes happen, or none do (InnoDB: undo log).</li>
+        <li><strong>Consistency</strong> — every constraint you defined still holds after the transaction.</li>
+        <li><strong>Isolation</strong> — concurrent transactions look as if they ran one after another (tunable — see levels below).</li>
+        <li><strong>Durability</strong> — once committed, it survives a crash (InnoDB: redo log, a write-ahead log).</li>
+      </ul>
+    </div>
+  </details>
+  <details>
+    <summary><span class="cat">Isolation</span> Four levels, one line each</summary>
+    <div class="specbody">
+      <ul>
+        <li><strong>Read Uncommitted</strong> — prevents nothing; can see another transaction's uncommitted writes.</li>
+        <li><strong>Read Committed</strong> — blocks dirty reads only.</li>
+        <li><strong>Repeatable Read</strong> — blocks dirty and non-repeatable reads; MySQL's default; InnoDB also blocks most phantoms here via MVCC + next-key locks.</li>
+        <li><strong>Serializable</strong> — blocks all three; MySQL does it by making plain reads take locks too.</li>
+      </ul>
+    </div>
+  </details>
+  <details>
+    <summary><span class="cat">Locks</span> Row-level vs table-level</summary>
+    <div class="specbody">
+      <ul>
+        <li><strong>Table-level</strong> — one lock for the whole table; MyISAM (legacy); simple, low concurrency.</li>
+        <li><strong>Row-level</strong> — locks only touched rows; InnoDB (default); high concurrency, can deadlock.</li>
+        <li><strong>Next-key lock</strong> — InnoDB locking a row plus the gap before it, to stop phantom inserts.</li>
+        <li><strong>Deadlock</strong> — InnoDB detects the cycle automatically and rolls back the cheaper-to-undo transaction.</li>
+      </ul>
+    </div>
+  </details>
+  <details>
+    <summary><span class="cat">Replication</span> Binlog, GTID, semi-sync, failover</summary>
+    <div class="specbody">
+      <ul>
+        <li><strong>Binlog</strong> — ordered log of committed changes on the primary; replicas stream and replay it.</li>
+        <li><strong>I/O thread vs SQL thread</strong> — receiving events and applying them are decoupled; a source of lag.</li>
+        <li><strong>GTID</strong> — a unique ID per transaction, so a replica can resume against a new primary without manual file/offset math.</li>
+        <li><strong>Semi-sync</strong> — primary waits for one replica to ACK receipt before committing; falls back to async on timeout.</li>
+        <li><strong>Failover</strong> — detect, elect the most up-to-date replica, fence the old primary, promote, repoint the rest.</li>
+      </ul>
+    </div>
+  </details>
+</div>
+
+<div class="flashcards" data-cards='[
+  {"q":"Why can B-tree indexes support range queries and hash indexes can&#39;t?","a":"A B-tree keeps keys sorted, with leaf pages chained in order, so a range scan just walks sideways. A hash function scatters keys unpredictably across buckets to get O(1) equality lookups, which destroys any notion of order between neighboring keys."},
+  {"q":"Does InnoDB let you create your own hash index?","a":"No. InnoDB accepts USING HASH syntax but silently builds a B-tree anyway. Real user-chosen hash indexes only exist on MySQL&#39;s MEMORY engine. InnoDB&#39;s only hash structure is its own internal, automatic Adaptive Hash Index."},
+  {"q":"What is a bookmark lookup in InnoDB?","a":"A secondary index&#39;s leaf pages store the indexed column plus the primary key, not a direct pointer to the row. So using a secondary index means one lookup in that index, then a second lookup in the clustered (primary key) index to fetch the full row."},
+  {"q":"Why does a leading wildcard like LIKE &#39;%smith&#39; force a full table scan?","a":"A B-tree index needs a known prefix to jump to a starting point. With an unknown prefix before &#39;smith&#39;, there is no starting point to jump to, so MySQL has to check every row."},
+  {"q":"Why does WHERE YEAR(created_at) = 2024 skip an index on created_at?","a":"The index stores raw column values in sorted order. Comparing against YEAR(created_at) needs the function computed per row first, which defeats the point of the sorted structure — MySQL falls back to a full scan unless you rewrite it as a plain range or index a generated column."},
+  {"q":"What is the leftmost prefix rule for a composite index?","a":"A composite index on (a, b, c) is one B-tree sorted first by a, then b within a, then c within b. It can serve queries filtering on a, or a+b, or a+b+c, but not queries that filter only on b or only on c while skipping a."},
+  {"q":"Why might MySQL ignore an index on a low-selectivity column?","a":"If a column has few distinct values, any one value still matches a large share of the table. Fetching that many rows via the index means scattered random I/O back to the clustered index, which the optimizer can estimate as costlier than a straight sequential full scan."},
+  {"q":"State ACID in one line each.","a":"Atomicity: all of a transaction&#39;s changes happen or none do. Consistency: every constraint you defined still holds afterward. Isolation: concurrent transactions look as if run one after another. Durability: once committed, it survives a crash."},
+  {"q":"Dirty read vs non-repeatable read vs phantom read — one line each.","a":"Dirty read: seeing another transaction&#39;s uncommitted change. Non-repeatable read: re-reading the same row and getting a different value because it was committed in between. Phantom read: re-running the same range query and getting a different set of rows because inserts/deletes changed the matches in between."},
+  {"q":"Which anomalies does MySQL&#39;s default isolation level, Repeatable Read, prevent?","a":"Dirty reads and non-repeatable reads by the SQL standard&#39;s definition. InnoDB&#39;s actual implementation goes further and also prevents phantom reads in almost all practical cases, via MVCC snapshots plus next-key locking — stronger than the standard requires at that level."},
+  {"q":"What problem does MVCC solve, in one sentence?","a":"It lets readers see a consistent snapshot of the database without taking any lock, so reads never block writers and writers never block readers — only writer-vs-writer contention on the same row still needs a lock."},
+  {"q":"Roughly how does InnoDB implement MVCC?","a":"Every row carries a hidden transaction ID and a roll pointer to its previous version in the undo log. A transaction&#39;s read view records which other transactions were uncommitted when it started; to read a row, InnoDB walks the undo log chain backward until it finds a version already committed as far as that read view is concerned."},
+  {"q":"Why can a single long-running transaction bloat InnoDB&#39;s undo log?","a":"InnoDB can&#39;t discard an old row version while some transaction&#39;s read view might still need it. A long-open transaction holds an old snapshot alive, blocking InnoDB&#39;s purge process from cleaning up versions newer transactions no longer need either."},
+  {"q":"Row-level vs table-level locking — what&#39;s the practical difference?","a":"Table-level locks the whole table per operation (MyISAM) — simple but low concurrency, since any write blocks every other read and write. Row-level locks only the rows actually touched (InnoDB, the default) — much higher concurrency, at the cost of possible deadlocks between transactions locking rows in different orders."},
+  {"q":"Give a realistic reason to denormalize part of a schema back for read performance.","a":"A hot read path like an order-history page needs a multi-way join (orders, customers, order_items, products) on nearly every request. Adding a redundant column, like a customer_name snapshot directly on orders, turns that read into a single-table lookup, trading some staleness risk for lower join cost and latency at scale."},
+  {"q":"What is the practical difference between MySQL&#39;s I/O thread and SQL thread on a replica?","a":"The I/O thread receives binlog events from the primary into the local relay log; the SQL thread (or parallel apply workers) separately reads that relay log and applies the changes. Because they&#39;re decoupled, a replica can be fully caught up on receiving events while still behind on applying them."},
+  {"q":"What does MySQL semi-sync replication actually guarantee, and what happens if no replica responds?","a":"The primary waits for at least one replica to acknowledge it received (not necessarily applied) the binlog event before confirming the commit to the client. If no replica acknowledges within the configured timeout, it falls back to async for that period instead of blocking forever, then returns to semi-sync once a replica catches up."},
+  {"q":"List the main steps of a MySQL failover in order.","a":"Detect the primary is unreachable, pick the most up-to-date surviving replica (using GTID position), fence the old primary so it can never accept writes again, promote the chosen replica, then repoint the remaining replicas and the application-facing endpoint to it."},
+  {"q":"Why does running at least one semi-sync replica matter for failover specifically?","a":"With pure async replication, any transaction committed on the old primary but not yet shipped anywhere is lost once that primary is fenced off. A semi-sync replica is guaranteed to already hold the last acknowledged transaction, shrinking that data-loss window to effectively zero."}
+]'></div>

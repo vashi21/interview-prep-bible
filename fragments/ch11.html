@@ -1,0 +1,279 @@
+<p class="lede">Some data doesn't fit any shape covered so far: text you want ranked by how well it matches, metrics that never stop arriving, and transactions that need to span machines without giving up ACID guarantees. This chapter covers the three tools built for exactly those jobs — Elasticsearch, time-series databases, and NewSQL — then closes Part III by showing how one real company picks a different database for each workload, and why.</p>
+
+<h2><span class="idx">01</span>Why Search Needs A Different Shape Of Index</h2>
+<p>Ch.7 covers the B-tree index (a sorted tree structure that most relational databases use by default): it maps a <strong>value to a row's location</strong>. Give it an exact value, or a range of values, and it walks down the tree in roughly <code>log(n)</code> steps and hands you back exactly the rows that match. That's the right tool for "find the user where <code>email = x</code>" or "find all orders placed between two dates."</p>
+<p>Full-text search is a different question entirely. Say you're searching a million product descriptions for "wireless noise cancelling headphones." You don't want an exact match on the whole description field — almost nothing will match that. You want documents that contain some or all of those words, ranked by how well they fit, with the best match first. A B-tree index on that description column can't help here: it can tell you whether the entire field equals some exact string, or match a prefix, but it has no way to look inside the text for independent words, and it has no concept of "how well" something matches — only match or no match.</p>
+<p>This is what an <strong>inverted index</strong> is built for, and it flips the B-tree's mapping around: instead of value-to-location, it maps <strong>term to the list of documents that contain it</strong>, called a <strong>postings list</strong>. The name comes from a very old, very physical analogy — the index at the back of a textbook. It lists every important word alphabetically, and next to each word is every page number where that word appears. You don't scan the whole book to find "mitochondria"; you look up the word once and jump straight to the pages.</p>
+<p>Under Elasticsearch, this is literally how it works, via a library called <strong>Lucene</strong> (a single-machine search engine written in Java that both Elasticsearch and the older Solr project are built on top of). When a document is indexed, an <strong>analyzer</strong> breaks its text into individual terms — lowercasing them, dropping common "stop words" like "the" and "a," and often reducing words to a root form (stemming, so "running" and "run" can be treated as the same term). For every unique term, Lucene keeps a postings list: which documents contain it, how many times (term frequency), and at what positions (needed for phrase queries like matching "noise cancelling" as an exact two-word phrase, not two separate hits). A search for several words just looks up each term's postings list directly and combines them — it never has to scan documents it already knows can't match.</p>
+<p>The other piece a B-tree simply doesn't have is <strong>relevance ranking</strong>. Lucene's default scoring function is <strong>BM25</strong>, a probabilistic ranking formula that replaced the older TF-IDF (term frequency–inverse document frequency) approach. In plain terms: a document scores higher if a search term appears often in it (term frequency), but a term that appears in almost every document in the whole index — common words — counts for less (inverse document frequency), and the score is normalized for document length so a long document doesn't win purely by repeating a word more times. A B-tree lookup has no equivalent of this — it was never asked to answer "how relevant," only "does it match."</p>
+
+<div class="table-scroll">
+  <table class="spec-table">
+    <caption>Two fundamentally different shapes of index</caption>
+    <thead><tr><th>Concept</th><th>B-tree index</th><th>Inverted index</th></tr></thead>
+    <tbody>
+      <tr><td>What it maps</td><td>A value to a row's storage location</td><td>A term to the list of documents containing it (postings list)</td></tr>
+      <tr><td>Best at</td><td>Exact match, range scans, sorted order, on one or a few columns</td><td>Multi-term matching, partial text, ranked relevance</td></tr>
+      <tr><td>Can't do well</td><td>Search inside free text; rank how well something matches</td><td>Fast exact-value point lookups by a single primary key; multi-row transactions</td></tr>
+      <tr><td>Update cost</td><td>Cheap, in-place — a tree rebalance touches a few nodes</td><td>Expensive in place, so real implementations use immutable segments instead (see section 02)</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<h2><span class="idx">02</span>Elasticsearch In Practice: Shards, Segments, And Scatter-Gather</h2>
+<p>An Elasticsearch <strong>index</strong> is a logical collection of documents — confusingly, the same word as a database index, but a completely different concept; think of it as closer to a table. Like the sharded databases in Ch.6, an Elasticsearch index is split into <strong>shards</strong> decided at creation time, and each shard is itself a complete, self-contained Lucene index with its own inverted index. Each primary shard can have one or more <strong>replica shards</strong> — the same replication idea from Ch.6, giving you both failover and more machines to spread search load across.</p>
+<p>There's one important way an Elasticsearch query differs from a normal sharded database query. In Ch.6, a well-chosen shard key routes a query to exactly one shard. A full-text search usually can't do that, because you don't know in advance which shard holds the documents containing a given term — the match could be anywhere. So a search request goes to a <strong>coordinating node</strong>, which scatters the query out to every shard, waits for each shard's ranked results, and merges and re-ranks them before replying. This "scatter-gather" pattern isn't a design flaw; it's inherent to what full-text search is asking for.</p>
+<p>Inside each shard, Lucene never updates its inverted index in place — rewriting a huge sorted postings list for every single write would be far too slow. Instead, each new batch of documents becomes a small, brand-new <strong>segment</strong> — an immutable chunk of the index. A delete doesn't remove anything immediately; it just flags the document as a tombstone. A background <strong>merge</strong> process periodically combines small segments into bigger ones and physically drops tombstoned documents in the process. This is the same immutable-then-merge shape as the LSM-tree and SSTable compaction Cassandra uses (Ch.9) — different data structure, same underlying trade: cheap sequential writes now, in exchange for background cleanup later.</p>
+<p>Because a document only becomes searchable after the next segment <strong>refresh</strong> — which defaults to about once per second — Elasticsearch is described as <strong>near-real-time</strong>, not real-time. And because it has no multi-document ACID transactions spanning shards the way a relational database does (Ch.7), Elasticsearch is almost never the system of record. The normal pattern is: keep MySQL, Postgres, or MongoDB as the source of truth, and feed a searchable copy of the relevant fields into Elasticsearch through a change pipeline — often change-data-capture or an outbox-style relay (Ch.14 covers the outbox pattern in detail).</p>
+
+<div class="diagram" data-diagram='{
+  "title": "Elasticsearch: shards, replicas, and a scatter-gather query",
+  "nodes": [
+    {"id":"client","x":30,"y":250,"w":150,"h":60,"kind":"external","label":"Client / Kibana"},
+    {"id":"coord","x":250,"y":250,"w":180,"h":60,"kind":"compute","label":"Coordinating Node","sub":"scatters query, merges + ranks results"},
+    {"id":"s0p","x":560,"y":80,"w":180,"h":60,"kind":"storage","label":"Shard 0: Primary","sub":"Lucene index: inverted index + segments"},
+    {"id":"s0r","x":560,"y":170,"w":180,"h":60,"kind":"storage","label":"Shard 0: Replica"},
+    {"id":"s1p","x":560,"y":330,"w":180,"h":60,"kind":"storage","label":"Shard 1: Primary","sub":"Lucene index: inverted index + segments"},
+    {"id":"s1r","x":560,"y":420,"w":180,"h":60,"kind":"storage","label":"Shard 1: Replica"}
+  ],
+  "edges": [
+    {"from":"client","to":"coord","label":"search query"},
+    {"from":"coord","to":"s0p","label":"scatter"},
+    {"from":"coord","to":"s1p","label":"scatter"},
+    {"from":"s0p","to":"s0r","label":"replicate"},
+    {"from":"s1p","to":"s1r","label":"replicate"}
+  ],
+  "groups": [
+    {"x":540,"y":60,"w":220,"h":190,"label":"Shard 0"},
+    {"x":540,"y":310,"w":220,"h":190,"label":"Shard 1"}
+  ]
+}'></div>
+
+<div class="callout tradeoff"><p>Shard count is fixed when an index is created (newer versions added limited split/shrink operations, but they come with real restrictions, similar to how resharding a MongoDB collection is a heavy operation — see Ch.6). Too few shards and you can't parallelize a big index across enough machines; too many and every query pays coordination overhead on shards that barely hold any data. Elastic's own guidance is commonly cited as keeping each shard roughly in the 10 to 50 GB range — small enough to move and recover quickly, big enough that you're not paying per-shard overhead for nothing.</p></div>
+
+<div class="callout say-this"><p>"I wouldn't make Elasticsearch the primary datastore here. I'd keep Postgres as the system of record for the actual records, and index a denormalized, search-optimized copy into Elasticsearch through a change-data-capture pipeline — that way a search-cluster outage never risks losing real data, just search availability."</p></div>
+
+<div class="callout em-angle"><p>Running your own Elasticsearch cluster means JVM heap tuning, watching for split-brain during master elections, and manually rebalancing shards under load — real operational weight. A managed offering (Elastic Cloud, Amazon OpenSearch Service) trades a monthly bill for a lot of that on-call burden, which is usually the right call for a team that isn't already staffed to run distributed search infrastructure.</p></div>
+
+<h2><span class="idx">03</span>The Write Pattern Time-Series Databases Are Built For</h2>
+<h3>What time-series data looks like</h3>
+<p>A time-series database (TSDB) stores a value tied to a timestamp, plus a small set of labels identifying what's being measured — a metric name, a host, a region. Examples: CPU usage sampled every 15 seconds per server, request latency per API endpoint, a sensor reading once a minute. Two things make this data different from a typical application table: it arrives constantly and it almost never changes after it's written. You don't go back and edit yesterday's CPU reading.</p>
+<p>The write pattern that follows from this: practically every write is a brand-new row with a timestamp newer than anything already stored — a nonstop, high-volume append. Updates to existing rows are rare to nonexistent. Reads are almost always range queries over time — "give me this metric for the last 24 hours" — combined with an aggregation like average, percentile, or sum, usually downsampled to far fewer points than were actually stored. Point lookups by a single primary key, the bread-and-butter query of a normal OLTP table, barely happen.</p>
+<p>The volume adds up fast. Take a modest fleet: 5,000 hosts, each exporting 200 metrics, scraped every 15 seconds. That's <code>5,000 × 200 = 1,000,000</code> distinct time series. Each one writes a new sample every 15 seconds, so that's roughly <code>1,000,000 ÷ 15 ≈ 66,700</code> samples a second, or about <code>66,700 × 86,400 ≈ 5.76 billion</code> samples a day — from one moderately sized fleet.</p>
+
+<h3>Why a regular database buckles under this pattern</h3>
+<p>Point a normal relational or document database at that write pattern and two specific things go wrong. First, an index on the timestamp column runs straight into the <strong>monotonically increasing key</strong> problem covered for MongoDB shard keys in Ch.6 — except here it happens at the level of a single B-tree, not a whole shard. Every insert has a timestamp higher than every timestamp before it, so every insert lands at the same edge of the index. That one spot keeps splitting under constant pressure, while the rest of the index — all the historical, cooling data — sits untouched but still takes up space and still gets scanned during vacuum or maintenance passes.</p>
+<p>Second, general-purpose row storage carries per-row overhead: a row header, transaction/version metadata (MVCC bookkeeping, Ch.7), and a B-tree index entry. A time-series sample's actual payload — one timestamp and one number — might be 16 bytes. When the overhead per row is comparable to or bigger than the payload, and you're storing billions of rows a day, that overhead alone can dwarf the real data.</p>
+<p>Retention makes it worse in the other direction. Time-series data is usually only useful for a bounded window — keep raw samples for 15 days, then downsample or discard. In a relational table, deleting millions of expired rows means scanning and deleting them (or running batched deletes), which is slow, generates a burst of transaction-log writes, and leaves behind bloat that needs periodic cleanup (Postgres's <code>VACUUM</code>, for instance).</p>
+
+<h3>The fix: time-bucketed compression</h3>
+<p>Purpose-built TSDBs solve both problems the same way: group samples into fixed time windows — blocks or chunks covering, say, a couple of hours — and compress each block as a self-contained unit, then treat that whole block as the unit of both storage and deletion. Because consecutive timestamps in one series differ by almost exactly the scrape interval, and consecutive values often barely change, delta-based encoding shrinks this data far more than compressing arbitrary, unrelated general-purpose rows ever could. And dropping data past its retention period becomes "delete this one immutable block," not "delete a few million rows one at a time."</p>
+<p>Facebook's Gorilla paper — describing an in-memory TSDB built for Facebook's own monitoring — is the well-known reference point here: it combines delta-of-delta encoding for timestamps (storing how much the gap between timestamps changed, which is usually zero) with XOR-based encoding for float values (storing the bitwise difference from the previous value, which is mostly zero bits when a metric barely moves). The paper reported compressing each data point down to roughly 1.37 bytes on average, versus 16 bytes stored naively — call it a 10x reduction, purely from exploiting how slowly-changing and evenly-spaced time-series data actually is.</p>
+
+<div class="callout tradeoff"><p>Compression and precision trade against each other over time, not just at write time. Keeping every raw 15-second sample forever gets expensive fast, so most TSDB setups keep raw resolution for a short window and downsample older data into coarser rollups (5-minute averages, then hourly). That's a real, deliberate loss of precision on old data in exchange for retention you can actually afford — worth stating explicitly if an interviewer asks about long-term storage cost.</p></div>
+
+<h2><span class="idx">04</span>Prometheus And InfluxDB In Practice</h2>
+<p><strong>Prometheus</strong> is pull-based: the Prometheus server scrapes each monitored target's <code>/metrics</code> HTTP endpoint on an interval — commonly around every 15 seconds — rather than waiting for targets to push data to it. Each result becomes a sample tagged with a metric name and a set of labels, like <code>http_requests_total{method="GET",status="200"}</code>. Prometheus stores this locally in its own TSDB: recent samples sit in an in-memory, still-mutable <strong>head block</strong>; roughly every two hours that block is compacted into an immutable block on disk, and older blocks are later merged together further. Queries use PromQL, Prometheus's own query language. Worth calling out directly, since it ties straight back to section 01: those on-disk blocks also carry an actual inverted index — mapping each label name-value pair to the set of series that have it — so a query like "every series where <code>job="api"</code>" doesn't have to scan every series, the same postings-list idea from Elasticsearch, applied to labels instead of words. Because a single Prometheus server isn't meant to hold years of history or answer queries across a whole fleet of Prometheus servers, it's commonly paired with a long-term storage layer over <code>remote_write</code> — Thanos, Cortex, or Mimir are the well-known options.</p>
+<p><strong>InfluxDB</strong> takes the opposite approach: it's push-based. Clients write data points to it directly, using its own line protocol, rather than being scraped. Its storage engine, called <strong>TSM</strong> (Time-Structured Merge tree), is conceptually an LSM-tree (Ch.9) adapted for time-ordered writes, organizing data into shard groups that each cover a time range. Queries use InfluxDB's own query languages (InfluxQL, and Flux in later versions).</p>
+
+<div class="diagram" data-diagram='{
+  "title": "Prometheus: pull-based scraping into time-bucketed blocks",
+  "nodes": [
+    {"id":"targets","x":30,"y":250,"w":160,"h":60,"kind":"external","label":"Scrape Targets","sub":"app /metrics endpoints"},
+    {"id":"prom","x":260,"y":250,"w":180,"h":60,"kind":"compute","label":"Prometheus Server","sub":"pulls every ~15s"},
+    {"id":"head","x":520,"y":150,"w":190,"h":60,"kind":"storage","label":"In-Memory Head Block","sub":"current window, mutable"},
+    {"id":"blockA","x":520,"y":260,"w":190,"h":55,"kind":"storage","label":"Immutable Block (~2h)","sub":"Gorilla-style compressed chunks"},
+    {"id":"blockB","x":520,"y":340,"w":190,"h":55,"kind":"storage","label":"Older Compacted Block"},
+    {"id":"remote","x":790,"y":250,"w":190,"h":60,"kind":"storage","label":"Long-Term Store","sub":"Thanos / Cortex / Mimir"},
+    {"id":"grafana","x":790,"y":100,"w":190,"h":55,"kind":"external","label":"Grafana","sub":"PromQL queries"}
+  ],
+  "edges": [
+    {"from":"targets","to":"prom","label":"scrape (pull)"},
+    {"from":"prom","to":"head","label":"append samples"},
+    {"from":"head","to":"blockA","label":"compact after ~2h"},
+    {"from":"blockA","to":"blockB","label":"merge/compact"},
+    {"from":"prom","to":"remote","label":"remote_write"},
+    {"from":"remote","to":"grafana","label":"long-range query"},
+    {"from":"prom","to":"grafana","label":"recent query"}
+  ]
+}'></div>
+
+<div class="table-scroll">
+  <table class="spec-table compare">
+    <caption>Prometheus vs InfluxDB</caption>
+    <thead><tr><th>Concept</th><th>Prometheus</th><th>InfluxDB</th></tr></thead>
+    <tbody>
+      <tr><td>Write model</td><td>Pull — scrapes targets on an interval</td><td>Push — clients write points directly</td></tr>
+      <tr><td>Storage engine</td><td>Own TSDB: head block + immutable time blocks</td><td>TSM (Time-Structured Merge tree), an LSM-tree variant</td></tr>
+      <tr><td>Query language</td><td>PromQL</td><td>InfluxQL / Flux</td></tr>
+      <tr><td>Long-term retention</td><td>Needs a paired long-term store (Thanos/Cortex/Mimir) for years of history</td><td>Handles retention natively via retention policies and shard groups</td></tr>
+      <tr><td>Typical fit</td><td>Infrastructure and service metrics you control and can expose an endpoint on</td><td>Anywhere push fits better — IoT devices, sensors, or clients you don't want to expose for scraping</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<div class="callout say-this"><p>"For internal service metrics, I'd default to Prometheus — pull-based scraping means the monitoring system doesn't depend on every service correctly pushing data, and it plugs straight into Kubernetes service discovery. I'd reach for a push-based store like InfluxDB when the data source can't be scraped at all — a fleet of IoT sensors, for instance, where the device has to initiate the write."</p></div>
+
+<h2><span class="idx">05</span>NewSQL: Wanting Scale, Consistency, And ACID Together</h2>
+<p>For a long time, this was a forced choice. A traditional relational database — MySQL, Postgres — gives you real SQL, strong consistency, and multi-row ACID transactions (Ch.7), but scales up more naturally than out: to shard it, you put a routing layer like Vitess in front of a fleet of single-leader instances (Ch.6), and a transaction spanning two shards stops being a simple thing your database gives you for free. A NoSQL store — Cassandra, DynamoDB, MongoDB (Ch.8, Ch.9) — scales out natively and was built for horizontal write throughput from day one, but the classic trade was giving up cross-row, cross-partition ACID transactions and often accepting eventual rather than strong consistency.</p>
+<p><strong>NewSQL</strong> is the attempt to stop choosing: get the horizontal scalability and fault tolerance of a NoSQL system, and the full ACID multi-row transactions and standard SQL surface of a traditional RDBMS, at the same time. It does this by building sharding, consensus-based replication, and distributed transactions into the engine's core design, instead of bolting them on top of a database that was never built for them.</p>
+<p>Two building blocks make this possible, both covered in depth later in this book. First, each shard replicates using a consensus protocol — Raft or Paxos (Ch.12) — instead of plain async leader-follower replication. A write that's "committed" has already been durably copied to a majority of replicas before the client hears back, so there's no single point of failure and no ambiguity about what actually happened. Second, a transaction that touches more than one shard runs a distributed transaction protocol — typically some form of two-phase commit (Ch.13) — coordinated with a way of establishing a global, meaningful ordering across shards, whether that's a synchronized clock or a central timestamp service.</p>
+
+<h2><span class="idx">06</span>Spanner, CockroachDB, TiDB, And Vitess: Four Ways To Get There</h2>
+<p><strong>Spanner</strong> is Google's globally distributed database. Its defining piece is <strong>TrueTime</strong>: an API backed by GPS receivers and atomic clocks in Google's data centers that exposes an interval bounding real-world clock uncertainty — typically just a few milliseconds. Before confirming a commit, Spanner waits out that uncertainty window, guaranteeing that transaction commit order matches real-world time order everywhere in the world, a guarantee called <strong>external consistency</strong>. Data is split into key-range "splits," each replicated via a Paxos group; a transaction touching more than one split runs two-phase commit across the group leaders involved. Spanner is only available as a fully managed Google Cloud product.</p>
+<p><strong>CockroachDB</strong> is explicitly modeled on the ideas in Google's Spanner paper, but built to run anywhere — not just inside data centers with atomic clock hardware. Instead of TrueTime, it uses <strong>hybrid logical clocks</strong> (a clock that blends real wall-clock time with a logical counter) plus an uncertainty interval, and instead of a hardware-guaranteed wait, it handles the rare ambiguous-ordering case by retrying (restarting) the transaction. Its unit of sharding is called a <strong>range</strong> — a contiguous slice of a table's key space, replicated (by default, three ways) via Raft — and it's wire-compatible with the Postgres protocol.</p>
+<p><strong>TiDB</strong>, from PingCAP, splits the job across three components: <strong>TiDB</strong> nodes are a stateless SQL layer that parses, plans, and pushes computation down to storage; <strong>TiKV</strong> is the distributed, transactional key-value storage layer, splitting data into Raft-replicated "regions"; and <strong>PD</strong> (Placement Driver) tracks cluster metadata and — critically — acts as a centralized timestamp oracle, handing out globally ordered timestamps as a simpler stand-in for Spanner's TrueTime. TiDB's distributed transaction model is based on Google's Percolator design (originally built to add cross-row transactions on top of Bigtable). TiDB is wire-compatible with MySQL.</p>
+<p><strong>Vitess</strong> is the odd one out. It began purely as a sharding and connection-pooling proxy in front of stock MySQL, exactly as covered in Ch.6 — each shard is just ordinary single-leader MySQL, which already gives you full ACID for any transaction that stays inside one shard for free. What earns it a place in this NewSQL conversation is that Vitess added an optional <strong>two-phase-commit mode</strong>: with it enabled, a single logical transaction that writes to rows on two different shards either commits everywhere or rolls back everywhere, closing a gap that used to be the application's problem to solve. It's not a from-scratch distributed storage engine like the other three — it's a mature proxy layer that grew distributed ACID on top of an unmodified single-node database.</p>
+
+<div class="diagram" data-diagram='{
+  "title": "A cross-shard write in a NewSQL system (CockroachDB/TiDB shape)",
+  "nodes": [
+    {"id":"client","x":30,"y":250,"w":150,"h":60,"kind":"external","label":"Application"},
+    {"id":"sql","x":250,"y":250,"w":190,"h":60,"kind":"compute","label":"Stateless SQL Layer","sub":"plans query across ranges"},
+    {"id":"pd","x":250,"y":440,"w":190,"h":55,"kind":"compute","label":"Placement Driver","sub":"metadata + commit timestamps"},
+    {"id":"aLeader","x":560,"y":100,"w":180,"h":55,"kind":"storage","label":"Range A: Raft Leader"},
+    {"id":"aF1","x":800,"y":60,"w":160,"h":50,"kind":"storage","label":"Range A: Follower"},
+    {"id":"aF2","x":800,"y":140,"w":160,"h":50,"kind":"storage","label":"Range A: Follower"},
+    {"id":"bLeader","x":560,"y":340,"w":180,"h":55,"kind":"storage","label":"Range B: Raft Leader"},
+    {"id":"bF1","x":800,"y":300,"w":160,"h":50,"kind":"storage","label":"Range B: Follower"},
+    {"id":"bF2","x":800,"y":380,"w":160,"h":50,"kind":"storage","label":"Range B: Follower"}
+  ],
+  "edges": [
+    {"from":"client","to":"sql","label":"update touches 2 ranges"},
+    {"from":"sql","to":"pd","label":"get commit timestamp"},
+    {"from":"sql","to":"aLeader","label":"2PC prepare"},
+    {"from":"sql","to":"bLeader","label":"2PC prepare"},
+    {"from":"aLeader","to":"aF1","label":"raft replicate"},
+    {"from":"aLeader","to":"aF2","label":"raft replicate"},
+    {"from":"bLeader","to":"bF1","label":"raft replicate"},
+    {"from":"bLeader","to":"bF2","label":"raft replicate"}
+  ],
+  "groups": [
+    {"x":540,"y":40,"w":440,"h":170,"label":"Range A (3-way Raft group)"},
+    {"x":540,"y":280,"w":440,"h":170,"label":"Range B (3-way Raft group)"}
+  ]
+}'></div>
+
+<div class="table-scroll">
+  <table class="spec-table compare">
+    <caption>Four NewSQL systems side by side</caption>
+    <thead><tr><th>System</th><th>Heritage</th><th>Consistency mechanism</th><th>Replication</th><th>SQL surface</th></tr></thead>
+    <tbody>
+      <tr><td>Spanner</td><td>Purpose-built by Google, ground up</td><td>TrueTime (GPS + atomic clocks) — external consistency</td><td>Paxos per split</td><td>Google's own SQL dialect (GoogleSQL)</td></tr>
+      <tr><td>CockroachDB</td><td>Open-source, Spanner-inspired</td><td>Hybrid logical clocks + uncertainty retries</td><td>Raft per range</td><td>Postgres wire-compatible</td></tr>
+      <tr><td>TiDB</td><td>PingCAP, open source, Percolator-style transactions</td><td>PD timestamp oracle</td><td>Raft per region (TiKV)</td><td>MySQL wire-compatible</td></tr>
+      <tr><td>Vitess</td><td>Sharding proxy in front of stock MySQL (Ch.6), extended with 2PC</td><td>Two-phase commit across shard leaders</td><td>Plain MySQL replication per shard</td><td>MySQL, via VTGate</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<div class="callout tradeoff"><p>None of this consensus and cross-shard coordination is free. A transaction that only touches one shard's data is roughly as fast as a single-node database commit. A transaction that has to run two-phase commit across ranges — worse, across regions — pays for real network round trips on the critical path: consensus among replicas, then a coordination handshake across every range involved. That can push write latency from low single-digit milliseconds to tens of milliseconds or more. NewSQL buys you strong consistency and horizontal scale; it doesn't buy you single-node commit latency for multi-shard writes.</p></div>
+
+<div class="callout em-angle"><p>Build-vs-buy shows up here too: Spanner is Google-Cloud-only — you cannot self-host it. CockroachDB and TiDB are open source and can be self-hosted or bought as a managed service (CockroachDB Cloud, TiDB Cloud). Reaching for any of these should be driven by a genuine need — a global inventory count, a financial ledger spanning regions — not just "we want it to scale," since the operational cost of running a distributed consensus database is real, and sharded MySQL via Vitess (Ch.6) already covers a lot of scaling needs without this added complexity.</p></div>
+
+<h2><span class="idx">07</span>Closing Part III: Uber's Four Databases, One Lesson</h2>
+<p>Uber's engineering team has written publicly about running several different databases side by side, each chosen for a specific workload rather than forcing everything into one system. It's a well-known real example of <strong>polyglot persistence</strong> — using more than one kind of database in the same architecture on purpose — and it's a clean way to tie together everything Ch.6 through Ch.11 have covered.</p>
+<ul>
+  <li><strong>MySQL for trip and payment records.</strong> A trip's status changes and a fare charge need real multi-row ACID guarantees and relational structure — you cannot afford to double-charge a rider or half-write a completed trip. That's precisely what a general-purpose relational database is built for (Ch.7), and Uber runs this system-of-record layer on a sharded MySQL fleet (Uber has written publicly, in its "Schemaless" work, about building a datastore layer on top of sharded MySQL for exactly this kind of transactional core data, after finding Postgres didn't hold up the way they needed at their write scale).</li>
+  <li><strong>Redis for live driver location.</strong> Finding which drivers are near a rider is an in-memory, low-latency lookup problem — Redis's in-memory model and geo-oriented data structures (Ch.8) are built for exactly this shape of query. The data is also disposable: a driver's location from 30 seconds ago is worthless, so trading durability for raw speed, which Ch.8's in-memory-store trade-offs cover, is the correct call here in a way it never would be for trip records.</li>
+  <li><strong>Cassandra for time-series telemetry.</strong> Trip event streams, GPS pings, and fleet telemetry are a nonstop, high-volume, append-only write stream that's almost never updated after the fact — exactly the write pattern section 03 of this chapter describes. Cassandra's leaderless replication (Ch.6) and LSM-tree write path (Ch.9) scale that kind of write volume horizontally without a single-leader bottleneck, which is why it's a workhorse for this kind of data at large companies even without being a purpose-built TSDB like Prometheus or InfluxDB.</li>
+  <li><strong>Elasticsearch for search.</strong> Searching trip history, support content, or restaurant and menu text needs relevance ranking over unstructured text — the exact inverted-index problem this chapter opened with. A B-tree index inside MySQL was never built to rank "how well" a row matches free text, so that content gets indexed into Elasticsearch as a search-optimized copy, fed from the systems of record.</li>
+</ul>
+
+<div class="diagram" data-diagram='{
+  "title": "Uber: one API, four purpose-built databases",
+  "nodes": [
+    {"id":"rider","x":30,"y":250,"w":150,"h":55,"kind":"external","label":"Rider / Driver Apps"},
+    {"id":"gateway","x":250,"y":250,"w":180,"h":55,"kind":"compute","label":"API Gateway"},
+    {"id":"trip","x":520,"y":60,"w":180,"h":55,"kind":"compute","label":"Trip & Payment Service"},
+    {"id":"loc","x":520,"y":190,"w":180,"h":55,"kind":"compute","label":"Driver Location Service"},
+    {"id":"telemetry","x":520,"y":320,"w":180,"h":55,"kind":"compute","label":"Telemetry Pipeline"},
+    {"id":"search","x":520,"y":450,"w":180,"h":55,"kind":"compute","label":"Search Service","sub":"trips, support, Eats"},
+    {"id":"mysql","x":800,"y":60,"w":170,"h":55,"kind":"storage","label":"MySQL","sub":"sharded, system of record"},
+    {"id":"redis","x":800,"y":190,"w":170,"h":55,"kind":"storage","label":"Redis","sub":"in-memory GEO lookups"},
+    {"id":"cassandra","x":800,"y":320,"w":170,"h":55,"kind":"storage","label":"Cassandra","sub":"append-only telemetry"},
+    {"id":"es","x":800,"y":450,"w":170,"h":55,"kind":"storage","label":"Elasticsearch","sub":"relevance-ranked search"}
+  ],
+  "edges": [
+    {"from":"rider","to":"gateway","label":"request"},
+    {"from":"gateway","to":"trip"},
+    {"from":"gateway","to":"loc"},
+    {"from":"gateway","to":"telemetry"},
+    {"from":"gateway","to":"search"},
+    {"from":"trip","to":"mysql","label":"ACID trip/fare writes"},
+    {"from":"loc","to":"redis","label":"sub-ms geo radius query"},
+    {"from":"telemetry","to":"cassandra","label":"high-volume timestamped writes"},
+    {"from":"search","to":"es","label":"relevance-ranked text query"}
+  ]
+}'></div>
+
+<div class="callout say-this"><p>"I wouldn't put all of this in one database, even a powerful one. Trip and payment data needs ACID and structure, so it goes in MySQL. Live location is ephemeral and needs microsecond in-memory lookups, so it goes in Redis. Telemetry is pure high-volume append traffic, so it goes in Cassandra. And search needs relevance ranking over free text, which only an inverted index gives you, so it goes in Elasticsearch. Each store is matched to the actual shape of its workload, not chosen out of habit."</p></div>
+
+<div class="callout em-angle"><p>Polyglot persistence is a legitimate architecture, but it isn't free: four different datastores means four different backup strategies, four different sets of on-call expertise, four monitoring setups. An EM-level answer weighs that operational cost honestly — the right number of datastores is the smallest number that fits the actual workloads, not the largest number that fits in theory. Adding a fifth store for a "nice to have" use case is a much harder sell than adding the first four for genuinely different access patterns.</p></div>
+
+<p>That's the throughline for all of Part III. Ch.6 covered how to split and copy data. Ch.7 through Ch.9 covered relational, document, key-value, wide-column, and graph stores, each shaped around a different access pattern. Ch.10 covered analytical stores built for scanning, not point lookups. This chapter closed the set with search, time-series, and NewSQL — three more shapes that don't fit anywhere else. The interview skill underneath all of it is the same: name the actual read and write pattern first, then pick the store built for that pattern, instead of reaching for whatever database you already know best.</p>
+
+<div class="specsheet">
+  <details>
+    <summary><span class="cat">Index</span> B-tree vs inverted index, one line each</summary>
+    <div class="specbody">
+      <ul>
+        <li><strong>B-tree</strong> — value to row location; built for equality/range lookups and sorted order.</li>
+        <li><strong>Inverted index</strong> — term to list of documents (postings list); built for multi-term matching and relevance ranking.</li>
+      </ul>
+    </div>
+  </details>
+  <details>
+    <summary><span class="cat">Elasticsearch</span> The pieces of a cluster</summary>
+    <div class="specbody">
+      <ul>
+        <li><strong>Index</strong> — a logical collection of documents (a different concept from a database index, despite the shared name).</li>
+        <li><strong>Shard</strong> — a horizontal slice of an index; each shard is itself a full Lucene index.</li>
+        <li><strong>Segment</strong> — an immutable chunk of a shard's Lucene index; periodically merged in the background.</li>
+        <li><strong>Coordinating node</strong> — the node a client talks to; scatters the query out and merges the results.</li>
+      </ul>
+    </div>
+  </details>
+  <details>
+    <summary><span class="cat">Compression</span> Time-series encoding tricks</summary>
+    <div class="specbody">
+      <ul>
+        <li><strong>Delta-of-delta encoding</strong> — store how much the gap between timestamps changed, not the timestamp itself.</li>
+        <li><strong>XOR encoding</strong> — store the bitwise XOR between consecutive float values; mostly zeros when a value barely changes.</li>
+        <li><strong>Time-bucketed blocks</strong> — group one time window's samples together so the block compresses, and expires, as one unit.</li>
+      </ul>
+    </div>
+  </details>
+  <details>
+    <summary><span class="cat">NewSQL</span> Four systems, one line each</summary>
+    <div class="specbody">
+      <ul>
+        <li><strong>Spanner</strong> — Google's globally distributed SQL database; TrueTime gives it external consistency worldwide.</li>
+        <li><strong>CockroachDB</strong> — open-source, Spanner-inspired, Postgres wire-compatible; hybrid logical clocks instead of atomic clocks.</li>
+        <li><strong>TiDB</strong> — MySQL wire-compatible; a stateless SQL layer, a Raft-replicated TiKV storage layer, and a PD metadata/timestamp service.</li>
+        <li><strong>Vitess</strong> — started as a MySQL sharding proxy (Ch.6); added an optional two-phase-commit mode for cross-shard transactions.</li>
+      </ul>
+    </div>
+  </details>
+</div>
+
+<div class="flashcards" data-cards='[
+  {"q":"What is the core structural difference between a B-tree index and an inverted index?","a":"A B-tree maps one value to one row location — built for exact and range lookups on a column. An inverted index maps one term to the list of every document containing it (a postings list), plus enough data to rank matches — content lookup with ranking, not location lookup."},
+  {"q":"Why can&#39;t a B-tree index support relevance-ranked full-text search?","a":"A B-tree only tells you whether a whole value (or prefix) matches — match or no match. It never tokenizes a text field into independently searchable words, and it has no notion of how well a row matches a query, which ranking requires."},
+  {"q":"What scoring function does Lucene (and Elasticsearch) use by default to rank matches?","a":"BM25, a probabilistic ranking function that succeeded classic TF-IDF. It rewards terms that appear often in a document but rarely across the whole index, and normalizes for document length."},
+  {"q":"Why are Lucene&#39;s index segments immutable?","a":"Updating a huge sorted postings list in place is expensive. New documents go into small new segments, deletes are marked as tombstones, and a background merge process periodically combines segments and drops tombstoned documents — the same immutable-then-merge idea as Cassandra&#39;s SSTable compaction (Ch.9)."},
+  {"q":"Why is Elasticsearch called near-real-time instead of real-time?","a":"A newly indexed document is not searchable until the next segment refresh, which defaults to about once per second — not the instant it is written."},
+  {"q":"Why do most Elasticsearch searches hit every shard, instead of routing to one shard the way a well-chosen database shard key would?","a":"You don&#39;t know in advance which shard holds documents containing a given search term. The coordinating node has to scatter the query to every shard, then merge and re-rank the results."},
+  {"q":"Why is Elasticsearch usually not the system of record for its own data?","a":"It has no multi-document ACID transactions across shards the way a relational database does (Ch.7). Real systems keep MySQL/Postgres/Mongo as the source of truth and feed a searchable copy into Elasticsearch through a change pipeline."},
+  {"q":"Why does a nonstop timestamped-metric write pattern break a regular B-tree index over time?","a":"Every new sample has a higher timestamp than anything before it, so every insert lands at the same edge of the index, forcing constant page splits in one spot — the same monotonic-key hot-spot problem covered for MongoDB shard keys in Ch.6, just at the index-page level."},
+  {"q":"What is time-bucketed compression, and why does it work so well for time-series data?","a":"Grouping samples into fixed time windows (Prometheus&#39;s roughly 2-hour blocks, InfluxDB&#39;s shard groups) and compressing each block as a unit. Consecutive timestamps and slowly-changing values compress far better as deltas than as unrelated general-purpose rows, and expiring a whole block is one cheap operation instead of deleting millions of rows."},
+  {"q":"What compression technique does Prometheus use, and roughly how much does it save?","a":"Delta-of-delta encoding for timestamps and XOR-based encoding for float values, the approach described in Facebook&#39;s Gorilla paper. That paper reported compressing each data point to roughly 1.37 bytes on average versus 16 bytes uncompressed — about a 10x reduction."},
+  {"q":"Prometheus vs InfluxDB — pull or push?","a":"Prometheus pulls: it scrapes each target&#39;s HTTP metrics endpoint on an interval. InfluxDB is push-based: clients write data points to it directly."},
+  {"q":"What problem is NewSQL trying to solve?","a":"Wanting all three at once — horizontal scalability, strong consistency, and multi-row ACID transactions — instead of the old choice between a traditional RDBMS (consistent and transactional, hard to scale out) or NoSQL (scales out natively, but gives up multi-row transactions and often consistency)."},
+  {"q":"What does Spanner&#39;s TrueTime give it?","a":"An interval bounding real-time clock uncertainty, built from GPS and atomic clock references in Google&#39;s data centers. Spanner waits out that uncertainty before confirming a commit, so transaction order matches real-world time order globally — external consistency."},
+  {"q":"How does CockroachDB approximate Spanner&#39;s guarantees without atomic clocks?","a":"It uses hybrid logical clocks plus an uncertainty interval, and instead of a hardware-guaranteed wait, it retries a transaction if it lands in an ambiguous ordering window."},
+  {"q":"What are TiDB&#39;s three layers?","a":"TiDB — a stateless SQL layer that parses and plans queries; TiKV — the distributed, Raft-replicated key-value storage layer; and PD, the Placement Driver, which tracks cluster metadata and hands out globally ordered commit timestamps."},
+  {"q":"Why is Vitess the odd one out among the NewSQL systems in this chapter?","a":"It started as a sharding and routing proxy in front of stock MySQL (Ch.6), not a from-scratch distributed storage engine. It only became NewSQL-like once it added an optional two-phase-commit mode letting one transaction span multiple shards atomically."},
+  {"q":"In Uber&#39;s polyglot persistence, why MySQL for trip and payment records?","a":"Trip status changes and fare charges need real multi-row ACID guarantees and relational structure — exactly what a general-purpose relational database (Ch.7) is built for."},
+  {"q":"Why Redis for live driver location, and Cassandra for telemetry, at Uber?","a":"Driver location is an in-memory, low-latency geo-lookup problem on disposable data — a stale location has no value, so trading durability for speed is correct (Ch.8). Telemetry is a nonstop, high-volume, append-only write stream, exactly the pattern Cassandra&#39;s leaderless replication and LSM-tree write path (Ch.9) are built to absorb."}
+]'></div>

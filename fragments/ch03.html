@@ -1,0 +1,265 @@
+<p class="lede">Before two systems can talk, a name has to become an address, and a request has to travel over a protocol both sides agree on. This chapter covers the plumbing under almost every system you will design in this book: DNS, HTTP/HTTPS, the six ways services talk to each other, and the boxes that sit in front of your servers to route, protect, and speed up traffic.</p>
+
+<h2><span class="idx">01</span>How A Name Becomes An Address (DNS)</h2>
+
+<p>Every computer on the internet is reached by an <strong>IP address</strong> — a number like <code>203.0.113.1</code> that tells routers where to send packets. Humans are bad at remembering numbers, so we use names instead, like <code>example.com</code>. <strong>DNS (Domain Name System)</strong> is the system that translates a name into an IP address. Nothing else about the internet works until this translation step happens first.</p>
+
+<p>DNS is organized as a tree, not one giant lookup table. At the top sits a small set of <strong>root servers</strong>. They do not know the IP address for <code>example.com</code>, but they know which server to ask about anything ending in <code>.com</code>. That next server is a <strong>TLD (top-level domain) server</strong>, one per suffix like <code>.com</code>, <code>.org</code>, or <code>.in</code>. It does not know <code>example.com</code>'s IP address either, but it knows which server owns that domain: the <strong>authoritative name server</strong>. That server holds the actual DNS records for <code>example.com</code> and gives out the real answer.</p>
+
+<p>You do not talk to all three of those servers yourself every time you load a page. A <strong>recursive resolver</strong> — usually run by your ISP, or a public one like Google's <code>8.8.8.8</code> or Cloudflare's <code>1.1.1.1</code> — does that chain of lookups on your behalf and hands you back one answer. It also <strong>caches</strong> the answer for a while, so the next request for the same name does not repeat the whole chain.</p>
+
+<div class="diagram" data-diagram='{
+  "title": "DNS resolution: from a name to an IP address",
+  "nodes": [
+    {"id":"client","x":30,"y":250,"w":150,"h":60,"kind":"external","label":"Browser"},
+    {"id":"resolver","x":260,"y":250,"w":180,"h":60,"kind":"external","label":"Recursive Resolver","sub":"e.g. 8.8.8.8 or your ISP"},
+    {"id":"root","x":520,"y":40,"w":170,"h":60,"kind":"external","label":"Root Server","sub":"knows the TLD servers"},
+    {"id":"tld","x":520,"y":250,"w":170,"h":60,"kind":"external","label":".com TLD Server","sub":"knows the authoritative NS"},
+    {"id":"auth","x":520,"y":460,"w":200,"h":60,"kind":"external","label":"Authoritative Name Server","sub":"holds example.com records"}
+  ],
+  "edges": [
+    {"from":"client","to":"resolver","label":"1. resolve example.com"},
+    {"from":"resolver","to":"root","label":"2. who handles .com?"},
+    {"from":"root","to":"resolver","label":"3. ask the TLD server"},
+    {"from":"resolver","to":"tld","label":"4. who handles example.com?"},
+    {"from":"tld","to":"resolver","label":"5. ask the authoritative NS"},
+    {"from":"resolver","to":"auth","label":"6. what is the IP?"},
+    {"from":"auth","to":"resolver","label":"7. 203.0.113.1"},
+    {"from":"resolver","to":"client","label":"8. IP, cached for TTL seconds"}
+  ],
+  "groups": [
+    {"x":500,"y":15,"w":260,"h":535,"label":"Global DNS hierarchy, queried in order"}
+  ]
+}'></div>
+
+<p>Each DNS record has a <strong>TTL (time to live)</strong> — a number of seconds the resolver is allowed to cache it before asking again. Typical values run from 60 seconds to a full day (86,400 seconds).</p>
+
+<div class="callout tradeoff"><p>TTL is a trade-off, not a free setting. A long TTL (say, a day) means fewer lookups hit your name servers, which is cheap and fast for everyone downstream. A short TTL (say, 60 seconds) means a DNS change — like pointing a domain at a new server during a failover — reaches the whole internet fast. You cannot have both: pick a short TTL on records you expect to change during an incident, and a long TTL on ones that almost never change.</p></div>
+
+<p>DNS records come in a few common types. You do not need to memorize the full list, but you should recognize these on sight.</p>
+
+<div class="specsheet">
+  <details>
+    <summary><span class="cat">DNS</span> Common DNS record types</summary>
+    <div class="specbody">
+      <ul>
+        <li><strong>A</strong> — maps a name to an IPv4 address.</li>
+        <li><strong>AAAA</strong> — maps a name to an IPv6 address.</li>
+        <li><strong>CNAME</strong> — an alias: points one name at another name, not directly at an IP. A name with a CNAME cannot have any other record type at the same time.</li>
+        <li><strong>NS</strong> — delegates a subdomain to a set of name servers (this is how the tree hands off from TLD to authoritative server).</li>
+        <li><strong>MX</strong> — points a domain at the mail servers that should receive its email.</li>
+        <li><strong>TXT</strong> — arbitrary text; commonly used to prove domain ownership or configure email anti-spam rules (SPF, DKIM).</li>
+      </ul>
+    </div>
+  </details>
+</div>
+
+<p>DNS queries mostly travel over UDP on port 53, because a query-and-answer is small and does not need a reliable connection. DNS falls back to TCP when the answer is too large for one UDP packet, or for administrative operations like transferring an entire zone between name servers.</p>
+
+<h2><span class="idx">02</span>HTTP And HTTPS, From First Principles</h2>
+
+<p>Once you have an IP address, you need a shared language to ask for something and get an answer back. <strong>HTTP (HyperText Transfer Protocol)</strong> is that language for the web. It is a <strong>request/response</strong> protocol: a client sends a request, a server sends back exactly one response, and the underlying connection can then be reused for the next request. HTTP is also <strong>stateless</strong> by default — the server does not remember your previous request unless something extra, like a cookie or a token, carries that state along.</p>
+
+<h3>Methods, status codes, headers</h3>
+<p>A request has a <strong>method</strong> that states its intent: <code>GET</code> to read something, <code>POST</code> to create something, <code>PUT</code>/<code>PATCH</code> to replace or partially update something, <code>DELETE</code> to remove it. A response carries a <strong>status code</strong> that states the outcome: <code>2xx</code> means success, <code>3xx</code> means "go look somewhere else" (a redirect), <code>4xx</code> means the client did something wrong (like asking for a resource that does not exist, <code>404</code>), and <code>5xx</code> means the server failed while handling a request that was itself fine. Both requests and responses carry <strong>headers</strong> — key/value metadata like <code>Content-Type</code> (what format the body is in) or <code>Authorization</code> (who is asking).</p>
+
+<div class="specsheet">
+  <details>
+    <summary><span class="cat">Status</span> HTTP status code families</summary>
+    <div class="specbody">
+      <ul>
+        <li><strong>1xx — Informational</strong> — request received, still processing (rarely seen directly).</li>
+        <li><strong>2xx — Success</strong> — <code>200 OK</code>, <code>201 Created</code>, <code>204 No Content</code>.</li>
+        <li><strong>3xx — Redirection</strong> — <code>301 Moved Permanently</code>, <code>304 Not Modified</code> (tells a client its cached copy is still good).</li>
+        <li><strong>4xx — Client error</strong> — <code>400 Bad Request</code>, <code>401 Unauthorized</code> (who are you?), <code>403 Forbidden</code> (I know who you are, you are not allowed), <code>404 Not Found</code>, <code>429 Too Many Requests</code>.</li>
+        <li><strong>5xx — Server error</strong> — <code>500 Internal Server Error</code>, <code>502 Bad Gateway</code>, <code>503 Service Unavailable</code>, <code>504 Gateway Timeout</code>.</li>
+      </ul>
+    </div>
+  </details>
+</div>
+
+<h3>HTTPS and TLS</h3>
+<p><strong>HTTPS</strong> is HTTP sent over <strong>TLS (Transport Layer Security)</strong> instead of a plain, unencrypted connection. Plain HTTP has three problems: anyone on the network path can read the traffic, anyone can alter it in transit, and you have no proof you are actually talking to the server you think you are. TLS fixes all three at once: it gives you <strong>confidentiality</strong> (traffic is encrypted), <strong>integrity</strong> (any tampering is detectable), and <strong>authentication</strong> (the server proves its identity with a certificate).</p>
+
+<p>A <strong>certificate</strong> is a signed statement, issued by a trusted <strong>Certificate Authority (CA)</strong>, that says "this public key belongs to example.com." Your browser ships with a list of CAs it trusts. When it connects, it checks that the server's certificate is signed by one of them, forming a <strong>chain of trust</strong> back to a root it already trusts.</p>
+
+<p>Setting up an encrypted connection needs a handshake before any real data can flow. In TLS 1.3, the version most services use today, that handshake takes one round trip: the client and server exchange just enough information to agree on a shared secret key, then switch to fast, ordinary encryption for the rest of the conversation. They use slow public-key cryptography only for that first exchange — encrypting the actual traffic with it end to end would be far too slow at any real scale. TLS 1.2 needed two round trips for the same handshake, which is one reason 1.3 feels faster on a slow network.</p>
+
+<div class="callout say-this"><p>"HTTPS is not just for login pages or payment forms. Any endpoint that carries a session cookie, a token, or personal data needs it, because plain HTTP leaks everything in that request to anyone on the same network — a coffee shop Wi-Fi, a compromised router, an ISP."</p></div>
+
+<p>You will also hear about HTTP/1.1, HTTP/2, and HTTP/3 — these are transport-level upgrades, not new languages. HTTP/1.1 opens several parallel TCP connections per browser tab, to work around the fact that one connection can only handle one request at a time. HTTP/2 fixes that at the root: it multiplexes many requests over a single TCP connection, so they no longer queue behind each other on the same pipe. HTTP/3 goes further and replaces TCP itself with QUIC, a transport built on UDP, which removes a remaining source of stalling — one lost packet on a TCP connection blocks every request sharing it, even ones that have nothing to do with the lost packet.</p>
+
+<h2><span class="idx">03</span>Talking Between Services: REST, GraphQL, gRPC, WebSockets, SSE, Long Polling</h2>
+
+<p>Once you have more than one service, or a client that needs live updates, plain request/response HTTP is only one option among several. Each of these six styles solves a different shape of communication problem.</p>
+
+<h3>REST</h3>
+<p><strong>REST (Representational State Transfer)</strong> models your system as <strong>resources</strong> — nouns like <code>/users/42</code> or <code>/orders/9</code> — and uses HTTP methods on those URLs to act on them. It is simple, it reuses HTTP's own caching and status-code semantics, and almost every engineer already understands it. Its weak point shows up with nested or varied data: a mobile screen that needs a user, their last three orders, and each order's shipping status either gets one bloated response with fields it does not need (<strong>over-fetching</strong>) or has to make several round trips (<strong>under-fetching</strong>).</p>
+
+<h3>GraphQL</h3>
+<p><strong>GraphQL</strong> is a query language for APIs. Instead of many fixed endpoints, there is usually one endpoint, and the client sends a query describing exactly the fields it wants, across whatever related resources it needs, in a single request. This directly solves REST's over/under-fetching problem. The cost shows up on the server: a naive resolver can trigger an <strong>N+1 query problem</strong> (one query to fetch a list, then one more query per item to fetch its related data), and because most GraphQL calls are POST requests to one URL, you lose the free caching that HTTP gives REST's GET requests by default.</p>
+
+<h3>gRPC</h3>
+<p><strong>gRPC</strong> is a remote-procedure-call framework built on HTTP/2, using <strong>Protocol Buffers (protobuf)</strong> — a compact binary format defined by a schema file — instead of JSON. Both sides generate strongly typed client and server code from that same schema, so contract mismatches get caught at compile time, not in production. It also supports streaming in both directions, not just one request and one response. This makes it a strong default for calls between services you control, inside your own infrastructure, where low latency and a strict contract matter more than human readability. It is a poor fit for a public, browser-facing API: browsers cannot speak raw gRPC without an extra proxy layer, and a binary payload is harder for an external developer to inspect and debug than JSON.</p>
+
+<h3>WebSockets</h3>
+<p>A <strong>WebSocket</strong> starts as a normal HTTP request that asks to <strong>upgrade</strong> the connection, then keeps one TCP connection open and lets either side send a message at any time, in either direction, with no need to open a new request each time. This is the only one of the six that is genuinely full-duplex — both client and server push whenever they have something to say.</p>
+
+<h3>SSE (Server-Sent Events)</h3>
+<p><strong>SSE</strong> also keeps a connection open, but only in one direction: the server streams events to the client over plain HTTP. The browser's built-in <code>EventSource</code> API even reconnects automatically if the stream drops. It is simpler to run than a WebSocket — no protocol upgrade, works over ordinary HTTP/HTTPS infrastructure — but the client cannot push data back over that same stream; if it needs to send something, that is a separate, ordinary HTTP request.</p>
+
+<h3>Long polling</h3>
+<p><strong>Long polling</strong> gets push-like behavior out of plain request/response HTTP: the client sends a request, the server holds it open without responding until it has new data (or a timeout passes), the client processes the response and immediately fires off another request. It predates both WebSockets and SSE, and it survives today mainly as a fallback where a persistent connection is not possible — some corporate proxies and older infrastructure block the WebSocket upgrade handshake, but they cannot block plain HTTP requests.</p>
+
+<div class="table-scroll">
+  <table class="spec-table compare">
+    <thead><tr><th>Style</th><th>Direction</th><th>Best fit</th><th>Real example</th></tr></thead>
+    <tbody>
+      <tr><td>REST</td><td>Request/response, client-initiated</td><td>Simple, resource-shaped CRUD APIs</td><td>Most public web APIs (e.g. Stripe's API)</td></tr>
+      <tr><td>GraphQL</td><td>Request/response, client-initiated</td><td>Flexible, nested queries across many resource types</td><td>GitHub's API v4</td></tr>
+      <tr><td>gRPC</td><td>Request/response or streaming, either direction</td><td>Internal service-to-service calls needing low latency and a strict contract</td><td>Microservice-to-microservice calls inside one company's infrastructure</td></tr>
+      <tr><td>WebSockets</td><td>Bidirectional, persistent</td><td>Both sides need to push often, with low latency</td><td>Chat apps, multiplayer games, collaborative editors</td></tr>
+      <tr><td>SSE</td><td>Server to client only, persistent</td><td>One-way live feed where the client never pushes</td><td>Live stock ticker, live sports scores, notification stream</td></tr>
+      <tr><td>Long polling</td><td>Repeated request/response, client-initiated</td><td>Near-real-time updates when WebSockets/SSE are not viable</td><td>Fallback transport behind restrictive proxies/firewalls</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<div class="diagram" data-diagram='{
+  "title": "Three ways to get near-real-time updates",
+  "nodes": [
+    {"id":"c1","x":40,"y":80,"w":150,"h":60,"kind":"external","label":"Client"},
+    {"id":"s1","x":40,"y":320,"w":150,"h":60,"kind":"compute","label":"Chat Server"},
+    {"id":"c2","x":390,"y":80,"w":150,"h":60,"kind":"external","label":"Client"},
+    {"id":"s2","x":390,"y":320,"w":150,"h":60,"kind":"compute","label":"Stock Price Service"},
+    {"id":"c3","x":740,"y":80,"w":150,"h":60,"kind":"external","label":"Client"},
+    {"id":"s3","x":740,"y":320,"w":150,"h":60,"kind":"compute","label":"Notification Service"}
+  ],
+  "edges": [
+    {"from":"c1","to":"s1","label":"either side sends anytime"},
+    {"from":"s1","to":"c1","label":"same open connection"},
+    {"from":"c2","to":"s2","label":"1. open the stream"},
+    {"from":"s2","to":"c2","label":"2. server pushes updates"},
+    {"from":"c3","to":"s3","label":"1. request (server holds it open)"},
+    {"from":"s3","to":"c3","label":"2. respond, client re-requests"}
+  ],
+  "groups": [
+    {"x":15,"y":20,"w":330,"h":390,"label":"WebSocket - bidirectional, persistent"},
+    {"x":365,"y":20,"w":330,"h":390,"label":"SSE - server pushes, client never sends"},
+    {"x":715,"y":20,"w":270,"h":390,"label":"Long polling - repeated request/response"}
+  ]
+}'></div>
+
+<div class="callout say-this"><p>"For this chat feature I would use WebSockets, not SSE, because participants both send and receive messages on the same channel — SSE only pushes from server to client, so I would still need a second path for the client to send anything, and at that point I am running two systems to do the job of one."</p></div>
+
+<div class="callout tradeoff"><p>WebSockets are stateful: a client stays pinned to whichever server instance accepted its connection. That breaks the usual stateless-server-behind-a-load-balancer model. You either route with sticky sessions (same client always hits the same instance) or, better at scale, have every instance publish messages to a shared pub/sub layer (like Redis Pub/Sub or Kafka) so any instance can deliver a message to any connected client, no matter which instance holds that client's socket.</p></div>
+
+<div class="callout em-angle"><p>GraphQL is also a build-vs-buy and team-maturity call, not just a technical one. It buys you flexible queries, but it costs you a schema to design and evolve, resolvers to write carefully to avoid N+1 queries, and a caching story you have to build yourself since HTTP-level caching mostly stops working. For a small team building a straightforward CRUD product, plain REST is often the cheaper choice for the first year or two, even if GraphQL would be technically nicer.</p></div>
+
+<h2><span class="idx">04</span>Load Balancers: What L4 And L7 Can (And Cannot) See</h2>
+
+<p>A <strong>load balancer</strong> sits in front of a group of servers and spreads incoming traffic across them, so no single server gets overwhelmed and a server that goes down can be quietly skipped. What differs between load balancer types is which layer of the network stack they operate at, and therefore how much of the request they can actually look at before making a routing decision.</p>
+
+<h3>L4: transport layer</h3>
+<p>An <strong>L4 (Layer 4) load balancer</strong> works at the transport layer — TCP or UDP. It sees the "5-tuple": source IP, source port, destination IP, destination port, and protocol. It does not open the packet's payload, so it has never seen an HTTP method, a URL path, a header, or a cookie. It just decides which backend gets this connection, using something like round robin or least-connections, and then keeps forwarding packets on that connection to the same backend. Because it does no parsing of anything above the transport layer, it is fast and cheap in CPU terms, and it works for any protocol built on TCP/UDP, not just HTTP.</p>
+
+<h3>L7: application layer</h3>
+<p>An <strong>L7 (Layer 7) load balancer</strong> works at the application layer. To do that with encrypted traffic, it has to <strong>terminate TLS</strong> — decrypt the connection itself — before it can read anything inside. Once it has done that, it can see the full HTTP request: method, path, headers, cookies, even the body. That lets it make much smarter decisions: route <code>/api/orders/*</code> to the orders service and <code>/api/users/*</code> to the users service, send a slice of traffic to a canary release based on a header, or keep a user pinned to one backend using a cookie instead of their IP. The cost is more CPU work per request — parsing HTTP and handling encryption — than an L4 load balancer ever does.</p>
+
+<div class="table-scroll">
+  <table class="spec-table compare">
+    <thead><tr><th></th><th>L4 load balancer</th><th>L7 load balancer</th></tr></thead>
+    <tbody>
+      <tr><td>Operates on</td><td>IP + port + protocol (TCP/UDP)</td><td>Full HTTP request, after decrypting TLS</td></tr>
+      <tr><td>Can see path/headers/cookies?</td><td>No</td><td>Yes</td></tr>
+      <tr><td>Routing decisions</td><td>Round robin, least connections, IP hash — by connection only</td><td>By path, hostname, header, cookie, or request content</td></tr>
+      <tr><td>TLS termination</td><td>Usually passes through encrypted</td><td>Terminates TLS to read the request</td></tr>
+      <tr><td>Protocol scope</td><td>Any TCP/UDP protocol</td><td>HTTP/HTTPS (and gRPC, WebSockets as HTTP variants)</td></tr>
+      <tr><td>Overhead per request</td><td>Low</td><td>Higher</td></tr>
+      <tr><td>Example</td><td>AWS Network Load Balancer (NLB)</td><td>AWS Application Load Balancer (ALB), NGINX, HAProxy, Envoy</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<div class="callout tradeoff"><p>Picking L4 over L7 is not just a performance micro-optimization. If you need to route by URL path, by hostname, or by cookie, you need L7 — an L4 load balancer physically cannot make that decision, it never looks that deep into the packet. If all you need is "spread raw TCP connections across healthy backends" for a non-HTTP protocol, L4 is simpler, cheaper, and has nothing extra to configure wrong.</p></div>
+
+<h2><span class="idx">05</span>Reverse Proxy vs API Gateway</h2>
+
+<p>A <strong>reverse proxy</strong> sits between clients and your servers, accepts requests on the servers' behalf, forwards each one to a backend, and returns the backend's response as if the proxy itself had produced it. It hides which servers actually exist behind it, and it commonly also handles TLS termination, load balancing, response caching, and compression — a single well-known entry point instead of clients talking to every backend server directly.</p>
+
+<p>An <strong>API gateway</strong> is a reverse proxy that has grown API-specific responsibilities, usually because there are now several microservices behind it instead of one application. On top of forwarding traffic, it typically owns <strong>authentication</strong> (checking a JWT or API key before a request is even allowed through), <strong>per-client rate limiting</strong>, <strong>protocol translation</strong> (accept REST from the outside world, call gRPC internally), and sometimes <strong>request composition</strong> — combining calls to two or three downstream services into the one response a client asked for.</p>
+
+<div class="table-scroll">
+  <table class="spec-table compare">
+    <thead><tr><th>Concern</th><th>Reverse proxy</th><th>API gateway</th></tr></thead>
+    <tbody>
+      <tr><td>Primary job</td><td>Hide backend topology, forward and return traffic</td><td>Manage access and cross-cutting concerns for a set of APIs</td></tr>
+      <tr><td>TLS termination</td><td>Yes</td><td>Yes</td></tr>
+      <tr><td>Load balancing</td><td>Often</td><td>Often (or delegates to a dedicated LB)</td></tr>
+      <tr><td>AuthN/AuthZ (JWT, API keys)</td><td>Not by default</td><td>Yes, built in</td></tr>
+      <tr><td>Per-client rate limiting</td><td>Not by default</td><td>Yes</td></tr>
+      <tr><td>Protocol translation</td><td>No</td><td>Often (e.g. external REST to internal gRPC)</td></tr>
+      <tr><td>Request composition/aggregation</td><td>No</td><td>Sometimes</td></tr>
+      <tr><td>Typical example</td><td>NGINX or HAProxy in front of a monolith</td><td>Kong, Amazon API Gateway, Envoy at the edge</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<div class="callout em-angle"><p>For a system with more than a handful of microservices, building your own auth-and-rate-limiting layer on top of a plain reverse proxy is usually the wrong call. A managed or open-source API gateway (AWS API Gateway, Kong, Envoy) already solves authentication, quotas, and routing in a way every team can plug into, so the build-vs-buy answer is almost always "buy," unless your gateway needs are genuinely unusual.</p></div>
+
+<div class="callout tradeoff"><p>Every hop adds latency and a new thing that can fail. An API gateway is one more network hop between the client and the service that does the real work, and if it goes down, everything behind it becomes unreachable even if every service is healthy. Most designs accept this because the alternative — every client managing auth and rate limiting against every service directly — is worse, but it is a real trade-off, not a free win.</p></div>
+
+<h2><span class="idx">06</span>CDN In One Page</h2>
+
+<p>A <strong>CDN (Content Delivery Network)</strong> is a network of servers spread across many physical locations, called <strong>edge servers</strong> or <strong>points of presence (PoPs)</strong>, that cache content closer to the people requesting it. The problem it solves is simple physics: a request from Mumbai to a single origin server in Virginia has to cross a large physical distance, and that costs real time that no amount of clever code removes. A CDN moves a copy of the content to a PoP near Mumbai instead.</p>
+
+<p>Roughly, it works like this: DNS or anycast routing sends a user's request to their nearest PoP. If that PoP already has the content cached (a <strong>cache hit</strong>), it answers immediately. If not (a <strong>cache miss</strong>), it fetches the content from the origin server once, serves it, and caches it for next time — this is called the <strong>pull</strong> model. Some setups instead <strong>push</strong> content out to edge servers ahead of time. Standard HTTP caching headers, like <code>Cache-Control</code> and <code>ETag</code>, control how long the edge is allowed to keep serving its cached copy before checking the origin again.</p>
+
+<p>CDNs started with static assets — images, CSS, JavaScript, video — but modern CDNs also accelerate dynamic content and absorb large traffic spikes and some denial-of-service traffic before it ever reaches your origin. Real-world examples: Cloudflare, Akamai, Fastly, and AWS CloudFront; Netflix even runs its own purpose-built CDN, Open Connect, to serve video.</p>
+
+<div class="callout"><p>This chapter covers only what a CDN is and the problem it solves. Cache placement, cache invalidation strategy, and where a CDN fits into a full scale-up story get deeper treatment in Chapter 2, Scale From Zero to Millions of Users.</p></div>
+
+<p>Put every piece from this chapter on one path, and a single request's journey looks like this: a name gets resolved by DNS, a CDN edge answers if it can, an L4 load balancer distributes the raw connection, an L7 load balancer or reverse proxy terminates TLS and reads the HTTP request, and an API gateway checks who is asking before routing it to the one microservice that actually handles it.</p>
+
+<div class="diagram" data-diagram='{
+  "title": "One request end to end: browser to microservice",
+  "nodes": [
+    {"id":"client","x":20,"y":250,"w":140,"h":60,"kind":"external","label":"Browser"},
+    {"id":"cdn","x":210,"y":250,"w":140,"h":60,"kind":"external","label":"CDN Edge","sub":"cached static assets"},
+    {"id":"l4","x":400,"y":80,"w":170,"h":60,"kind":"compute","label":"L4 Load Balancer","sub":"routes by IP:port only"},
+    {"id":"l7","x":400,"y":250,"w":170,"h":60,"kind":"compute","label":"L7 LB / Reverse Proxy","sub":"terminates TLS, routes by path"},
+    {"id":"gateway","x":400,"y":420,"w":170,"h":60,"kind":"compute","label":"API Gateway","sub":"auth, rate limit, routing"},
+    {"id":"orders","x":720,"y":120,"w":160,"h":60,"kind":"compute","label":"Orders Service"},
+    {"id":"payments","x":720,"y":250,"w":160,"h":60,"kind":"compute","label":"Payments Service"},
+    {"id":"users","x":720,"y":380,"w":160,"h":60,"kind":"compute","label":"Users Service"}
+  ],
+  "edges": [
+    {"from":"client","to":"cdn","label":"1. request"},
+    {"from":"cdn","to":"l4","label":"2. miss: forward to origin"},
+    {"from":"l4","to":"l7","label":"3. distribute TCP connection"},
+    {"from":"l7","to":"gateway","label":"4. decrypted HTTP request"},
+    {"from":"gateway","to":"orders","label":"/orders"},
+    {"from":"gateway","to":"payments","label":"/payments"},
+    {"from":"gateway","to":"users","label":"/users"}
+  ],
+  "groups": [
+    {"x":700,"y":90,"w":200,"h":380,"label":"Backend microservices (Ch.15)"}
+  ]
+}'></div>
+
+<div class="flashcards" data-cards='[
+  {"q":"What problem does DNS solve?","a":"It translates a human-readable domain name into the IP address computers actually use to route traffic - nothing else on the internet works until that translation happens."},
+  {"q":"What is a DNS TTL, and what is the trade-off in setting it high vs low?","a":"TTL is the number of seconds a resolver may cache a DNS record. A long TTL means fewer lookups hit your name servers, but a change (like a failover) takes longer to reach everyone. A short TTL is the opposite: faster propagation, more lookup traffic."},
+  {"q":"What restriction applies to a CNAME record?","a":"A name that has a CNAME record cannot have any other record type at the same time - for example, you cannot put a CNAME and an MX record on the same name."},
+  {"q":"What three things does HTTPS add on top of plain HTTP?","a":"Confidentiality (traffic is encrypted), integrity (tampering is detectable), and authentication (a certificate, signed by a trusted CA, proves you are talking to the real server)."},
+  {"q":"Why does TLS use slow public-key cryptography for only part of the handshake?","a":"Public-key (asymmetric) crypto is used briefly to safely agree on a shared secret key. Once both sides have it, they switch to fast symmetric encryption for the actual data - encrypting all traffic with asymmetric crypto would be far too slow at scale."},
+  {"q":"What specific problem does GraphQL solve that plain REST often does not?","a":"Over-fetching and under-fetching: a REST endpoint returns a fixed response shape, so a client needing a nested or partial slice of data gets too much, or has to call several endpoints. GraphQL lets the client ask for exactly the fields it needs in one request."},
+  {"q":"Why is gRPC a strong fit inside your own infrastructure but a poor fit for a public browser-facing API?","a":"It uses HTTP/2 and binary Protocol Buffers for low latency and a strict, code-generated contract, which is ideal between services you control. Browsers cannot speak raw gRPC without an extra proxy, and its binary payloads are harder for external developers to read and debug than JSON."},
+  {"q":"Chat app, live stock ticker, and a flexible query API like GitHub&#39;s - which communication style fits each, and why?","a":"Chat app: WebSockets, because both sides push messages often and need low latency. Stock ticker: SSE, because only the server has updates to push. GitHub-style API: GraphQL, because clients need very different, often nested, slices of the same underlying data."},
+  {"q":"What is the core difference between SSE and long polling?","a":"SSE keeps one HTTP connection open that the server can push events over at any moment. Long polling repeats a full request-hold-response-request cycle for every update, which means more connection setup, more latency per update, and more load on the server."},
+  {"q":"What can an L4 load balancer never see about a request that an L7 load balancer can?","a":"L4 only sees transport-layer info - source/destination IP, port, and protocol. It never opens the payload, so it cannot see the HTTP method, URL path, headers, cookies, or body. An L7 load balancer terminates TLS and reads the actual HTTP request to make those decisions."},
+  {"q":"Why must an L7 load balancer terminate TLS to route by URL path, and what does that cost?","a":"The path lives inside the encrypted payload, so the load balancer has to decrypt the connection before it can read it. The cost is more CPU work per request than an L4 load balancer, which never decrypts anything."},
+  {"q":"In one line, what is the difference between a reverse proxy and an API gateway?","a":"An API gateway is a reverse proxy with API-specific jobs added on top - authentication, per-client rate limiting, protocol translation, and sometimes composing calls to multiple services - not just forwarding and hiding traffic."},
+  {"q":"What problem does a CDN solve, in one sentence?","a":"It cuts latency and origin load by caching content on edge servers physically closer to the user, instead of every request crossing the full distance to one origin server."},
+  {"q":"After a deploy, a user reports the page is still showing old content through a CDN. What is the first thing to check?","a":"The Cache-Control/TTL settings on that content, and whether the deploy triggered a cache purge at the edge - the CDN may simply still be serving a cached copy that has not expired yet."}
+]'></div>

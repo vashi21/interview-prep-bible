@@ -1,0 +1,192 @@
+<p class="lede">A single server can only take so many requests before it falls over. This chapter covers three tools that let a system survive traffic it was never sized for: load balancers that spread requests across many servers, rate limiters that stop any one client from taking down the system, and consistent hashing, the trick that makes both of those tools — and distributed caches and databases — survive servers joining and leaving without chaos.</p>
+
+<h2><span class="idx">01</span>What A Load Balancer Actually Decides</h2>
+<p>A load balancer sits in front of a group of servers that all do the same job. Every time a request arrives, the load balancer has exactly one decision to make: which server gets this request? Chapter 3 already covered where a load balancer sits in the request path and the difference between an L4 (transport-layer, routes by IP and port) and an L7 (application-layer, can read the HTTP request) load balancer. This chapter is about the decision itself, once the load balancer already knows the list of healthy servers.</p>
+<p>Two things make this decision matter. First, spreading requests evenly (or in proportion to capacity) keeps any single server from becoming the bottleneck, the one slow part that limits how fast the whole system can go. Second, if a server dies, a good load balancer notices via health checks and quietly stops sending it traffic, so the system keeps working with one less server instead of failing outright.</p>
+<div class="callout"><p>Most of the algorithms below assume your servers are stateless — any server can handle any request equally well because no server is holding onto private state a request needs. The moment a server keeps something a request depends on, like a local cache or an in-memory session, the load balancer's algorithm choice starts to matter for correctness, not just speed. That is exactly the case consistent-hash-based load balancing exists for, covered later in this section.</p></div>
+
+<h2><span class="idx">02</span>Four Load Balancer Algorithms, And When Each One Wins</h2>
+
+<h3>Round Robin</h3>
+<p>Round robin cycles through the server list in a fixed order: server 1, then server 2, then server 3, then back to server 1, sending each new request to the next server in line.</p>
+<p><strong>When it wins:</strong> your servers are truly identical in capacity, and requests cost about the same amount of work to process, for example serving static files or uniform-sized API calls. It is simple, needs almost no bookkeeping, and is fair by construction.</p>
+<p><strong>When it fails:</strong> it does not know or care how busy each server currently is. If server 2 is stuck processing one slow request, round robin still sends it the next request anyway, because "next in line" is all it tracks.</p>
+
+<h3>Least Connections</h3>
+<p>The load balancer keeps a live count of active connections (requests currently being handled but not yet finished) for every server, and always routes the next request to whichever server has the fewest.</p>
+<p><strong>When it wins:</strong> request processing time varies a lot — a mix of quick reads and slow, heavy writes, or long-lived connections like WebSockets. Least connections naturally avoids piling more work onto a server that is already struggling, which round robin cannot do.</p>
+<p><strong>When it fails:</strong> it needs the load balancer to track live counts for every server, a bit more bookkeeping than round robin. It can also be fooled if connection count does not reflect real load, for example many idle-but-open connections that are not actually using much CPU.</p>
+
+<h3>Weighted (Round Robin or Least Connections)</h3>
+<p>Every server gets a weight number based on its real capacity, and the load balancer sends traffic in that proportion. A weight of 3 for a bigger box and a weight of 1 for a smaller box means the bigger box gets three times the traffic.</p>
+<p><strong>When it wins:</strong> your fleet is not uniform — you added newer, bigger machines alongside older ones during a gradual hardware upgrade, or you deliberately run mixed instance types to save cost.</p>
+<p><strong>When it fails:</strong> weights are usually set once by a human, based on specs like CPU and RAM, and do not automatically adjust if real-world load patterns change. You still need health checks and monitoring to catch a server that is underperforming its assigned weight.</p>
+
+<h3>Consistent-Hash-Based</h3>
+<p>Instead of picking whichever server is next in line or least busy, this algorithm computes a hash (a fixed-size number produced from an input, here a request property like client IP, user ID, or session ID) and uses that hash to always send requests carrying the same key to the same server, for as long as that server stays healthy.</p>
+<p><strong>When it wins:</strong> you need the same client, or the same cache key, to land on the same backend every time. A common example is a backend that keeps a local in-memory cache per user. If every request from that user always lands on the same server, the cache on that server stays warm — full of that user's already-loaded data — instead of missing on every single request.</p>
+<p><strong>When it fails:</strong> when that one server goes down, all of "its" clients have to move somewhere else at once. The exact mechanics of how consistent hashing keeps that disruption small — instead of reshuffling every client — get a full deep dive in section 05 of this chapter.</p>
+<div class="callout say-this"><p>“I would use a consistent-hash-based load balancer here, not round robin, because each backend keeps a local cache per user. Round robin would spread one user's requests across every server and cause constant cache misses.”</p></div>
+<p>Quick pick, in one line each:</p>
+<ul>
+<li>Uniform servers, uniform request cost — round robin.</li>
+<li>Uneven request duration, mixed read/write or long-lived connections — least connections.</li>
+<li>Uneven server capacity across the fleet — weighted.</li>
+<li>Need the same client or key stuck to the same server for cache locality or session affinity — consistent hash.</li>
+</ul>
+
+<div class="diagram" data-diagram='{
+  "title": "Weighted round robin sending more traffic to the bigger server",
+  "nodes": [
+    {"id":"client","x":30,"y":250,"w":150,"h":60,"kind":"external","label":"Client Requests"},
+    {"id":"lb","x":280,"y":250,"w":190,"h":60,"kind":"compute","label":"Load Balancer","sub":"weighted round robin"},
+    {"id":"serverA","x":680,"y":60,"w":180,"h":60,"kind":"compute","label":"Server A","sub":"weight 3, 16 vCPU"},
+    {"id":"serverB","x":680,"y":250,"w":180,"h":60,"kind":"compute","label":"Server B","sub":"weight 1, 4 vCPU"},
+    {"id":"serverC","x":680,"y":440,"w":180,"h":60,"kind":"compute","label":"Server C","sub":"weight 1, 4 vCPU"}
+  ],
+  "edges": [
+    {"from":"client","to":"lb","label":"incoming requests"},
+    {"from":"lb","to":"serverA","label":"3 of every 5 requests"},
+    {"from":"lb","to":"serverB","label":"1 of every 5 requests"},
+    {"from":"lb","to":"serverC","label":"1 of every 5 requests"}
+  ]
+}'></div>
+
+<h2><span class="idx">03</span>Why Every API Needs A Rate Limiter</h2>
+<p>Rate limiting is a rule that caps how many requests a single client — a user, an API key, or an IP address — can make in a given amount of time, and rejects or delays requests over that cap.</p>
+<p>Three reasons every public API needs this. First, protection: a single misbehaving or malicious client (a buggy retry loop, a scraping script, or a deliberate denial-of-service attempt) should not be able to overwhelm the backend and degrade service for everyone else. Second, cost: every request usually costs real compute, so unbounded requests mean unbounded, unpredictable cost. Third, fairness: on shared infrastructure, one heavy user's traffic should not slow down every other user sharing the same servers.</p>
+<p>Rate limits get enforced at different layers: at the edge (an API gateway or load balancer, before requests even reach a backend service — Chapter 3 covers the API gateway pattern), inside a specific service (protecting one slow downstream dependency, like a third-party payment processor with its own limits), or client-side (a well-behaved client throttles its own requests to avoid tripping the server's limiter in the first place). When a limit is hit, the standard response is an HTTP <code>429 Too Many Requests</code> status, often with a <code>Retry-After</code> header telling the client how long to wait before trying again.</p>
+
+<h2><span class="idx">04</span>Four Rate Limiting Algorithms, And The Trade-offs Between Them</h2>
+
+<h3>Token Bucket</h3>
+<p>Picture a bucket that holds up to N tokens. Tokens get added at a steady rate, say 10 per second, up to the bucket's maximum size. Every incoming request must take one token to proceed; if the bucket is empty, the request is rejected or queued, depending on the implementation. Because tokens build up while nobody is making requests, a client that has been quiet can suddenly send a burst of requests — up to the bucket size, all at once — before being throttled back down to the steady refill rate.</p>
+<p><strong>Real example:</strong> Stripe documents that its API enforces rate limits using a token-bucket-style approach on a per-Stripe-account basis, not per API key. This lets a client send a short burst of requests above its steady allowed rate before being throttled, rather than a hard per-second cutoff that rejects the very first request over the line. The exact bucket size and refill rate differ by endpoint and by test versus live mode, but the shape of the behavior — burst now, average out over time — is the token bucket pattern.</p>
+
+<h3>Leaky Bucket</h3>
+<p>Think of a bucket with a small hole in the bottom. Requests get added to the bucket, which acts as a queue, as they arrive. The bucket leaks out at one constant, fixed rate no matter how full it is. If the bucket is full, new requests get dropped. Unlike token bucket, the output rate is always smoothed to a steady stream — a backlog of saved-up capacity never bursts through all at once.</p>
+<p><strong>Good for:</strong> shaping bursty traffic into a steady stream, for example network traffic shaping in routers, or protecting a downstream system that genuinely cannot handle even a brief burst, like a legacy system with a hard per-second processing ceiling.</p>
+<p><strong>Weakness:</strong> because it flattens every burst, a legitimate client that briefly needs to send more requests after being idle gets throttled exactly the same as an abusive one — it is less forgiving of real, bursty usage patterns than token bucket.</p>
+
+<h3>Fixed Window Counter</h3>
+<p>Divide time into fixed windows, for example every distinct clock hour. Keep one counter per client per window, and increment it on every request. Once the counter passes the limit for that window, reject further requests until the next window starts and the counter resets to zero.</p>
+<p><strong>Good for:</strong> extreme simplicity and low cost — one counter per client per window is cheap to store and cheap to check.</p>
+<p><strong>The boundary problem:</strong> a client can spend its whole quota in the very last second of one window, then immediately spend its whole quota again in the very first second of the next window. That is up to double the intended rate, packed into about one second, right at the window edge.</p>
+<p><strong>Real example:</strong> GitHub's REST API rate limit is a fixed window per hour. Authenticated requests are documented as capped at roughly 5,000 requests per hour for standard authenticated users, and GitHub returns <code>X-RateLimit-Limit</code>, <code>X-RateLimit-Remaining</code>, and <code>X-RateLimit-Reset</code> response headers, so a well-behaved client can see exactly how many requests it has left and exactly when the window resets.</p>
+
+<h3>Sliding Window (Log or Counter)</h3>
+<p><strong>Sliding window log:</strong> store the exact timestamp of every request from a client in the trailing window, say the last 60 seconds. To check a new request, discard timestamps older than 60 seconds ago and count what is left. If that count is under the limit, allow the request and record its timestamp. This gives an exact count with no boundary problem, at the cost of storing one entry per request per client.</p>
+<p><strong>Sliding window counter:</strong> a cheaper compromise. Keep two adjacent fixed-window counters — the current window and the previous one — and estimate the trailing-window count as a weighted blend of the two, based on how far into the current window you are. This is not perfectly exact like the log, but it is very close, at the cost of only two numbers per client instead of a growing list of timestamps.</p>
+<p><strong>Good for:</strong> the log when you need to be strictly correct and client volume is low enough that the memory cost is fine; the counter when you need something very close to correct at much lower memory cost, for example rate limiting millions of API keys at once.</p>
+
+<div class="table-scroll">
+<table class="spec-table compare">
+<thead><tr><th>Algorithm</th><th>Burst tolerance</th><th>Memory cost</th><th>Accuracy</th></tr></thead>
+<tbody>
+<tr><td>Token bucket</td><td>Allows a burst up to the bucket size, then settles to the steady refill rate</td><td>Low — one token count and one timestamp per client</td><td>Exact for the rule it enforces; the rule itself permits short bursts by design</td></tr>
+<tr><td>Leaky bucket</td><td>Effectively none — smooths everything to one constant output rate</td><td>Low — one queue size or counter per client</td><td>Exact for a constant-rate rule; no burst allowed at all</td></tr>
+<tr><td>Fixed window counter</td><td>Can allow up to 2x the limit right at a window boundary</td><td>Lowest — one counter per client per window</td><td>Inexact — the boundary problem</td></tr>
+<tr><td>Sliding window log</td><td>No boundary problem; burst limited to exactly the stated rule</td><td>Highest — one stored timestamp per request per client</td><td>Exact</td></tr>
+<tr><td>Sliding window counter</td><td>Very close to sliding log, with a small smoothing error at the boundary</td><td>Low — two counters per client</td><td>Close to exact; a small approximation error, not zero</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="callout tradeoff"><p>Sliding window log gives you the most accurate rate limiting, but it costs the most memory because it stores every request's timestamp. Fixed window costs almost nothing, but lets a client burst to roughly double its real rate for about a second at every window boundary. Most production systems land on the sliding window counter as the practical middle ground: cheap, and close enough to exact that the small approximation error does not matter.</p></div>
+<div class="callout em-angle"><p>An EM-level answer adds: most teams should not write a rate limiter from scratch. API gateways such as AWS API Gateway or Envoy already support token-bucket-style limits per API key out of the box; Kong's Rate Limiting plugin defaults to fixed-window counters instead (its enterprise Rate Limiting Advanced plugin defaults to a sliding window), so check the algorithm before assuming any given gateway gives you token bucket. Building your own only pays off once you need rules an off-the-shelf gateway cannot express, for example a limit that depends on account tier or on usage-based billing.</p></div>
+
+<h2><span class="idx">05</span>Consistent Hashing: The Problem, The Ring, And Virtual Nodes</h2>
+
+<h3>The Naive Approach: hash(key) % N — And Why It Breaks</h3>
+<p>A hash function takes an input, for example a key like a user ID or a cache key string, and turns it into a number. The naive way to decide which of N servers owns a given key is to compute <code>hash(key) % N</code> — the remainder after dividing by N — and route to the server at that index.</p>
+<p>This works fine as long as N never changes. The problem shows up the moment a server joins or leaves: N changes, and the remainder for almost every key changes along with it, because the modulo operation is sensitive to the exact value of N. The result is that nearly every key now maps to a different server than it did a moment ago — not just the keys that logically should move because of the new server, but nearly all of them.</p>
+<p>For a distributed cache, that means nearly the entire cache becomes wrong all at once. Every key that moved to a different server is a cache miss on that new server, which can trigger a thundering herd (a flood of requests all hitting the database at once because they all missed the cache — see Chapter 4) right at the moment you were trying to scale up, not overload the system further. For a sharded database, it means nearly all the data would have to be physically moved between machines just because you added one more machine, which is far too expensive to do every time you scale.</p>
+
+<h3>The Ring: How Consistent Hashing Fixes This</h3>
+<p>Consistent hashing picks a large, fixed-size range of numbers, for example 0 to 2^32 minus 1, and treats it as a circle, called a ring, where the highest number wraps back around to zero. Both servers and keys get hashed onto this same ring using the same hash function: each server lands at one point (hash of its ID or IP address), and each key lands at one point (hash of the key itself).</p>
+<p>The ownership rule is simple: a key belongs to the first server you reach by moving clockwise around the ring from the key's position.</p>
+<p>This is what fixes the reshuffling problem. When a new server joins, it takes a position on the ring somewhere between two existing servers. It only takes over the keys that fall in the slice of the ring between it and its counter-clockwise neighbor — every other key on the ring keeps pointing to exactly the same server it did before the new server showed up. Removing a server works the same way in reverse: only its keys move, and they all move to its clockwise neighbor. Instead of "almost everything moves," it is "roughly one out of N keys move," which is a dramatically smaller, cheaper event.</p>
+
+<div class="diagram" data-diagram='{
+  "title": "Consistent hashing ring: only a small slice of keys move when Node D joins",
+  "nodes": [
+    {"id":"router","x":410,"y":250,"w":200,"h":60,"kind":"compute","label":"Hash Ring Router","sub":"hash(key), pick next node clockwise"},
+    {"id":"nodeA","x":760,"y":60,"w":200,"h":60,"kind":"storage","label":"Node A","sub":"owns range (340°, 45°]"},
+    {"id":"nodeB","x":760,"y":440,"w":200,"h":60,"kind":"storage","label":"Node B","sub":"owns range (45°, 186°]"},
+    {"id":"nodeC","x":40,"y":440,"w":200,"h":60,"kind":"storage","label":"Node C","sub":"owns range (186°, 306°]"},
+    {"id":"nodeD","x":40,"y":60,"w":220,"h":60,"kind":"storage","label":"New Node D (joining)","sub":"inserted at 340°"}
+  ],
+  "edges": [
+    {"from":"router","to":"nodeA","label":"keys hashing into (340°,45°]"},
+    {"from":"router","to":"nodeB","label":"keys hashing into (45°,186°]"},
+    {"from":"router","to":"nodeC","label":"keys hashing into (186°,306°]"},
+    {"from":"router","to":"nodeD","label":"keys hashing into (306°,340°] now go here"},
+    {"from":"nodeD","to":"nodeA","label":"only this slice moves, from A to D"}
+  ]
+}'></div>
+
+<h3>Virtual Nodes: Smoothing Out The Load</h3>
+<p>The plain ring still has a weak spot. If each physical server gets only one point on the ring, the arcs between servers can end up very uneven purely by chance of where each hash happens to land — one server might randomly own half the ring, another only a twentieth of it. And when that one big server fails, its whole large arc dumps onto a single neighbor, potentially doubling that neighbor's load overnight.</p>
+<p>Virtual nodes fix this. Instead of one point per physical server, each physical server is given many points on the ring — commonly on the order of a hundred or more — each landing at a different hash position, but all still owned by the same underlying physical server. With enough virtual points spread around the ring, every physical server ends up owning roughly the same total amount of ring space, regardless of hash luck. And when a server fails, its load was never one big arc — it was many small arcs scattered across the ring, so that load gets shared across many different neighbors instead of dumped onto one. This is the same idea behind Amazon's original Dynamo design, and the same reason systems like Cassandra assign each physical node many token positions on its ring instead of just one.</p>
+<div class="callout say-this"><p>“I would put consistent hashing with virtual nodes in front of our cache tier, not naive hash mod N, so that when we add a tenth cache node, only about ten percent of keys move to it. The naive scheme would invalidate almost the whole cache at once.”</p></div>
+<div class="callout tradeoff"><p>Consistent hashing is not free. It adds real implementation cost — maintaining the ring, choosing how many virtual nodes per server, handling the rebalancing when nodes change — compared to a plain <code>hash % N</code> scheme. For a fixed-size cluster that genuinely never resizes, the simple scheme is fine. The cost of consistent hashing only pays for itself once your node count actually changes over the system's life, which for almost any growing system, it eventually does.</p></div>
+
+<h3>One Ring, Many Uses</h3>
+<p>The exact same problem shows up in three places that look different on the surface: a load balancer deciding which backend server should handle a request from a given user (the consistent-hash-based algorithm from section 02), a distributed cache client deciding which cache server holds a given key, and a distributed database deciding which shard — a partition of the data holding a range or hash-selected slice of all rows — owns a given row.</p>
+<p>All three are the same underlying question: given a key and a set of nodes that can change over time, which node should own this key, in a way that adding or removing a node does not reshuffle everything? Consistent hashing with virtual nodes is the general-purpose answer, wherever that question shows up.</p>
+<div class="callout em-angle"><p>Chapter 6 goes deep on how real systems shard databases, including Cassandra's ring-based partitioning and DynamoDB's partition keys, alongside range-based and directory-based sharding schemes that solve the same problem differently. The ring model in this chapter is the same mental model Chapter 6 builds on — the only thing that changes is what sits on the ring: a request, a cache entry, or now, a row of data.</p></div>
+
+<h2><span class="idx">06</span>Quick Reference: Cheat Sheet</h2>
+<div class="specsheet">
+  <details>
+    <summary><span class="cat">LB Algo</span> Load balancer algorithm picks, one line each</summary>
+    <div class="specbody">
+      <ul>
+        <li><strong>Round Robin</strong> — cycles through servers in fixed order. Best for uniform servers and uniform request cost.</li>
+        <li><strong>Least Connections</strong> — sends to the server with the fewest active requests. Best when request cost varies a lot.</li>
+        <li><strong>Weighted</strong> — splits traffic in proportion to assigned capacity. Best for a mixed-capacity fleet.</li>
+        <li><strong>Consistent Hash</strong> — the same key always lands on the same server. Best for cache locality or session affinity.</li>
+      </ul>
+    </div>
+  </details>
+  <details>
+    <summary><span class="cat">Rate Limit</span> Rate limiting algorithm picks, one line each</summary>
+    <div class="specbody">
+      <ul>
+        <li><strong>Token Bucket</strong> — allows a burst up to the bucket size, then settles to the refill rate. Stripe-style APIs use this.</li>
+        <li><strong>Leaky Bucket</strong> — smooths everything to one constant output rate. Used in network traffic shaping.</li>
+        <li><strong>Fixed Window</strong> — cheapest, but allows up to roughly 2x rate right at the window boundary. GitHub's hourly REST limit uses this.</li>
+        <li><strong>Sliding Window (Log/Counter)</strong> — accurate, at a memory cost. The log is exact; the counter is a cheap, close approximation.</li>
+      </ul>
+    </div>
+  </details>
+  <details>
+    <summary><span class="cat">Hashing</span> Consistent hashing quick facts</summary>
+    <div class="specbody">
+      <ul>
+        <li>The ring is usually a large fixed range, like 0 to 2^32 minus 1, produced by a hash function.</li>
+        <li>A key belongs to the first server found going clockwise from the key's position on the ring.</li>
+        <li>Virtual nodes — commonly on the order of a hundred or more per physical server — even out load and spread failure impact across many neighbors instead of one.</li>
+        <li>The same ring idea powers load balancer routing, distributed cache client hashing, and database shard placement (see Chapter 6).</li>
+      </ul>
+    </div>
+  </details>
+</div>
+
+<div class="flashcards" data-cards='[
+  {"q":"What problem does a load balancer solve?","a":"It spreads incoming requests across many backend servers so no single server becomes a bottleneck or a single point of failure, and lets you add or remove servers without downtime."},
+  {"q":"When does round robin load balancing work well, and when does it fail?","a":"It works well when every backend server has about the same capacity and every request takes about the same time to process. It fails when servers differ in capacity, or some requests are much heavier than others, because round robin sends the same number of requests to every server no matter how busy each one currently is."},
+  {"q":"What does least-connections load balancing track, and why does it beat round robin when request cost is uneven?","a":"It tracks how many active connections each server has right now, meaning requests currently being handled but not yet finished, and always routes the next request to the server with the fewest. This adapts to slow or overloaded servers, which round robin cannot do because round robin ignores current load."},
+  {"q":"What is weighted load balancing for?","a":"It lets you assign each backend server a weight based on its real capacity, so a bigger server gets proportionally more traffic than a smaller one. A weight of 3 versus a weight of 1 means the bigger server gets three times the requests."},
+  {"q":"Why pick a consistent-hash-based load balancer instead of round robin?","a":"When the same client, or the same key such as a user ID, needs to keep landing on the same backend server every time, for example to keep a local per-user cache warm on that server, instead of spreading requests evenly and losing that cache locality."},
+  {"q":"What is the core idea behind token bucket rate limiting?","a":"A bucket holds up to N tokens and refills at a fixed rate. Each request consumes one token, and an empty bucket means the request is rejected or delayed. Because tokens can build up while a client is quiet, this allows a short burst of requests up to the bucket size before throttling kicks in."},
+  {"q":"How does leaky bucket differ from token bucket in the traffic it produces?","a":"Leaky bucket queues requests and releases them at one constant, fixed rate, smoothing bursts into steady output. Token bucket lets a saved-up burst through immediately as long as tokens are available, and only throttles once the bucket runs dry."},
+  {"q":"What is the boundary problem with fixed window rate limiting?","a":"A client can use its full quota in the last second of one window, then immediately use its full quota again in the first second of the next window. That is up to double the intended rate packed into about one second, right at the window edge."},
+  {"q":"How does sliding window log fix the fixed-window boundary problem, and what does that cost?","a":"It stores the timestamp of every request in the trailing window and counts how many fall within it right now, which is exact with no boundary problem. The cost is memory: it stores one entry per request per client instead of a single counter."},
+  {"q":"What does GitHub REST API rate limiting look like, and which algorithm family is it?","a":"A fixed window per hour: authenticated requests are documented as capped at roughly 5,000 per hour, with X-RateLimit-Remaining and X-RateLimit-Reset response headers telling the client how many requests are left and when the window resets."},
+  {"q":"What algorithm does Stripe describe using for its API rate limits, and what does that produce for the caller?","a":"Stripe documents a token-bucket-style approach per Stripe account (not per API key), which lets a client send a short burst above its steady allowed rate before being throttled back down, rather than enforcing a hard per-second cutoff."},
+  {"q":"Why does naive hash(key) % N break when a server is added or removed?","a":"Changing N changes the remainder for almost every key, so almost every key now maps to a different server. For a cache, that invalidates nearly the whole cache at once. For a sharded database, it means nearly all the data would need to move machines."},
+  {"q":"What is the core idea of consistent hashing?","a":"Hash both servers and keys onto the same fixed-size ring, for example 0 to 2^32 minus 1. A key belongs to the first server found going clockwise from the key position on the ring. Adding or removing one server only changes the small slice of keys between it and its neighbor, not the whole ring."},
+  {"q":"What problem do virtual nodes solve in consistent hashing?","a":"With only one ring point per physical server, load can be very uneven by chance, and losing one server dumps its entire slice onto a single neighbor. Giving every physical server many points on the ring spreads its slice into many small pieces scattered around the ring, which evens out load and spreads failure impact across many neighbors instead of one."},
+  {"q":"Why does the same consistent-hashing technique show up in load balancers, caches, and databases?","a":"All three are the same underlying question: given a key and a changing set of nodes, which node should own this key, without reshuffling everything when a node joins or leaves. Chapter 6 uses this same ring idea to shard databases, where the thing on the ring is a row of data instead of a request or a cache entry."}
+]'></div>

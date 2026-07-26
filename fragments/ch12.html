@@ -1,0 +1,254 @@
+<p class="lede">Every system that keeps more than one copy of data will, sooner or later, have two of those copies unable to talk to each other. CAP theorem tells you exactly what breaks when that happens, and forces a real choice. PACELC adds the choice you still face even when nothing is broken. Paxos and Raft are the algorithms that let a group of unreliable machines agree on one answer anyway — the actual machinery every strongly consistent distributed system is built on.</p>
+
+<h2><span class="idx">01</span>CAP Theorem: What C, A, And P Actually Mean</h2>
+<p>A distributed system keeps more than one copy of the same data on more than one machine (Ch.6 covers why: replication for availability and read throughput). Sooner or later, two of those machines will fail to reach each other over the network — a router misbehaves, a cable gets cut, a cross-region link times out. That is a <strong>network partition</strong>: messages between some nodes get dropped or arbitrarily delayed, even though each side of the split might be running perfectly fine on its own.</p>
+<p><strong>CAP theorem</strong> — proposed by Eric Brewer in 2000 and formally proven by Seth Gilbert and Nancy Lynch in 2002 — says: when a network partition happens, a distributed system can keep at most two of the following three properties, not all three at once: Consistency, Availability, Partition tolerance. The letters are precise, and mixing them up is one of the most common mistakes people make in an interview. Read each one carefully.</p>
+<ul>
+  <li><strong>Consistency (the CAP sense)</strong> — every read gets back the most recent successful write, or an error, as if there were only one copy of the data no matter which node answered. This is <strong>not</strong> the same "C" as ACID consistency (Ch.7), which means a transaction never leaves the data violating its own rules, like a foreign key that always points to something real. CAP consistency is about how fresh a read is across replicas — that is the meaning an interviewer means almost every time "CAP" comes up.</li>
+  <li><strong>Availability</strong> — every request to a working node gets a real, non-error response, in bounded time. It says nothing about whether that response is correct or up to date. An available system is allowed to hand back stale data and still count as "available" in the CAP sense.</li>
+  <li><strong>Partition tolerance</strong> — the system keeps operating even though some messages between nodes are being dropped or delayed. This is easy to misread: it does not mean "the system never has partitions." It means the system does not just stop working the instant one happens.</li>
+</ul>
+<p>Why can't a system have all three at once during a partition? A short version of Gilbert and Lynch's proof: say Node 1 and Node 2 each hold a replica, and a partition cuts all messages between them. A client writes to Node 1. Right after, a different client reads from Node 2. Node 2 has two options, and no third one. It can answer immediately with its own last known value — but that value might be stale, since Node 2 has no way to confirm anything with Node 1 right now, which breaks Consistency. Or it can refuse to answer until it can confirm with Node 1 — but Node 1 is unreachable, so that refusal (or an unbounded wait) breaks Availability. There is no way for Node 2 to give a response that is both guaranteed fresh and guaranteed to arrive. That is the whole theorem, stated without symbols.</p>
+
+<div class="callout"><p>Say the two Cs out loud if an interviewer asks about CAP: "CAP's Consistency is about read freshness across replicas — every read sees the latest write. ACID's Consistency is about transactions never breaking their own data rules. They just happen to share a letter." Getting this distinction right, unprompted, is a small signal that separates a memorized answer from an understood one.</p></div>
+
+<h2><span class="idx">02</span>Why CP Or AP Is A Partition-Time Choice, Not A Permanent One</h2>
+<p>Partition tolerance is not really a design choice you get to opt out of. Any real system spanning more than one machine — let alone more than one data center or region — will eventually have a link fail: that is simply a fact about networks, not a setting. Because of that, practitioners rarely ask "C, A, or P?" as if all three were equally up for grabs. The real question is: given that a partition <strong>will</strong> eventually happen, what does the system do the moment it does — favor Consistency (a <strong>CP</strong> system) or favor Availability (an <strong>AP</strong> system)?</p>
+<p>And just as important: outside of a partition — the healthy, ordinary majority of the time, when every node can reach every other node — a well-built system does not have to give up anything. It can serve consistent <strong>and</strong> available responses at the same time. The trade-off CAP describes only bites at the exact moment a partition is happening; it is not a tax paid on every single request, forever. Calling a system "CP" or "AP" is shorthand for "this is the policy it follows when a partition hits," not a description of how it behaves all day, every day.</p>
+
+<h3>Scenario 1: A Distributed Lock Or Leader-Election Service — Choose CP</h3>
+<p>A distributed lock service, or a leader-election system, decides which single node is allowed to do something — write to a shared resource, run a scheduled job, act as the primary — at any given time. ZooKeeper, etcd, and Consul are the well-known examples; Google's older Chubby service did the same job internally.</p>
+<p>If a partition splits the cluster and two different nodes each believe they are the leader or the lock-holder — a condition called <strong>split brain</strong> — they can both act on the same resource at the same time: both write to the same file, both run the same "exactly once" job, both think they own the same shard. That is actively dangerous, and worse than the alternative. So these systems refuse to grant the lock or confirm leadership to whichever side of a partition cannot prove it has a majority of the cluster. That is a deliberate sacrifice of Availability, on purpose, to protect Consistency.</p>
+
+<h3>Scenario 2: A Shopping Cart Or Social Feed — Choose AP</h3>
+<p>Adding an item to a cart, or loading a social feed, faces a different question during a partition: would you rather show the customer "service unavailable, try again later," or let them keep going — adding items, scrolling posts — using whichever replica is reachable, and sort out any conflicts afterward?</p>
+<p>For most consumer products, the second option wins. A cart that is a few seconds out of sync across two devices, or a feed missing the very latest post for a moment, costs the business almost nothing — most users never even notice. An error page during checkout costs a sale, right now, visibly. Amazon's own Dynamo paper — the design behind DynamoDB — used the shopping-cart problem as its motivating example for choosing availability over strict consistency. Twitter's timeline and Facebook's News Feed work on the same logic: a slightly stale view is an acceptable, invisible cost; an outage page is not.</p>
+
+<h3>Scenario 3: A Banking Ledger — Choose CP</h3>
+<p>A ledger recording account balances and transfers cannot tolerate a stale read during a partition, because a stale balance can be acted on. A user could see an old, higher balance and spend money that is no longer there. Two systems on opposite sides of a partition could each independently approve a withdrawal from the same account — a double-spend. The financial and legal cost of a wrong balance is far higher than the cost of pausing transaction processing on the affected accounts for a few seconds until the partition heals.</p>
+<p>So the deliberate, correct answer for a core ledger is CP: refuse to process, or route the request to whichever side actually has a quorum, rather than serve a number that might be wrong. Google Spanner — a strongly-consistent, globally-distributed database built by Google — is the well-known production example of a system engineered specifically to make this call, willing to pay latency and, in rare partition scenarios, restrict availability, in exchange for a single, globally consistent view of the data.</p>
+
+<div class="callout say-this"><p>"I would design the leader-election path to be CP — it is worse to have two nodes both think they are the leader than to have neither answer for a few seconds. But I would design the cart and browse paths to be AP — a customer who cannot add an item to their cart because of a transient partition is a lost sale, and a cart that is a few seconds out of sync across devices is not."</p></div>
+
+<div class="callout em-angle"><p>An EM-level answer separates these paths inside one product instead of picking one label for the whole system. E-commerce checkout does not need a single CAP answer: the inventory-lock and payment-authorization path should behave CP, while the cart, browse, and recommendation paths should behave AP. Naming one database and calling the whole architecture "CP" or "AP" is usually a sign the trade-off was never actually thought through per use case.</p></div>
+
+<div class="diagram" data-diagram='{
+  "title": "CAP in action: same partition, two different policies",
+  "nodes": [
+    {"id":"client","x":30,"y":250,"w":150,"h":60,"kind":"external","label":"Client","sub":"reaches whichever node it can"},
+    {"id":"nodeC","x":260,"y":250,"w":220,"h":80,"kind":"storage","label":"Node C, minority side","sub":"CP: rejects the write, stays unavailable. AP: accepts it, may conflict later."},
+    {"id":"nodeA","x":680,"y":110,"w":220,"h":70,"kind":"storage","label":"Node A, majority side"},
+    {"id":"nodeB","x":680,"y":330,"w":220,"h":70,"kind":"storage","label":"Node B, majority side"}
+  ],
+  "edges": [
+    {"from":"client","to":"nodeC","label":"write request, mid-partition"},
+    {"from":"nodeC","to":"nodeA","label":"partition: no messages get through"},
+    {"from":"nodeA","to":"nodeB","label":"still connected, 2 of 3 is a majority"}
+  ],
+  "groups": [
+    {"x":660,"y":90,"w":260,"h":330,"label":"Majority side: has quorum"},
+    {"x":240,"y":230,"w":260,"h":120,"label":"Minority side: no quorum"}
+  ]
+}'></div>
+
+<h2><span class="idx">03</span>PACELC: The Trade-Off You Face Even Without A Partition</h2>
+<p>CAP only describes what happens during a partition — and partitions, while inevitable eventually, are rare. Most of the time the network is healthy and every node can reach every other node. Yet distributed systems still make a consistency trade-off during that healthy majority of the time, for a completely different reason: latency, the time a request takes to complete. Daniel Abadi named this <strong>PACELC</strong> (commonly pronounced "pace-elk") to capture both halves of the real trade-off in a single acronym.</p>
+<p>Read it as two clauses. <strong>"PAC"</strong> is exactly CAP's forced choice: if there is a Partition, choose Availability or Consistency. <strong>"ELC"</strong> is the new half: Else — meaning no partition — choose Latency or Consistency.</p>
+<p>Why does this trade-off exist even on a perfectly healthy network? Keeping replicas consistent means a write has to be confirmed by more than one machine before it counts as done, and that confirmation takes real time — even over a fast, working link, and especially across regions, where a round trip between, say, a US and an Asia data center is tens to over a hundred milliseconds no matter how healthy the network is. So on every single write, all the time, no partition required, a system picks one of two options: wait for enough replicas to confirm before replying (stronger consistency, higher latency), or reply as soon as one replica has it and ship the rest in the background (lower latency, but a read hitting a different replica right after can be stale).</p>
+
+<div class="table-scroll">
+  <table class="spec-table">
+    <caption>PACELC classifications commonly cited for real systems</caption>
+    <thead><tr><th>System</th><th>Classification</th><th>What it means in practice</th></tr></thead>
+    <tbody>
+      <tr><td>DynamoDB (original design), Cassandra</td><td>PA / EL</td><td>Favors Availability during a partition, and favors Latency over Consistency the rest of the time too</td></tr>
+      <tr><td>BigTable, HBase</td><td>PC / EC</td><td>Favors Consistency both during a partition and in normal operation, at the cost of latency and, mid-partition, availability</td></tr>
+      <tr><td>Yahoo's PNUTS</td><td>PC / EL</td><td>Consistency-favoring during a partition, but Latency-favoring the rest of the time — proof the two halves are independent choices</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<div class="callout tradeoff"><p>Notice PACELC's two halves are independent — a system's partition-time answer does not have to match its normal-time answer, as PNUTS shows. That is exactly why "CP or AP" alone is not the whole story at an EM-level bar: PACELC is the natural follow-up question that catches anyone who only memorized CAP without understanding what drives the choice.</p></div>
+
+<h2><span class="idx">04</span>Five Consistency Models You Should Be Able To Define</h2>
+<p>CAP and PACELC describe when a trade-off happens. Consistency models describe exactly what guarantee you get on the "less strict than perfect" side of that trade-off — and interviewers will ask you to name and define several of them precisely.</p>
+
+<h3>Strong Consistency (Linearizability)</h3>
+<p>Every read, from any node, immediately reflects the latest completed write — the whole system behaves as if there were only one copy of the data, with every operation appearing to happen in a single, agreed-upon order. <strong>Example:</strong> reading a balance from a single-master relational database like MySQL, where all reads and writes go through one primary (Ch.7) — there is no other copy to be behind, so a read from the primary is trivially strongly consistent.</p>
+
+<h3>Eventual Consistency</h3>
+<p>If no new writes happen, every replica will eventually converge to the same value — but there is no promise of how long "eventually" takes, and a read in the meantime can return an old value. <strong>Example:</strong> a DNS record update (Ch.3). After you change a domain's IP address, some resolvers around the world keep answering with the old address until their cached copy's TTL (time-to-live, how long a cached value is trusted before it expires) runs out.</p>
+
+<h3>Causal Consistency</h3>
+<p>Operations that are causally related — one clearly happens because of, or after, another — must be seen by every node in that same order. Operations that are not related to each other can be seen in a different order on different nodes, and that is fine. <strong>Example:</strong> a reply to a comment. Every node must show the original comment before it shows a reply to it, since a reply appearing without its parent makes no sense, but two unrelated top-level comments on the same post can legitimately show up in a different order on different nodes.</p>
+
+<h3>Read-Your-Writes Consistency</h3>
+<p>After a specific user writes something, every read that same user makes afterward is guaranteed to see that write, even if other users elsewhere might briefly still see the old value. <strong>Example:</strong> you update your profile photo and immediately reload the page — you always see the new photo, typically because your reads get routed to the same replica you wrote to, or because the client remembers the version of its own last write.</p>
+
+<h3>Monotonic Reads</h3>
+<p>Once a client has read a value, a later read by that same client will never return an older value — that client's reads only ever move forward in time, never backward, even if two consecutive reads happen to land on different replicas. <strong>Example:</strong> refreshing an order-tracking page. If the first refresh shows "Shipped," a second refresh should never show "Processing" again, even if it happens to hit a replica that is usually a bit behind.</p>
+
+<div class="callout"><p>Strong consistency and eventual consistency sit at the two ends of a spectrum. Causal consistency, read-your-writes, and monotonic reads are all cheaper, more specific promises in between — each gives up strict global ordering but keeps one particular guarantee that a real product usually actually needs, without paying for a guarantee it does not.</p></div>
+
+<div class="specsheet">
+  <details>
+    <summary><span class="cat">CAP</span> CAP theorem, precisely</summary>
+    <div class="specbody">
+      <ul>
+        <li><strong>Consistency</strong> — every read sees the latest write, or an error. Not the same "C" as ACID.</li>
+        <li><strong>Availability</strong> — every request to a working node gets a real response in bounded time. Says nothing about freshness.</li>
+        <li><strong>Partition tolerance</strong> — the system keeps working despite dropped or delayed messages between nodes.</li>
+        <li>The theorem forces a choice between C and A, and only while a partition is actually happening.</li>
+      </ul>
+    </div>
+  </details>
+  <details>
+    <summary><span class="cat">PACELC</span> PACELC in one line</summary>
+    <div class="specbody">
+      <ul>
+        <li><strong>PAC</strong> — if a Partition happens, choose Availability or Consistency (this is just CAP).</li>
+        <li><strong>ELC</strong> — Else, with no partition, choose Latency or Consistency, because confirming a write across replicas always costs time.</li>
+        <li>The two halves are independent: a system's partition-time answer does not have to match its everyday answer.</li>
+      </ul>
+    </div>
+  </details>
+  <details>
+    <summary><span class="cat">Models</span> Five consistency models, one line each</summary>
+    <div class="specbody">
+      <ul>
+        <li><strong>Strong</strong> — every read sees the latest write, as if there were one copy.</li>
+        <li><strong>Eventual</strong> — replicas converge if writes stop, but with no bound on how long.</li>
+        <li><strong>Causal</strong> — related operations are seen in order; unrelated ones can differ by node.</li>
+        <li><strong>Read-your-writes</strong> — a user always sees their own last write on their next read.</li>
+        <li><strong>Monotonic reads</strong> — a client's reads never go backward in time.</li>
+      </ul>
+    </div>
+  </details>
+  <details>
+    <summary><span class="cat">Raft</span> Raft vocabulary cheat sheet</summary>
+    <div class="specbody">
+      <ul>
+        <li><strong>Term</strong> — a number that increases with every new election; stale terms are rejected.</li>
+        <li><strong>Leader / Follower / Candidate</strong> — the three roles a node can be in.</li>
+        <li><strong>Heartbeat</strong> — an empty AppendEntries message the leader sends to say it is still alive.</li>
+        <li><strong>Election timeout</strong> — the randomized delay a follower waits before becoming a candidate.</li>
+        <li><strong>RequestVote / AppendEntries</strong> — the two RPCs Raft nodes send each other.</li>
+        <li><strong>Commit index</strong> — the highest log position known to be acknowledged by a majority.</li>
+      </ul>
+    </div>
+  </details>
+  <details>
+    <summary><span class="cat">Systems</span> Named systems: CP or AP</summary>
+    <div class="specbody">
+      <ul>
+        <li><strong>ZooKeeper, etcd, Consul</strong> — CP. Built for coordination, refuse to answer without a majority.</li>
+        <li><strong>DynamoDB (original design), Cassandra</strong> — AP by default, with tunable read/write quorums (Ch.9).</li>
+        <li><strong>Google Spanner</strong> — CP. Strong global consistency via TrueTime and Paxos-based commits.</li>
+        <li><strong>MongoDB replica set</strong> — leans CP for writes: a single primary, and the minority side of a partition cannot elect a new one and refuses writes (Ch.6, Ch.8).</li>
+        <li><strong>HBase, BigTable</strong> — CP. Strong per-row consistency, backed by a single-region-server-owns-a-range design.</li>
+      </ul>
+    </div>
+  </details>
+</div>
+
+<h2><span class="idx">05</span>What Problem Consensus Algorithms Actually Solve</h2>
+<p><strong>Consensus</strong> is getting a group of nodes — any of which can crash, restart, or simply be slow to respond at any point — to agree on a single value, or, more usefully for a real database, a single ordered sequence of values (a <strong>replicated log</strong>). The agreement has to hold two properties at once: every node that is still working ends up with the exact same answer, and once something is agreed, it never gets un-agreed, even after crashes and restarts.</p>
+<p>This is genuinely hard to get right without a formal protocol. A naive "ask everyone and go with the majority" scheme can fail the moment messages get delayed or nodes crash mid-vote: you can end up with two different groups each convinced they hold a majority (the split-brain problem from section 02), or a crashed node coming back online with old, wrong data and confusing everyone else about what was actually agreed.</p>
+<p>This is exactly the machinery that makes a CP choice from section 02 safely implementable, without turning one single machine into an unavoidable single point of failure. A distributed lock service's "who holds the lock right now," a strongly-consistent metadata store, and a replicated database's own "who is the leader right now" decision are all, underneath, one running instance of a consensus algorithm. Paxos and Raft are the two most important algorithms of this kind. This chapter stops at the level of agreeing on one log — Ch.13 covers the quorum math for tunable per-operation reads and writes, and two-phase commit for transactions that span more than one shard.</p>
+
+<h2><span class="idx">06</span>Raft: Leader Election</h2>
+<p><strong>Raft</strong>, introduced by Diego Ongaro and John Ousterhout in 2014, organizes a cluster of an odd number of nodes — commonly 3 or 5, so a majority is always unambiguous — around a single leader at any given time. Every node is in exactly one of three roles: <strong>leader</strong>, <strong>follower</strong>, or <strong>candidate</strong>.</p>
+<p>Time is divided into <strong>terms</strong> — a term is just a number that increases by one every time a new election starts, working like a round counter for elections. Every node remembers the highest term it has seen, and rejects any message carrying an older term. This single rule is what stops a node that got disconnected and is now out of date from confusing the cluster once it reconnects — its old, stale term is simply ignored.</p>
+<p>During normal operation, the leader sends periodic <strong>heartbeats</strong> — empty AppendEntries messages, covered fully in section 07 — to every follower, essentially saying "I am still here, do not start an election." Each follower resets a randomized <strong>election timeout</strong>, commonly somewhere around 150 to 300 milliseconds, every time it hears from the leader.</p>
+<p>If a follower's election timeout fires before it hears from the leader — because the leader crashed, or a partition cut it off — that follower becomes a <strong>candidate</strong>: it increments its term by one, votes for itself, and sends a <strong>RequestVote</strong> message to every other node asking for a vote in this new term. A node grants at most one vote per term, on a first-come basis, and only if the candidate's log is at least as up to date as its own — that second condition is a safety rule that stops a node missing recent entries from ever becoming leader.</p>
+<p>A candidate that receives votes — including its own — from a <strong>majority</strong> of the cluster becomes leader for that term (3 votes out of 5 nodes, for example) and immediately starts sending heartbeats to establish itself before anyone else's timeout expires. The randomization on election timeouts exists specifically to avoid ties: if two followers time out at nearly the same moment, one is very likely to fire first and gather a majority before the other's timer even runs out. If a genuine tie does happen and no candidate gets a majority, that term simply ends without a leader, and the whole process retries at a higher term.</p>
+
+<div class="diagram" data-diagram='{
+  "title": "Raft leader election: terms, votes, and majority",
+  "nodes": [
+    {"id":"nodeA","x":400,"y":60,"w":200,"h":70,"kind":"storage","label":"Node A","sub":"election timeout fires, becomes Candidate, term N+1"},
+    {"id":"nodeB","x":120,"y":300,"w":200,"h":70,"kind":"storage","label":"Node B","sub":"Follower, term N"},
+    {"id":"nodeC","x":680,"y":300,"w":200,"h":70,"kind":"storage","label":"Node C","sub":"Follower, term N"}
+  ],
+  "edges": [
+    {"from":"nodeA","to":"nodeB","label":"RequestVote, term N+1"},
+    {"from":"nodeA","to":"nodeC","label":"RequestVote, term N+1"},
+    {"from":"nodeB","to":"nodeA","label":"vote granted"},
+    {"from":"nodeC","to":"nodeA","label":"vote granted"}
+  ],
+  "groups": [
+    {"x":80,"y":30,"w":840,"h":380,"label":"Majority (2 of 3) votes for Node A: it becomes Leader for term N+1"}
+  ]
+}'></div>
+
+<h2><span class="idx">07</span>Raft: Log Replication And Commit</h2>
+<p>Every node keeps a <strong>log</strong> — an ordered, append-only list of entries, each one holding a command (for example, "set x = 5") plus the term it was created in and its position, or <strong>index</strong>, in the log. The entire point of Raft is keeping every node's log identical, in order, for every entry that has been committed.</p>
+<p>A client sends its command to the leader. If it accidentally contacts a follower instead, the follower redirects it — there is only ever one node accepting writes at a time, the same single-leader shape covered for MySQL and MongoDB in Ch.6. The leader appends the command to its own log immediately, as a new, <strong>uncommitted</strong> entry.</p>
+<p>The leader then sends that entry to every follower in an <strong>AppendEntries</strong> message, along with the index and term of the entry right before it in the log. Each follower checks whether its own log already has a matching entry at that previous position. If it does, the follower appends the new entry and acknowledges (acks) the leader. If it does not — its log is missing entries, or has a conflicting one — it rejects the message, and the leader walks backward and resends from an earlier point until the logs line up again, overwriting anything in the follower's log that conflicts with the leader's. This backward-walking repair is how Raft heals a follower that fell behind or briefly diverged, without any human stepping in.</p>
+<p>The leader considers an entry <strong>committed</strong> once a majority of the cluster — itself plus enough followers — has acknowledged storing it. For a 5-node cluster, the leader plus two followers is enough; it does not have to wait for all five. This rule has one sharp edge: it only lets a leader commit an entry directly when that entry was created in the leader's own <strong>current</strong> term. A leader must never decide an older-term entry is committed just because a majority now happens to store it — that entry only becomes safely committed indirectly, once a later entry from the leader's current term is itself replicated to a majority. Ongaro and Ousterhout call this the "Figure 8" problem in the Raft paper, and it is the one part of the commit rule that is easy to state correctly but easy to implement wrong. Once committed, the leader applies the command to its own <strong>state machine</strong> (the actual data structure the log entry describes, such as an in-memory key-value map) and tells the client the write succeeded. Followers apply the same entry once a later heartbeat tells them the commit index has moved forward.</p>
+<p>Majority is enough for safety because any two majorities drawn from the same cluster must overlap by at least one node. A future leader election also requires a majority of votes, so any node that wins an election is guaranteed to have talked to at least one node that already held every previously committed entry — and Raft's voting rule, granting a vote only to a candidate whose log is at least as up to date, means a node missing committed entries can never win. That is the core safety argument, in plain words rather than a formal proof. It also explains crash recovery directly: if a leader crashes right after replicating an entry to a majority but before replying to the client, the entry is still safely committed, and whichever node wins the next election is guaranteed to already have it.</p>
+
+<div class="diagram" data-diagram='{
+  "title": "Raft log replication: append, replicate, commit on majority",
+  "nodes": [
+    {"id":"client","x":30,"y":250,"w":150,"h":60,"kind":"external","label":"Client"},
+    {"id":"leader","x":380,"y":250,"w":200,"h":80,"kind":"storage","label":"Leader","sub":"appends entry locally, replicates, commits once majority ack"},
+    {"id":"follower1","x":750,"y":100,"w":200,"h":70,"kind":"storage","label":"Follower 1"},
+    {"id":"follower2","x":750,"y":400,"w":200,"h":70,"kind":"storage","label":"Follower 2"}
+  ],
+  "edges": [
+    {"from":"client","to":"leader","label":"write command"},
+    {"from":"leader","to":"follower1","label":"AppendEntries: new entry"},
+    {"from":"leader","to":"follower2","label":"AppendEntries: new entry"},
+    {"from":"follower1","to":"leader","label":"ack"},
+    {"from":"follower2","to":"leader","label":"ack"},
+    {"from":"leader","to":"client","label":"success, entry committed"}
+  ],
+  "groups": [
+    {"x":360,"y":70,"w":630,"h":430,"label":"Raft cluster: one leader, replicated log"}
+  ]
+}'></div>
+
+<div class="callout em-angle"><p>Nobody who is not building database infrastructure for a living should hand-write Paxos or Raft from scratch — the safety rules in section 06 and 07 are easy to state and easy to get subtly wrong under real failure conditions. The EM-level move is to reach for an existing, battle-tested implementation (etcd, ZooKeeper, a managed Spanner or CockroachDB) instead of budgeting engineering time to build one, unless consensus itself is the product.</p></div>
+
+<h2><span class="idx">08</span>How Paxos Relates To Raft</h2>
+<p><strong>Paxos</strong>, published by Leslie Lamport in 1998 and later re-explained in the 2001 paper "Paxos Made Simple," was the original general solution to the consensus problem, and for a long time was treated as the reference algorithm every distributed-systems paper cited. Google's Chubby lock service and Google Spanner both use Paxos-family algorithms internally.</p>
+<p>Basic Paxos solves the narrower problem of agreeing on a single value. Getting a full replicated log out of it — the thing an actual database needs — means running many rounds of it back to back, informally called <strong>Multi-Paxos</strong>, and the original papers left much of the practical engineering of Multi-Paxos, such as maintaining a stable leader, compacting the log, and changing cluster membership, as an exercise for implementers rather than something spelled out step by step.</p>
+<p>That gap is exactly what Raft was built to close. Ongaro and Ousterhout's 2014 paper is literally titled "In Search of an Understandable Consensus Algorithm" — Raft is explicitly, by its own authors' stated goal, an attempt to solve the same problem as Multi-Paxos, with equivalent safety guarantees, but structured so that engineers implementing it, and students learning it, can actually reason about why it is correct. It mainly does this through one specific design choice Paxos does not enforce: a <strong>strong leader</strong> — log entries only ever flow one direction, from leader to followers, never the reverse, and only the leader ever decides what order they go in. Basic Paxos allows any node to propose a value in any round, which is more flexible but is also exactly why reasoning about it, and implementing it correctly, is famously difficult.</p>
+<p>In production, both families exist side by side. etcd, Consul, CockroachDB, and TiKV all use Raft directly. ZooKeeper uses its own protocol called ZAB (ZooKeeper Atomic Broadcast), which is conceptually close to Multi-Paxos with a stable leader. Google's internal infrastructure, including Chubby and Spanner, uses Paxos variants. For an interview, the honest, useful summary is: they solve the identical problem with equivalent guarantees, and Raft is the one you are expected to be able to explain the actual mechanics of, because it was designed for exactly that.</p>
+
+<div class="table-scroll">
+  <table class="spec-table compare">
+    <caption>Paxos vs Raft</caption>
+    <thead><tr><th>Concept</th><th>Paxos</th><th>Raft</th></tr></thead>
+    <tbody>
+      <tr><td>Problem solved directly</td><td>Consensus on a single value (Multi-Paxos extends this to a log)</td><td>Consensus on a replicated log directly</td></tr>
+      <tr><td>Leader concept</td><td>No built-in stable leader in Basic Paxos; any node can propose a value</td><td>Explicit strong leader; only the leader appends and orders entries</td></tr>
+      <tr><td>Core roles</td><td>Proposer, Acceptor, Learner</td><td>Leader, Follower, Candidate</td></tr>
+      <tr><td>How agreement happens</td><td>Two-phase voting per value (Prepare/Promise, then Accept/Accepted)</td><td>Majority-acked AppendEntries per log entry, plus a majority-voted leader election</td></tr>
+      <tr><td>Stated design goal</td><td>Prove correctness of a minimal, general solution</td><td>Be provably correct and easy for engineers to implement correctly</td></tr>
+      <tr><td>Known production users</td><td>Google Chubby, Google Spanner (Paxos-family)</td><td>etcd, Consul, CockroachDB, TiKV</td></tr>
+      <tr><td>Published</td><td>Lamport, 1998 ("Paxos Made Simple," 2001)</td><td>Ongaro &amp; Ousterhout, 2014 ("In Search of an Understandable Consensus Algorithm")</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<div class="flashcards" data-cards='[
+  {"q":"In the CAP theorem, what does the letter C (Consistency) actually mean, and how is that different from ACID consistency?","a":"CAP consistency means every read returns the most recent successful write, or an error, as if there was only one copy of the data. ACID consistency means a transaction never leaves data violating its own rules, like a valid foreign key. They are two unrelated meanings of the same word."},
+  {"q":"In the CAP theorem, what does Availability guarantee, and what does it NOT guarantee?","a":"Every request to a working node gets a real, non-error response in bounded time. It does not guarantee the response is correct or up to date; a stale answer still counts as available."},
+  {"q":"What is a network partition, in the CAP sense?","a":"A break in communication between parts of a distributed system, where messages between some nodes get dropped or arbitrarily delayed, even though each side may keep running fine on its own."},
+  {"q":"Why is picking two of C, A, and P forever a misreading of CAP?","a":"Partition tolerance is not really an opt-out for a system spread across more than one machine, because networks eventually partition regardless of what is chosen. CAP is really a forced choice between C and A, and only during the moments a partition is actually happening. Outside of a partition, a system can be both consistent and available at the same time."},
+  {"q":"Why does a distributed lock service or leader-election system, like ZooKeeper, etcd, or Consul, need to be CP rather than AP?","a":"If a partition lets two nodes each believe they hold the lock or the leadership, they can act on the same shared resource at the same time and corrupt it. Refusing to answer on the side that cannot prove it has a majority is safer than answering with something that might be wrong."},
+  {"q":"Why can a shopping cart or a social feed safely favor AP over CP?","a":"A cart or feed that is a few seconds stale is invisible and cheap. Refusing service during a partition, such as an error page mid-checkout, is a visible and costly failure. Amazon used the shopping-cart case as its own argument for favoring availability in the design behind DynamoDB."},
+  {"q":"Why does a banking ledger need to be CP rather than AP?","a":"A stale balance can be acted on: a user could overspend, or two systems on opposite sides of a partition could both approve a withdrawal from the same account. The cost of a wrong number is higher than the cost of pausing."},
+  {"q":"What does PACELC add on top of the CAP theorem?","a":"It adds the trade-off you still face when there is no partition at all. PAC is CAP own partition-time choice between Availability and Consistency. ELC is the everyday choice between Latency and Consistency, because confirming a write across replicas always costs time."},
+  {"q":"Under Daniel Abadi PACELC framework, how are Dynamo-style systems such as Cassandra commonly classified, and what does that mean in practice?","a":"PA slash EL: they favor Availability during a partition, and they favor Latency over Consistency even during ordinary, healthy operation."},
+  {"q":"What is eventual consistency, with a concrete example?","a":"If writes stop, every replica will eventually converge to the same value, but there is no promise of how long that takes, and a read in the meantime can return an old value. A DNS record update is a common example: some resolvers keep answering with the old address until their cached copy TTL expires."},
+  {"q":"What is causal consistency, in one sentence?","a":"Operations that are causally related, meaning one clearly happens because of another, must be seen in that same order by every node, while unrelated operations can be seen in different orders on different nodes."},
+  {"q":"What is the practical difference between read-your-writes consistency and monotonic reads?","a":"Read-your-writes guarantees a specific user always sees their own most recent write on their next read. Monotonic reads guarantees a client reads never go backward in time on that same value, no matter whose write produced it."},
+  {"q":"What problem does a consensus algorithm actually solve?","a":"Getting a group of nodes, any of which can crash or be delayed, to agree on a single value, or an ordered log of values, so that every surviving node ends up with the exact same answer, and that answer never gets reversed later."},
+  {"q":"In Raft, what is a term, and why does every message carry one?","a":"A term is a number that increases every time a new election starts. Nodes reject any message carrying an older term than they have already seen, which stops a node that was disconnected and is now stale from confusing the cluster once it reconnects."},
+  {"q":"In Raft, what has to happen for a candidate to become leader?","a":"It increments the term, votes for itself, and sends RequestVote to every other node. If it receives votes, including its own, from a majority of the cluster, it becomes leader for that term."},
+  {"q":"In Raft, when does the leader consider a log entry committed, and what happens next?","a":"Once a majority of the cluster, including itself, has acknowledged storing that entry. The leader then applies it to its own state machine and tells the client the write succeeded. Followers apply the same entry once a later heartbeat tells them the commit index moved forward."},
+  {"q":"How does Raft relate to Paxos?","a":"They solve the same consensus problem with equivalent guarantees. Raft was explicitly designed by Ongaro and Ousterhout as a more understandable alternative to Multi-Paxos, mainly by enforcing one strong leader, something Paxos itself does not require."}
+]'></div>

@@ -9,19 +9,48 @@ system-design knowledge to an EM-level HLD interview bar.
 
 ## What this is
 
-One `index.html` with client-side hash routing (`#/hld`, `#/hld/ch1` ...
-`#/hld/ch22`) — no build step, no framework, no server-side routing needed.
-Works as a installable web app on iOS/Android (manifest + service worker +
-offline caching of the whole book).
+`index.html` is the deployed app: client-side hash routing (`#/hld`,
+`#/hld/ch1` ... `#/hld/ch22`), no build step at runtime, no framework, no
+server-side routing needed — every chapter's fully-rendered content is
+embedded directly in its `<script>` block. Works as an installable web app on
+iOS/Android (manifest + service worker + offline caching of the whole book).
 
-## Structure
+## Repo layout
 
-- `index.html` — the entire app: theme, layout, router, and every chapter's
-  content, all inlined into one file.
-- `manifest.json`, `sw.js`, `icon-*.png` — PWA install/offline support.
+- **`index.html`, `manifest.json`, `sw.js`, `icon-*.png`** — the deployed site.
+  This is the only part GitHub Pages actually serves.
+- **`fragments/`** — the readable source: one plain HTML file per chapter
+  (`ch01.html` ... `ch22.html`, plus `ch00-hub.html` for the index page). This
+  is what to open/diff/edit if you're changing a chapter — not `index.html`
+  directly, which is generated.
+- **`shell/`** — the shared design system all chapters render through:
+  `theme.css` (light/dark tokens), `components.css` (callouts, diagrams,
+  flashcards, tables, accordions), `site.css` (volume-selector styling),
+  `engine.js` (renders the JSON-described diagrams/flashcards, persists the
+  progress checklist), `router.js` (the hash router).
+- **`registry.json`** — chapter metadata (title, part, one-line description,
+  ordering). Drives both the chapter checklist on the index page and the
+  prev/next navigation on each chapter.
+- **`build_spa.py`** — regenerates `index.html` + `manifest.json` + `sw.js`
+  from `fragments/` + `registry.json` + `shell/`. Run this after editing any
+  fragment: `python3 build_spa.py`.
+- **`assemble.py`, `hub_content.py`** — helper modules `build_spa.py` imports
+  (chrome generation, hub-body generation). `assemble.py` also has its own
+  CLI mode for a separate, unrelated publishing target (individual pages as
+  Claude Artifacts) — not used by this repo; only its importable functions
+  are.
+- **`generate_hub.py`** — regenerates `fragments/ch00-hub.html` for that other
+  target; the SPA build calls the same underlying logic directly with its own
+  links, so you don't need to run this for the site itself.
+- **`validate_json_blocks.py`** — sanity-checks every `data-diagram`/
+  `data-cards` JSON blob across all fragments still parses (catches a bad
+  escape before it ships).
 
-## Regenerating
+## Making a change
 
-This site is generated from a separate source project (fragments per chapter +
-a build script). If you have that source tree, `python3 build_spa.py`
-regenerates everything in this folder from scratch.
+1. Edit the relevant file in `fragments/`.
+2. `python3 build_spa.py` to regenerate `index.html`.
+3. Open `index.html` locally (or serve the folder with e.g.
+   `python3 -m http.server`) to check it.
+4. `git add -A && git commit -m "..." && git push` — GitHub Pages rebuilds
+   automatically in well under a minute.

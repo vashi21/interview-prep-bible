@@ -1,0 +1,194 @@
+<p class="lede">A cache is a small, fast copy of your data that sits between your app and a slower system of record. Get the pattern, the eviction policy, and the stampede protection wrong, and the cache stops saving you and starts causing outages instead.</p>
+
+<h2><span class="idx">01</span>Why put a cache in the path at all</h2>
+<p>A cache is a storage layer that holds a copy of data your app reads often, placed somewhere faster to reach than the original source. The original source is usually a database — engineers call it the <strong>system of record</strong>, meaning it is the one copy that is always correct if everything else disagrees with it. The cache is not the system of record. It is a faster, disposable copy.</p>
+<p>Two reasons drive almost every caching decision:</p>
+<ul>
+<li><strong>Latency.</strong> Reading from an in-memory store like Redis or Memcached takes on the order of a millisecond or less. Reading from a disk-backed database, once you add network hops, locking, and disk I/O, is usually slower — often by one or two orders of magnitude, though the exact gap depends on the query and the database.</li>
+<li><strong>Load on the database.</strong> Every read served from the cache is one less query hitting your database. The database is usually the hardest part of your system to scale out, so shaving load off it buys you room everywhere else.</li>
+</ul>
+<p>Two terms you will use constantly for the rest of this chapter:</p>
+<ul>
+<li><strong>Cache hit ratio</strong> — the fraction of read requests served from the cache instead of falling through to the database: <code>hits / (hits + misses)</code>. A cache that only gets hit 10% of the time is adding complexity for almost no benefit.</li>
+<li><strong>TTL (time to live)</strong> — how long a cached entry is treated as valid before it is considered stale and must be refreshed or thrown away.</li>
+</ul>
+<div class="callout"><p>A cache with a low hit ratio is worse than no cache at all: you pay for the extra network hop and the extra piece of infrastructure to operate, and you still send almost all your traffic to the database anyway. Before reaching for a cache, check that the access pattern is actually skewed — a small set of keys read far more often than the rest (a "hot" set). Caching a uniformly-random access pattern rarely pays off.</p></div>
+
+<h2><span class="idx">02</span>Five ways to keep a cache and a database in sync</h2>
+<p>These five patterns split into two separate questions that interviewers often blur together: how do you fill the cache on a <strong>read</strong>, and how do you keep it correct on a <strong>write</strong>? Cache-aside and read-through are read-path answers. Write-through, write-back, and write-around are write-path answers. In practice you pick one from each list and pair them — most systems pair cache-aside with either write-through or write-around.</p>
+
+<h3>Cache-aside (the default)</h3>
+<p>The application code owns the logic. On a read, the app checks the cache first. If the key is there (a <strong>hit</strong>), it returns the value. If not (a <strong>miss</strong>), the app reads the database itself, writes the result into the cache, and then returns it. The cache is "beside" the app, not hidden behind an interface — hence the name.</p>
+<div class="diagram" data-diagram='{
+  "title": "Cache-aside pattern: read path and cache fill",
+  "nodes": [
+    {"id":"client","x":30,"y":250,"w":160,"h":60,"kind":"external","label":"Client"},
+    {"id":"app","x":330,"y":250,"w":180,"h":60,"kind":"compute","label":"App Server"},
+    {"id":"cache","x":680,"y":80,"w":200,"h":70,"kind":"storage","label":"Cache","sub":"Redis / Memcached"},
+    {"id":"db","x":680,"y":400,"w":200,"h":70,"kind":"storage","label":"Primary DB","sub":"system of record"}
+  ],
+  "edges": [
+    {"from":"client","to":"app","label":"1. GET /product/42"},
+    {"from":"app","to":"cache","label":"2. check cache (miss)"},
+    {"from":"app","to":"db","label":"3. read row on miss"},
+    {"from":"app","to":"cache","label":"4. app writes result into cache"},
+    {"from":"cache","to":"app","label":"5. next request: hit"},
+    {"from":"app","to":"client","label":"response"}
+  ]
+}'></div>
+<p><strong>Pick it when:</strong> you want the simplest possible setup and you can tolerate the cache being empty right after a restart or a deploy. This is the default choice for most read-heavy services — a product catalog page, a user profile lookup, a "get post by ID" endpoint. Almost every system that mentions "we cache X" without more detail means cache-aside.</p>
+
+<h3>Read-through</h3>
+<p>Same idea as cache-aside, but the cache-filling logic moves out of your application code and into the caching layer itself. The app only ever talks to the cache; on a miss, the cache library or service fetches from the database on the app's behalf, stores it, and returns it. The app never sees a raw database connection.</p>
+<p><strong>Pick it when:</strong> you want that fetch-on-miss logic centralized and reused across many services instead of copy-pasted into every codebase. Amazon DAX in front of DynamoDB is a real example — it speaks the DynamoDB API, so client code that already talks to DynamoDB can point at DAX instead and gets read-through caching for free, with no code change.</p>
+<div class="callout tradeoff"><p>Read-through and cache-aside solve the same problem and look similar from the outside. The difference is entirely about where the fetch-on-miss code lives — in your app, or inside the cache layer. Don't let an interviewer's "which one is it?" throw you; name the pattern by asking "who calls the database on a miss?"</p></div>
+
+<h3>Write-through</h3>
+<p>Every write goes to the cache, and the cache synchronously writes it through to the database before the write is acknowledged as done. Cache and database are always in sync, because a write does not succeed until both are updated.</p>
+<p><strong>Pick it when:</strong> a read immediately after a write must never see stale data, and your write volume is low enough that doubling the work per write (cache + DB, both on the critical path) is an acceptable cost. An inventory count that gates whether a sale can be made is a good example — you cannot afford a customer completing checkout on stale stock data.</p>
+
+<h3>Write-back (write-behind)</h3>
+<p>A write lands in the cache and is acknowledged immediately. The flush to the database happens later, asynchronously, often batched with other pending writes. This makes writes very fast and lets you batch many small writes into fewer, larger database operations.</p>
+<div class="callout tradeoff"><p>The cost is durability. If the cache crashes before the async flush runs, those writes are gone — they were never in the database. Write-back only makes sense when you have decided, explicitly, that losing the last few seconds of writes on a rare crash is an acceptable trade for much lower write latency and less database load. Say that decision out loud in an interview; don't let it look like an oversight.</p></div>
+<p><strong>Pick it when:</strong> write volume is very high and small data loss is tolerable — a view counter, a "likes" counter, or session activity tracking. Losing the last increment on a crash is not worth a slower system.</p>
+
+<h3>Write-around</h3>
+<p>Writes go straight to the database, skipping the cache entirely. The cache only gets populated later, on a subsequent read, exactly like a cache-aside miss.</p>
+<p><strong>Pick it when:</strong> the data you're writing is unlikely to be read again soon, so pushing it into the cache would just evict something hotter to make room for it. A pipeline ingesting raw analytics events or audit-log entries is a good fit — each record is written once and rarely re-read within the cache's lifetime, so caching it on write would only waste memory.</p>
+<div class="callout say-this"><p>"I'd default to cache-aside for reads and write-around for writes here, since this is a read-heavy catalog and most writes come from a batch import that nobody re-reads right away. I'd only reach for write-through if we find a specific field, like available stock, where read-after-write correctness actually matters."</p></div>
+
+<h2><span class="idx">03</span>Eviction policies: what gets thrown out when the cache is full</h2>
+<p>A cache has a fixed amount of memory. Once it's full, adding a new entry means removing an old one. The eviction policy decides which one.</p>
+<ul>
+<li><strong>LRU (least recently used)</strong> — evict whichever key was read or written longest ago. This is the most common default because "recently used" is usually a good proxy for "will be used again soon." Redis does not keep a perfectly-ordered list of every key by recency, because tracking exact order across millions of keys is expensive — instead it samples a small random set of keys, compares their idle time, and evicts the oldest of that sample. This is an <strong>approximation</strong> of LRU, not a literal one, and Redis documents it as such. Memcached implements LRU too, but per <strong>slab class</strong> — it divides memory into fixed-size chunks ("slabs") grouped by object size, and runs LRU independently within each slab class. A slab holding many small objects can evict aggressively while a slab holding large objects sits mostly idle, which is a real, occasionally surprising quirk of Memcached's memory model.</li>
+<li><strong>LFU (least frequently used)</strong> — evict whichever key has been accessed the fewest times, not the longest ago. This protects a key that's read constantly but happened to go quiet for the last minute — plain LRU would evict it; LFU won't. Redis added LFU support (<code>allkeys-lfu</code> / <code>volatile-lfu</code>) using a small approximate counter per key that increases probabilistically (so it doesn't saturate instantly on a burst) and decays over time (so old popularity fades and doesn't lock a once-hot key in forever).</li>
+<li><strong>FIFO (first in, first out)</strong> — evict whichever key was inserted longest ago, regardless of how often it's been used since. It's the simplest policy to implement — a queue, not a ranking — but it can evict a very hot key just because it happened to be added early. In practice it's rarely the primary policy of a production cache; it shows up more as the mental baseline interviewers use to test whether you understand why LRU is usually better, and in some simple edge/CDN caches where insertion order roughly tracks freshness anyway.</li>
+</ul>
+<div class="callout tradeoff"><p>LFU beats LRU for content with a stable popularity distribution (a small set of items that are always hot), but it costs more to track and can be slow to "forget" an item that used to be popular but no longer is, unless the counter decays. LRU is cheaper and adapts to shifting popularity faster. Most systems default to LRU and only move to LFU after measuring that recency is a bad predictor of future reads for their specific workload.</p></div>
+
+<h2><span class="idx">04</span>Thundering herd: when everyone misses at once</h2>
+<p>A <strong>thundering herd</strong>, also called a <strong>cache stampede</strong>, happens when a single hot key expires or gets evicted, and many concurrent requests for that exact key all miss at the same instant. Every one of them falls through to the database at once. A key that was previously absorbing thousands of requests per second suddenly sends all of them to the database in the same moment — which can look and feel like a self-inflicted outage.</p>
+<p>This isn't only a TTL-expiry problem. It also happens on a cold cache after a deploy, or — as you'll see in the Meta example below — when a cache <em>server</em> fails and every key that lived on it becomes a miss simultaneously.</p>
+<div class="diagram" data-diagram='{
+  "title": "Cache stampede: request coalescing stops the herd",
+  "nodes": [
+    {"id":"clients","x":30,"y":250,"w":210,"h":70,"kind":"external","label":"1000s of Concurrent Requests","sub":"same key, same instant"},
+    {"id":"coalescer","x":340,"y":250,"w":220,"h":70,"kind":"compute","label":"Request Coalescer","sub":"one in-flight fetch per key"},
+    {"id":"cache","x":700,"y":80,"w":220,"h":70,"kind":"storage","label":"Cache","sub":"key just expired"},
+    {"id":"db","x":700,"y":420,"w":220,"h":70,"kind":"storage","label":"Primary DB"}
+  ],
+  "edges": [
+    {"from":"clients","to":"coalescer","label":"N requests for one key"},
+    {"from":"coalescer","to":"cache","label":"1. check cache (miss)"},
+    {"from":"coalescer","to":"db","label":"2. ONE fetch, others wait"},
+    {"from":"coalescer","to":"cache","label":"3. refill with jittered TTL"},
+    {"from":"cache","to":"coalescer","label":"4. all N requests served"}
+  ]
+}'></div>
+<p>Three mitigations actually work in production:</p>
+<ul>
+<li><strong>Locking / request coalescing.</strong> When a key misses, let exactly one request go fetch it from the database. Every other concurrent request for that same key waits for the first one to finish (or gets served a slightly stale value in the meantime) instead of also querying the database. This is usually implemented as a short-lived lock in the cache itself — for example, an atomic "set if not exists" with a TTL acting as a mutex — or, as you'll see below, built directly into the caching server.</li>
+<li><strong>Jittered TTLs.</strong> If you set every cached entry to expire in exactly 60 seconds, and you filled thousands of them at once (say, right after a deploy), they all expire in the same instant — a self-inflicted stampede. Add randomness: expire each key at 60 seconds plus or minus a random few seconds. This spreads the misses out over a window instead of letting them land in one spike.</li>
+<li><strong>Stale-while-revalidate.</strong> Instead of treating an expired entry as unusable, serve it immediately to the requester — it's old, but usually still good enough — while kicking off a background refresh. The next request gets the same stale value until the refresh completes, and no request ever blocks waiting on the database. This is a named directive in HTTP caching (<code>Cache-Control: stale-while-revalidate</code>) and the same idea works in an application-level cache: store a value with two expiry markers, a soft one that triggers a background refresh and a hard one past which the value is truly unusable.</li>
+</ul>
+<div class="callout em-angle"><p>These three mitigations are not mutually exclusive, and a mature system layers all three: jittered TTLs to reduce how often the herd forms, request coalescing to contain it when it does, and stale-while-revalidate so that even the coalesced wait is invisible to the end user. If you're asked to prioritize, coalescing is the one that stops an active incident; the other two are what stop it from happening as often in the first place.</p></div>
+
+<h2><span class="idx">05</span>Redis vs Memcached</h2>
+<p>Both are in-memory key-value stores you'd reach for as a cache. The difference that matters most is how much each one does beyond "store bytes under a key."</p>
+<p><strong>Memcached</strong> is deliberately minimal: values are byte blobs, and the operations are get, set, delete, increment/decrement, and compare-and-swap. That simplicity is a feature — it makes Memcached easy to reason about and lets a single instance use multiple CPU cores, because Memcached has been multi-threaded internally since early in its life. It has no persistence: it is purely in-memory, and a restart empties it completely. It has no server-side clustering either — sharding across a fleet of Memcached servers is done in the client library (usually via consistent hashing, covered in Ch.5) or through a proxy layer placed in front, such as Meta's mcrouter or Twitter's twemproxy.</p>
+<p><strong>Redis</strong> is a data-structure server that happens to work great as a cache. Beyond plain strings, it natively supports lists, hashes (field-value maps), sets, sorted sets (ordered by a score — the backbone of leaderboards and ranked feeds), streams, bitmaps, and geospatial indexes, all with atomic operations. It supports persistence: RDB snapshotting (a periodic point-in-time dump to disk) and/or an AOF write log (every write appended to a file as it happens), which can be combined for stronger durability. Redis Cluster shards data server-side across 16,384 fixed hash slots and replicates each shard, giving you built-in horizontal scaling and failover without a separate proxy layer. The trade-off: Redis's core command execution is mostly single-threaded per instance — this keeps its data-structure operations simple and lock-free, but it also means one slow, expensive command can block every other client talking to that instance while it runs.</p>
+<div class="table-scroll">
+<table class="spec-table compare">
+<thead><tr><th>Concept</th><th>Redis</th><th>Memcached</th></tr></thead>
+<tbody>
+<tr><td>Data model</td><td>Rich structures — strings, lists, hashes, sets, sorted sets, streams, bitmaps, geospatial</td><td>Pure key-value — byte blobs, plus atomic incr/decr and compare-and-swap</td></tr>
+<tr><td>Persistence</td><td>RDB snapshots and/or AOF write log; can survive a restart</td><td>None — purely in-memory, a restart loses everything</td></tr>
+<tr><td>Clustering</td><td>Redis Cluster: server-side sharding across 16,384 hash slots, with built-in replication</td><td>None built-in; client-side consistent hashing, or a proxy (mcrouter, twemproxy) in front</td></tr>
+<tr><td>Concurrency model</td><td>Mostly single-threaded per instance for command execution (I/O threading added in later versions)</td><td>Multi-threaded — a single instance can use multiple CPU cores</td></tr>
+<tr><td>Extra capabilities</td><td>Pub/sub, Lua scripting, transactions, per-key TTL, distributed locks</td><td>Nothing beyond get/set/incr/decr/CAS — deliberately minimal</td></tr>
+<tr><td>Best fit</td><td>Leaderboards, counters, a session store that must survive restarts, rate limiting, pub/sub</td><td>Very large, simple caching layers where raw per-core throughput matters more than features</td></tr>
+</tbody>
+</table>
+</div>
+<div class="callout em-angle"><p>Redis Ltd changed Redis's license in 2024, moving away from the permissive BSD-style terms it used before, to source-available terms (SSPL, then RSALv2) that are not OSI-approved open source. That prompted the Linux Foundation-backed Valkey fork, maintained by the original Redis contributors and several cloud vendors. The story didn't stop there: in May 2025, Redis Ltd reversed course and relicensed Redis 8 under AGPLv3, an OSI-approved open-source license, though still a copyleft one with its own obligations. It's still a legitimate build-vs-buy and vendor-risk question at the EM level for any new system: are you pulling in upstream Redis (and which license version), a managed offering (ElastiCache, MemoryDB), or a fork like Valkey — and how much do you trust that the licensing terms won't shift again?</p></div>
+
+<h2><span class="idx">06</span>Real systems, real trade-offs</h2>
+<h3>Twitter's timeline cache</h3>
+<p>Building a user's home timeline by scanning every account they follow, at read time, doesn't scale — a user following thousands of accounts would trigger thousands of lookups on every page load. Twitter's approach is <strong>fan-out-on-write</strong>: when someone posts, the tweet's ID is pushed into a cached, per-follower list — held in Redis — for every one of that account's followers, at write time. Reading a timeline then means reading one pre-built list of tweet IDs out of the cache, not recomputing anything. The cost moves from read time (expensive, happens on every page load) to write time (still bounded, happens once per post), and full tweet content is hydrated from a separate store afterward. This is the classic trade-off behind fan-out-on-write, which you'll meet again in the Problem Bank chapters: it makes reads cheap at the cost of making a post from a very high-follower account touch a very large number of cached lists.</p>
+<p>Twitter doesn't apply fan-out-on-write uniformly, and this is the detail interviewers probe for most. For celebrity or very-high-follower accounts, pushing one post into millions of follower lists at write time would be too slow and too expensive, so Twitter falls back to <strong>fan-out-on-read</strong> for those accounts specifically: the post is not pre-pushed anywhere, and instead it's merged into a follower's timeline at read time, alongside their pre-built fan-out-on-write list. This hybrid model is the real answer — most accounts use fan-out-on-write, a small set of very-high-follower accounts use fan-out-on-read, and a timeline read merges both. If you're asked to design a timeline cache, naming this hybrid split is what separates a basic answer from an EM-level one.</p>
+
+<h3>Meta's "Scaling Memcache at Facebook" paper</h3>
+<p>This is one of the most cited real-world caching case studies, and it's worth knowing by name (Nishtala et al., NSDI 2013). A few specific techniques from it map directly onto what you just read:</p>
+<ul>
+<li><strong>mcrouter</strong> — a proxy Meta built that sits between web servers and the Memcached fleet, handling connection pooling and routing. It's the same idea as the proxy layer mentioned in the Redis-vs-Memcached section above, at Meta's actual scale.</li>
+<li><strong>Leases, to stop thundering herd.</strong> On a cache miss, Memcached (in Meta's modified version) hands the first requester a lease token. Only the holder of a valid lease is allowed to write the fresh value back to the cache; other concurrent requesters for that same key are told to wait briefly rather than also querying the database. This is server-side request coalescing, built into the cache itself rather than into application code — exactly the first mitigation from Section 04, implemented at the infrastructure layer.</li>
+<li><strong>The gutter pool.</strong> A small standby pool of extra Memcached servers that absorb traffic when a regular Memcached server fails or becomes unreachable. Without it, a single dead cache node would turn every key that lived on it into a simultaneous miss — a stampede caused by infrastructure failure, not by TTL expiry.</li>
+<li><strong>Regional invalidation.</strong> Multiple front-end clusters in a region each run their own Memcached pool but share the same MySQL tier. When data changes, Meta broadcasts a delete to every cluster's cache by watching the MySQL replication stream (the paper calls this component "mcsqueal"), so a write in one cluster doesn't leave stale copies sitting in every other cluster's cache.</li>
+</ul>
+<div class="callout tradeoff"><p>The gutter pool and mcsqueal are real infrastructure investments — extra servers, extra pipelines — that only pay for themselves at Meta's scale. At a smaller scale, an EM-level answer is to recognize that you don't need to rebuild these; a managed cache with built-in cross-zone replication (or a client library with lease-like coalescing) gets you most of the same protection for a fraction of the engineering cost. Know the pattern; don't over-build it before you need it.</p></div>
+
+<h3>Netflix EVCache</h3>
+<p>EVCache is Netflix's open-source caching layer, built on top of Memcached rather than replacing it. What it adds is zone- and region-awareness for AWS: cached data is replicated across multiple availability zones, so a read is always served from a copy in the same zone as the requesting service — avoiding both the extra latency and the data-transfer cost of a cross-zone hop — while writes replicate asynchronously to the other zones for resilience. Netflix has described running EVCache at massive scale across its microservices fleet, reportedly handling on the order of trillions of operations a day, in its own public engineering talks. The underlying lesson is the same one behind Redis Cluster's replication and Meta's gutter pool: at large enough scale, "where is the cache physically located relative to the caller" becomes as important a design question as which eviction policy it runs.</p>
+
+<h2><span class="idx">07</span>Quick reference</h2>
+<div class="specsheet">
+<details>
+<summary><span class="cat">Strategy</span> Read and write caching patterns</summary>
+<div class="specbody">
+<ul>
+<li><strong>Cache-aside</strong> — app checks cache, reads DB and fills cache itself on a miss. The default.</li>
+<li><strong>Read-through</strong> — same as cache-aside, but the cache layer does the fetch-and-fill, hidden from the app.</li>
+<li><strong>Write-through</strong> — write goes to cache, which synchronously writes it to the DB before acknowledging. Always consistent, adds write latency.</li>
+<li><strong>Write-back (write-behind)</strong> — write goes to cache, acknowledged immediately, flushed to the DB later/async. Fast, risks losing recent writes on a crash.</li>
+<li><strong>Write-around</strong> — write goes straight to the DB, bypassing the cache; cache fills later on read. Avoids caching data that won't be re-read soon.</li>
+</ul>
+</div>
+</details>
+<details>
+<summary><span class="cat">Eviction</span> LRU, LFU, FIFO</summary>
+<div class="specbody">
+<ul>
+<li><strong>LRU</strong> — evict the least-recently-used entry. Most common default; Redis approximates it via sampling, Memcached runs it per slab class.</li>
+<li><strong>LFU</strong> — evict the least-frequently-used entry. Better for stable "always hot" items; Redis uses a decaying approximate counter.</li>
+<li><strong>FIFO</strong> — evict the oldest-inserted entry regardless of use. Simplest to implement, rarely the primary policy in production.</li>
+</ul>
+</div>
+</details>
+<details>
+<summary><span class="cat">Stampede</span> Cache stampede mitigations</summary>
+<div class="specbody">
+<ul>
+<li><strong>Locking / request coalescing</strong> — one request fetches on a miss, others wait or get a stale value instead of all hitting the DB.</li>
+<li><strong>Jittered TTLs</strong> — randomize expiry so keys filled together don't all expire in the same instant.</li>
+<li><strong>Stale-while-revalidate</strong> — serve the expired value immediately, refresh in the background, never block a request on the DB.</li>
+</ul>
+</div>
+</details>
+<details>
+<summary><span class="cat">Pick</span> Redis vs Memcached, in one line each</summary>
+<div class="specbody">
+<ul>
+<li><strong>Pick Memcached</strong> when you need a large, simple, pure key-value caching layer and don't need persistence or structured data.</li>
+<li><strong>Pick Redis</strong> when you need atomic operations on structures (sorted sets, lists), durability, replication, pub/sub, or locks — not just a cache, but a small durable data store too.</li>
+</ul>
+</div>
+</details>
+</div>
+
+<div class="flashcards" data-cards='[
+{"q":"What&#39;s the difference between cache-aside and read-through caching?","a":"In cache-aside, the application code checks the cache, and on a miss reads the DB itself and writes the result into the cache. In read-through, the cache layer sits in front of the DB and does that fetch-and-populate itself, so the application only ever talks to the cache."},
+{"q":"When would you pick write-through over write-back?","a":"Pick write-through when the next read must never see stale data and write volume is low enough that the added write latency is fine, e.g. an inventory count. Pick write-back when write throughput matters more than an occasional risk of losing the last few writes on a crash, e.g. view counters."},
+{"q":"What is write-around and when do you use it?","a":"Writes go straight to the DB, skipping the cache; the cache only fills on a later read. Use it for data written once and rarely re-read soon after, like raw event logs, so you don&#39;t push hot data out of the cache to make room for something that won&#39;t be read again."},
+{"q":"How does Redis approximate LRU eviction?","a":"Redis doesn&#39;t keep a perfectly ordered list of every key by recency - too expensive at millions of keys. It samples a small random set of keys, compares their idle time, and evicts the oldest of that sample. It&#39;s an approximation, not a true LRU."},
+{"q":"Why can Memcached&#39;s LRU eviction be uneven across a cache?","a":"Memcached organizes memory into slabs, each sized for a specific range of object sizes, and runs LRU independently inside each slab class. A slab full of small objects can evict aggressively while a slab of large objects sits nearly empty."},
+{"q":"What is a thundering herd, also called a cache stampede?","a":"When a hot key expires or the cache misses, many concurrent requests for that same key all fall through to the DB at once, causing a load spike that can look like an outage."},
+{"q":"Name three real mitigations for cache stampede.","a":"1) Locking or request coalescing - let only one request fetch from the DB while others wait or get a stale value. 2) Jittered TTLs - randomize expiry so keys don&#39;t all expire at the same instant. 3) Stale-while-revalidate - serve the expired value immediately while refreshing it in the background."},
+{"q":"What is a memcached &#39;lease&#39; and what does it prevent?","a":"On a cache miss, Meta&#39;s memcached hands the first requester a lease token; only that token holder is allowed to write the fresh value back. Other concurrent requesters are told to wait briefly instead of also hitting the DB. It&#39;s server-side request coalescing, and it prevents thundering herd."},
+{"q":"What is Facebook/Meta&#39;s &#39;gutter pool&#39; for?","a":"A small standby pool of memcached servers that absorb traffic when a regular memcached server fails, so a dead cache node doesn&#39;t turn into a stampede of requests hitting the DB directly."},
+{"q":"Redis vs Memcached - what&#39;s the core structural difference?","a":"Redis supports rich data structures - lists, hashes, sets, sorted sets, streams - with atomic operations on each. Memcached is a pure key-value store of byte blobs with almost no server-side structure."},
+{"q":"Which of Redis or Memcached has built-in persistence, and how?","a":"Redis does, through RDB snapshotting (periodic point-in-time dumps) and/or an AOF write log (every write appended to a file), which can be combined. Memcached has no built-in persistence - a restart loses everything."},
+{"q":"How does each one scale across multiple servers?","a":"Redis Cluster shards data server-side across 16,384 hash slots with built-in replication. Memcached has no server-side clustering - sharding is done client-side via consistent hashing in the client library, or through a proxy like mcrouter or twemproxy placed in front of it."},
+{"q":"Why is Redis mostly single-threaded for command execution, and what&#39;s the practical risk?","a":"Its core data-structure operations run on one thread per instance, which keeps them simple and atomic without locks. The risk: one expensive command, like scanning a huge collection, can block every other client on that instance while it runs."},
+{"q":"How does Twitter&#39;s timeline cache avoid recomputing a user&#39;s feed on every read?","a":"It uses fan-out-on-write: when someone posts, the tweet ID is pushed into a cached list, in Redis, for every follower&#39;s timeline at write time. Reading a timeline is then just reading that pre-built list, not scanning every followed account at read time."},
+{"q":"What does Netflix&#39;s EVCache add on top of plain Memcached?","a":"Zone- and region-aware replication across AWS availability zones, so reads stay local to a zone - avoiding cross-zone latency and cost - while writes replicate asynchronously to other zones for resilience."}
+]'></div>

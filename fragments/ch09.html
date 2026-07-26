@@ -1,0 +1,258 @@
+<p class="lede">Cassandra throws out the idea of a single leader entirely — every machine in the cluster is an equal peer, which is what lets it keep accepting writes even when whole data centers go dark. Neo4j takes the opposite kind of shortcut: it keeps a normal replication story but changes the data model itself, so a question like "who are my friends' friends" is one query instead of a chain of joins. This chapter covers both in enough depth to defend them in an EM-level interview.</p>
+
+<h2><span class="idx">01</span>What Wide-Column And Graph Databases Actually Change</h2>
+<p>Ch.7 covered MySQL, a single-leader relational database. Ch.8 covers document and key-value stores that still route each shard's writes through one primary. The two databases in this chapter each break that pattern, but in different directions.</p>
+<p><strong>Cassandra</strong> is a <strong>wide-column store</strong> — it still organizes data into tables with rows and columns, but each row can have a different set of columns, unlike a fixed relational schema (that flexibility is truest of the classic Bigtable-style model; a modern CQL-defined Cassandra table declares a fixed set of columns, and a row just skips storage for any column it never sets). There is no leader node at all — any machine in the cluster can accept any write. That single design choice is where almost everything interesting about Cassandra comes from.</p>
+<p><strong>Neo4j</strong> is a <strong>graph database</strong>. It keeps a fairly conventional single-leader replication model under the hood, but it stores data as a network of connected entities instead of tables — so questions about how things relate to each other, not just what their fields contain, become the natural query.</p>
+<p>Both come up constantly in HLD interviews for the same reason: an interviewer wants to see you recognize when a relational or document store is fighting the access pattern, and reach for the tool built for it instead.</p>
+
+<h2><span class="idx">02</span>The Cassandra Ring: No Leader, Every Node Is A Peer</h2>
+<p>Cassandra was built at Facebook and later open-sourced; its design deliberately combines two well-known ideas — the decentralized, peer-to-peer architecture from Amazon's Dynamo, and the wide-column data model from Google's Bigtable. The peer-to-peer part is the one that makes Cassandra behave so differently from MySQL or MongoDB.</p>
+<p>Every node in a Cassandra cluster is arranged on a logical <strong>ring</strong> — an ordered loop of positions, not a physical circle of wires. Each node owns one or more <strong>token</strong> ranges: a token is just a number produced by hashing a row's partition key (the column value that decides which node stores the row) through a <strong>partitioner</strong>. The default partitioner, Murmur3Partitioner, produces tokens across the full 64-bit range, roughly -2^63 to 2^63-1. A row's partition key hashes to one token, and the node that owns the range containing that token is the row's primary owner.</p>
+<p>There is no primary/replica distinction at the node level and no leader coordinating traffic. Any node can receive a client request and act as the <strong>coordinator</strong> for it — the coordinator computes the token for the request's key, works out which nodes actually own that data, and forwards the request there, merging the responses before answering the client. A different request a moment later might land on a completely different node acting as coordinator.</p>
+<p>The <strong>replication factor</strong> (N) sets how many copies of each row exist. With the simplest replication strategy, the coordinator writes to the node that owns the token, plus the next N-1 nodes walking clockwise around the ring. (Real multi-datacenter deployments use a strategy that places N copies per data center instead, so a whole region can go down without losing every replica.) In production, each physical node typically owns many small, scattered token ranges — called <strong>virtual nodes (vnodes)</strong> — rather than one big contiguous range. That spreads load more evenly across the cluster and means adding or removing a node only has to reshuffle a fraction of the data, not renegotiate one huge contiguous boundary.</p>
+<p>Because there is no leader, there is nothing to fail over. If one of the three replica-holding nodes for a key goes down, the coordinator simply writes to the other two — the request still succeeds as long as enough replicas answer (the exact rule is section 05's quorum math). No election, no promotion, no brief window where writes are rejected while a new leader is chosen.</p>
+
+<div class="diagram" data-diagram='{
+  "title": "The Cassandra ring: replicas placed clockwise from the token owner; gossip pairs shown below are illustrative random peers, not a fixed ring order",
+  "nodes": [
+    {"id":"client","x":30,"y":250,"w":140,"h":60,"kind":"external","label":"Client"},
+    {"id":"a","x":635,"y":250,"w":150,"h":60,"kind":"storage","label":"Node A","sub":"coordinator + replica 1 (owns this token)"},
+    {"id":"b","x":530,"y":68,"w":150,"h":60,"kind":"storage","label":"Node B","sub":"replica 2 (next clockwise)"},
+    {"id":"c","x":320,"y":68,"w":150,"h":60,"kind":"storage","label":"Node C","sub":"replica 3 (next clockwise)"},
+    {"id":"d","x":215,"y":250,"w":150,"h":60,"kind":"storage","label":"Node D","sub":"peer, not a replica for this key"},
+    {"id":"e","x":320,"y":432,"w":150,"h":60,"kind":"storage","label":"Node E"},
+    {"id":"f","x":530,"y":432,"w":150,"h":60,"kind":"storage","label":"Node F"}
+  ],
+  "edges": [
+    {"from":"client","to":"a","label":"write user_id=42 — any node can coordinate"},
+    {"from":"a","to":"c","label":"gossip with random peer (this round)"},
+    {"from":"b","to":"e","label":"gossip with random peer (this round)"},
+    {"from":"d","to":"f","label":"gossip with random peer (this round)"}
+  ]
+}'></div>
+
+<div class="callout say-this"><p>"Cassandra does not have a primary node the way MySQL does — every node is a peer, any node can coordinate any request, and the replication factor plus consistency level decide how many copies have to agree, not which node is in charge."</p></div>
+
+<h2><span class="idx">03</span>Gossip: How A Leaderless Cluster Tracks Who Is Alive</h2>
+<p>A ring with no leader still needs every node to agree on who is currently in the cluster, which nodes own which tokens, and which nodes are down. With no central node to hold that list, Cassandra uses a <strong>gossip protocol</strong>: about once a second, each node picks a few random peers and exchanges what it currently knows — cluster membership, node status, token ownership, schema version, and load. It works the way a rumor spreads through a group of people: nobody talks to everybody, there is no central bulletin board, but because each exchange is with a random peer, the information reaches the whole cluster in a small number of rounds — the number of rounds needed grows only logarithmically with cluster size, not linearly.</p>
+<p>Failure detection rides on the same mechanism. Rather than declaring a node dead after one fixed timeout (which false-triggers constantly on a network with normal jitter), Cassandra uses a <strong>Phi Accrual Failure Detector</strong>. It tracks the recent history of how often gossip messages actually arrive from each node and computes a confidence value, called phi, that the node is genuinely down rather than just briefly slow. A higher phi means more confidence; the threshold is configurable, trading faster detection against more false positives.</p>
+<div class="callout"><p>Gossip is also why Cassandra has no separate "membership service" to operate or scale — the membership list is just data that lives inside the same peer-to-peer protocol as everything else, which is consistent with there being no leader anywhere in the design.</p></div>
+
+<h2><span class="idx">04</span>The LSM-Tree Write Path And Why Compaction Has To Exist</h2>
+<p>Cassandra's storage engine is a <strong>Log-Structured Merge-tree (LSM-tree)</strong>. It is built around one rule: never update data in place. That is the opposite of a B-tree engine like MySQL's InnoDB (Ch.7), which finds the exact page a row lives on and rewrites it — usually a random disk seek.</p>
+<p>The write path has two steps, both fast, sequential appends:</p>
+<ul>
+  <li>Append the write to the <strong>commit log</strong> — a write-ahead log on disk, purely for crash recovery. If the node dies, it replays the commit log on restart.</li>
+  <li>Write the same data into the <strong>memtable</strong> — an in-memory, sorted structure holding recent writes for the active data range.</li>
+</ul>
+<p>Both steps are sequential appends: no seek, no read-before-write, no lock contention with other rows. That is the entire reason Cassandra is described as <strong>write-optimized</strong> — the cost of a write does not depend on how much data already exists.</p>
+<p>Once a memtable fills up, it gets flushed to disk as an <strong>SSTable</strong> (Sorted String Table) — a file that, once written, is never modified again. Over time a node accumulates many SSTables. A read for a given key may have to check the memtable and several SSTables, since older and newer versions of the same row can be spread across different files, with the newest timestamp winning. Deletes do not remove anything in place either — a delete writes a <strong>tombstone</strong>, a marker meaning "this was deleted at time T," because the SSTable holding the old value cannot be edited.</p>
+<p>To avoid opening every SSTable on every read, each one carries a <strong>Bloom filter</strong> — a small probabilistic structure that can say a key is definitely not in that file, or maybe is (occasionally wrong in that direction, never wrong the other way). Most reads skip most files without touching disk.</p>
+<p><strong>Compaction</strong> is the background process that keeps this whole system from growing forever: it merges several SSTables into fewer, larger ones, keeping only the newest version of each column and dropping tombstones once they are older than a configured grace period. Two common strategies show the trade-off: <strong>SizeTieredCompactionStrategy</strong> merges similarly-sized SSTables together and is the general-purpose default; <strong>LeveledCompactionStrategy</strong> organizes SSTables into size-bounded levels for more predictable read latency, at the cost of more background I/O.</p>
+
+<div class="callout tradeoff"><p>Write-optimized does not mean free. Compaction is where the bill for cheap writes actually gets paid — it uses real CPU and disk I/O, running in the background, competing with live traffic. Fall behind on compaction (too many pending SSTables) and reads get slower because every read has to check more files; that is the operational cost hiding behind "write-optimized."</p></div>
+
+<h2><span class="idx">05</span>Tunable Consistency: The R + W &gt; N Quorum Math</h2>
+<p>Because there is no leader deciding write order, Cassandra lets each individual read or write choose how many replicas must participate, called its <strong>consistency level</strong>. For a write, <strong>W</strong> is how many replicas must acknowledge before the coordinator tells the client the write succeeded. For a read, <strong>R</strong> is how many replicas must respond (the coordinator returns whichever has the newest timestamp) before the coordinator answers the client. Common levels: <code>ONE</code> (a single replica), <code>QUORUM</code> (a strict majority, <code>floor(N/2) + 1</code>), <code>ALL</code> (every replica), and <code>LOCAL_QUORUM</code> (a quorum within the local data center only, for multi-region deployments).</p>
+<p>The rule that decides whether you get strong consistency is: <strong>if R + W &gt; N, every possible read set and every possible write set are guaranteed to share at least one replica</strong>, so a read is guaranteed to see the most recent acknowledged write. If R + W &le; N, a read set and a write set can miss each other completely — that is eventual consistency, the read will catch up once replication finishes, but there is a window where it can return stale data.</p>
+
+<h3>Worked example: N = 3</h3>
+<p>With three replicas, <code>QUORUM = floor(3/2) + 1 = 2</code>. Call the three replicas <code>{X, Y, Z}</code>.</p>
+<ul>
+  <li><strong>QUORUM write, QUORUM read (W=2, R=2):</strong> R + W = 4 &gt; 3. A write acknowledged by, say, <code>{X, Y}</code>, followed by a read from any 2 of the 3 nodes — even the "worst" pick, <code>{X, Z}</code> or <code>{Y, Z}</code> — is guaranteed to include at least one node from the write set. Two 2-element subsets of a 3-element set cannot both avoid overlapping (2 + 2 = 4, which cannot fit into 3 without sharing at least one element). That guaranteed overlap is what makes this combination strongly consistent.</li>
+  <li><strong>QUORUM write, ONE read (W=2, R=1):</strong> R + W = 3, which equals N, not greater than it — this is the trap. A write acknowledged by <code>{X, Y}</code> followed by a read from <code>Z</code> alone can miss the write entirely, because <code>Z</code> was not in the write set. Equal to N is not enough; it still has to be strictly greater.</li>
+  <li><strong>ONE write, ONE read (W=1, R=1):</strong> R + W = 2 &lt; 3. Lowest latency, highest availability — the write succeeds even with two of the three nodes down — but no overlap guarantee at all. This is plain eventual consistency.</li>
+</ul>
+
+<div class="table-scroll">
+  <table class="spec-table">
+    <caption>N = 3 replicas — every common consistency-level combination, worked out</caption>
+    <thead><tr><th>Write CL (W)</th><th>Read CL (R)</th><th>R + W</th><th>vs N = 3</th><th>Result</th></tr></thead>
+    <tbody>
+      <tr><td>ONE (1)</td><td>ONE (1)</td><td>2</td><td>2 &lt; 3</td><td>Eventual — fastest, no overlap guarantee</td></tr>
+      <tr><td>QUORUM (2)</td><td>ONE (1)</td><td>3</td><td>3 = 3, not &gt;</td><td>Still eventual — the common mistake</td></tr>
+      <tr><td>QUORUM (2)</td><td>QUORUM (2)</td><td>4</td><td>4 &gt; 3</td><td>Strong — every read overlaps every write</td></tr>
+      <tr><td>ALL (3)</td><td>ONE (1)</td><td>4</td><td>4 &gt; 3</td><td>Strong, but the write fails if any 1 replica is unreachable</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<div class="callout say-this"><p>"I would default new writes to QUORUM and reads to QUORUM if the feature needs to read its own latest write — R plus W is 4 against a replication factor of 3, so that combination is strongly consistent. For something like a like-count or a presence indicator, I would drop both to ONE for lower latency, since a few seconds of staleness there costs nothing."</p></div>
+
+<div class="callout tradeoff"><p>This is the CAP theorem (Ch.12) showing up as a per-query dial instead of a whole-database setting. Pushing R and W up toward N buys consistency but costs latency and availability — a write at ALL fails outright if even one replica is down. Pushing them down buys speed and uptime but accepts staleness. Cassandra's real pitch is that you get to choose this trade-off per operation, not once for the whole system.</p></div>
+
+<h2><span class="idx">06</span>Cassandra In Production: Netflix</h2>
+<p><strong>Netflix</strong> has run one of the best-known large Cassandra deployments in the industry for years — many clusters spanning multiple AWS regions, storing things like viewing history and other data that has to keep accepting writes even if an entire AWS region has a bad day. That requirement lines up exactly with what a leaderless, multi-datacenter ring is built for: there is no single-region leader to lose, and <code>NetworkTopologyStrategy</code> (section 02) keeps full replica sets in each region so a region failure does not mean data loss or a manual failover.</p>
+<div class="callout em-angle"><p>An EM-level answer adds the build-vs-buy angle: running a large multi-region Cassandra ring yourself is a real operational commitment — compaction tuning, repair jobs, capacity planning per data center. Managed offerings (DataStax Astra, AWS Keyspaces) trade some of that flexibility for someone else owning the 3am pages, which is often the right call until a team's scale genuinely needs to tune the ring itself.</p></div>
+
+<h2><span class="idx">07</span>HBase In Brief: A Master-Based Wide-Column Store On HDFS</h2>
+<p>HBase is another wide-column store, modeled on Google's Bigtable paper, but it takes the opposite architectural approach from Cassandra. Instead of a leaderless ring, HBase uses a <strong>master/RegionServer</strong> model, and instead of managing its own files on local disk, it stores everything on <strong>HDFS</strong> (the Hadoop Distributed File System) — HBase is part of the Hadoop ecosystem, not a standalone store.</p>
+<p>An <strong>HMaster</strong> handles schema changes and assigns <strong>regions</strong> — contiguous ranges of row keys for a table — to <strong>RegionServers</strong>, which actually serve reads and writes for the regions they own. Each RegionServer uses the same core LSM-tree idea as Cassandra internally (a write-ahead log plus an in-memory MemStore, flushed to immutable HFiles and compacted in the background) — it is the ownership model wrapped around that engine that differs. ZooKeeper coordinates cluster membership and HMaster failover. Because exactly one RegionServer owns a given region at any moment, HBase gives strong, consistent reads and writes per row by default — there is no quorum dial to tune, unlike Cassandra. Facebook's original Messages product famously ran on HBase, a well-known early production use case.</p>
+
+<div class="table-scroll">
+  <table class="spec-table compare">
+    <caption>Cassandra vs HBase — two wide-column stores, opposite architectures</caption>
+    <thead><tr><th>Concept</th><th>Cassandra</th><th>HBase</th></tr></thead>
+    <tbody>
+      <tr><td>Underlying storage</td><td>Manages its own SSTable files directly on local disk</td><td>Layered on HDFS — files live in the Hadoop filesystem</td></tr>
+      <tr><td>Node roles</td><td>No leader; every node is a peer in a masterless ring</td><td>Master/RegionServer: HMaster assigns regions, ZooKeeper coordinates</td></tr>
+      <tr><td>Membership / failure detection</td><td>Gossip protocol + Phi Accrual failure detector</td><td>ZooKeeper heartbeats and session timeouts</td></tr>
+      <tr><td>Consistency</td><td>Tunable per query — eventual by default, strong if R + W &gt; N</td><td>Strong per row by default — one RegionServer owns each region</td></tr>
+      <tr><td>Write path</td><td>Commit log + memtable, flushed to an immutable SSTable</td><td>WAL + MemStore, flushed to an immutable HFile on HDFS</td></tr>
+      <tr><td>Known for</td><td>Netflix-style always-write-available, multi-region workloads</td><td>Hadoop-ecosystem workloads; Facebook's original Messages product</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<h2><span class="idx">08</span>Neo4j And The Property Graph Model</h2>
+<p>A graph database stores data as a network of connected entities rather than tables. Neo4j, the most widely used graph database, is built on the <strong>property graph model</strong>: data is made of <strong>nodes</strong> (entities, like a person or an account) and <strong>relationships</strong> (directed edges between two nodes, like "follows" or "transferred money to"), and both nodes and relationships can carry <strong>labels</strong> (a type tag — a node might be labeled <code>:Person</code>, a relationship typed <code>:FRIENDS_WITH</code>) and their own <strong>properties</strong> (key-value attributes — a <code>:TRANSFERRED_TO</code> relationship might carry an <code>amount</code> and a <code>timestamp</code>, just like a node can). This is different from an RDF triple store, another kind of graph database, which represents everything as plain subject-predicate-object statements without first-class properties on the edges themselves — the property graph model is the one that shows up most in interviews, because it maps naturally onto entities and attributes people already think in.</p>
+<p>Neo4j is queried with <strong>Cypher</strong>, a pattern-matching language: instead of describing a set of rows to filter, you draw the shape you are looking for using an ASCII-art-like syntax — <code>(a)-[:REL]-&gt;(b)</code> reads as "a node <code>a</code>, connected by a <code>REL</code> relationship, to a node <code>b</code>" — and Neo4j finds every match of that shape in the graph.</p>
+<p>The structural reason this is fast is called <strong>index-free adjacency</strong>: every node physically stores direct pointers to its adjacent relationships and neighboring nodes. Walking from a node to its neighbor is a pointer dereference, not an index lookup — its cost does not depend on how big the overall dataset is, only on how many nodes and relationships you actually visit. A relational join, by contrast, typically needs an index lookup per hop, and that lookup's cost is tied to the size of the tables being joined.</p>
+
+<div class="diagram" data-diagram='{
+  "title": "Property graph model: a social graph and a fraud ring, as nodes and relationships",
+  "nodes": [
+    {"id":"alice","x":60,"y":80,"w":140,"h":55,"kind":"storage","label":"Alice","sub":":Person"},
+    {"id":"bob","x":280,"y":40,"w":140,"h":55,"kind":"storage","label":"Bob","sub":":Person"},
+    {"id":"dave","x":280,"y":170,"w":140,"h":55,"kind":"storage","label":"Dave","sub":":Person"},
+    {"id":"carol","x":520,"y":105,"w":140,"h":55,"kind":"storage","label":"Carol","sub":":Person, 2 hops from Alice"},
+    {"id":"acct1","x":60,"y":330,"w":150,"h":55,"kind":"storage","label":"Account 1"},
+    {"id":"acct2","x":340,"y":330,"w":150,"h":55,"kind":"storage","label":"Account 2"},
+    {"id":"acct3","x":200,"y":460,"w":150,"h":55,"kind":"storage","label":"Account 3"},
+    {"id":"device","x":600,"y":330,"w":150,"h":55,"kind":"storage","label":"Device X","sub":"shared fingerprint"}
+  ],
+  "edges": [
+    {"from":"alice","to":"bob","label":":FRIENDS_WITH"},
+    {"from":"bob","to":"carol","label":":FRIENDS_WITH"},
+    {"from":"alice","to":"dave","label":":FRIENDS_WITH"},
+    {"from":"dave","to":"carol","label":":FRIENDS_WITH"},
+    {"from":"acct1","to":"acct2","label":":TRANSFERRED_TO"},
+    {"from":"acct2","to":"acct3","label":":TRANSFERRED_TO"},
+    {"from":"acct3","to":"acct1","label":":TRANSFERRED_TO"},
+    {"from":"acct1","to":"device","label":":USES_DEVICE"},
+    {"from":"acct2","to":"device","label":":USES_DEVICE"}
+  ],
+  "groups": [
+    {"x":20,"y":15,"w":700,"h":230,"label":"Social graph — Carol is a friend-of-friend of Alice, two paths"},
+    {"x":20,"y":300,"w":760,"h":250,"label":"Fraud ring — a transfer cycle plus a shared device fingerprint"}
+  ]
+}'></div>
+
+<h2><span class="idx">09</span>Why A Graph Model Beats Relational Joins</h2>
+<p>The diagram above sets up the two cases interviewers actually ask about: a multi-hop traversal (friends-of-friends), and pattern detection across a network (a fraud ring). Both are the kind of question where a relational engine's per-hop join cost adds up fast, and a graph engine's per-hop pointer walk does not.</p>
+
+<h3>Social graph traversal: friends-of-friends</h3>
+<p>In a relational schema, friendships live in a table like <code>friendships(user_id, friend_id)</code>. Finding second-degree friends means joining that table with itself once per extra hop:</p>
+<pre><code>SELECT DISTINCT f2.friend_id AS fof
+FROM friendships f1
+JOIN friendships f2 ON f2.user_id = f1.friend_id
+WHERE f1.user_id = 123
+  AND f2.friend_id &lt;&gt; 123
+  AND f2.friend_id NOT IN (
+    SELECT friend_id FROM friendships WHERE user_id = 123
+  );</code></pre>
+<p>Going one hop further (third-degree friends) means adding a third self-join on <code>f3.user_id = f2.friend_id</code>, and the intermediate row count can multiply out at every hop before the final filter trims it back down — each person's row can fan out to however many friends they have. That is why plain joins get painful past two or three hops on a table with many rows per user. Some relational engines offer recursive CTEs to express arbitrary-depth traversal in a single query, but under the hood the engine still executes it as repeated joins with no shortcut, and it is typically much slower than a native graph traversal at the same depth.</p>
+<p>The same query in Cypher is one pattern, and adding a hop is one extra segment, not a new join:</p>
+<pre><code>MATCH (me:Person {id: 123})-[:FRIENDS_WITH]-&gt;(:Person)-[:FRIENDS_WITH]-&gt;(fof:Person)
+WHERE fof.id &lt;&gt; 123 AND NOT (me)-[:FRIENDS_WITH]-&gt;(fof)
+RETURN DISTINCT fof</code></pre>
+
+<h3>Fraud-ring detection: cycles and shared attributes</h3>
+<p>Fraud rings tend to show up as one of two graph shapes. The first is a <strong>cycle</strong>: money moves from account A to B to C and back toward A, and you usually do not know the cycle's length ahead of time. The second is a <strong>shared attribute</strong>: accounts that look unrelated — different names, different emails — but point to the same device fingerprint, IP address, or payment card.</p>
+<p>Cypher expresses "a cycle of unknown length" with a <strong>variable-length relationship pattern</strong>:</p>
+<pre><code>MATCH path = (a:Account)-[:TRANSFERRED_TO*2..5]-&gt;(a)
+RETURN path</code></pre>
+<p><code>*2..5</code> means "walk this relationship type between 2 and 5 times." Not knowing the cycle length ahead of time is exactly the case that breaks the SQL self-join approach — you cannot pre-write "the right number" of joins, so you would need a recursive CTE with an explicit cycle guard, and it still has no direct-pointer shortcut between rows the way a graph traversal does.</p>
+<p>The shared-attribute case is a pattern with two accounts pointing at the same node:</p>
+<pre><code>MATCH (a1:Account)-[:USES_DEVICE]-&gt;(d:Device)&lt;-[:USES_DEVICE]-(a2:Account)
+WHERE a1.id &lt;&gt; a2.id
+RETURN a1, a2, d</code></pre>
+<p>On its own that is a plain join on a <code>device_id</code> column in SQL too — not the hard part. The hard part is chaining it: "accounts that share a device with an account that also shares a payment card with a third account" is another self-join per extra hop in SQL, while in Cypher it is one more relationship segment on the same pattern.</p>
+
+<div class="callout tradeoff"><p>Graph databases are excellent at "how are these things connected" questions, and bad at the aggregate, scan-heavy questions a data warehouse is built for — "sum revenue by region for the last quarter across 500 million rows" is not a graph traversal, and Neo4j is not a replacement for the OLAP systems in Ch.10 for that kind of workload.</p></div>
+
+<div class="callout em-angle"><p>Adopting a graph database for one feature, like fraud detection, is rarely a full migration. Most teams keep accounts and transactions in their existing primary store and mirror just the relevant edges — account, device, transfer — into Neo4j using change data capture or an event stream. The build-vs-buy question is really "which slice of our data needs graph traversal," not "should we replace our relational database."</p></div>
+
+<div class="callout say-this"><p>"I would reach for a graph database specifically for the traversal, not as a system of record. I would keep account and transaction data in the primary store and mirror only the account-device-transfer edges into Neo4j, so a fraud query that is three or more hops deep runs in milliseconds instead of timing out a recursive SQL query."</p></div>
+
+<div class="specsheet">
+  <details>
+    <summary><span class="cat">Ring</span> Cassandra ring vocabulary</summary>
+    <div class="specbody">
+      <ul>
+        <li><strong>Token</strong> — a number produced by hashing a row's partition key; decides which node owns the row.</li>
+        <li><strong>Partitioner</strong> — the hash function that produces tokens; Murmur3Partitioner is the default.</li>
+        <li><strong>Vnode</strong> — a node owning many small scattered token ranges instead of one big one, for even load and cheap rebalancing.</li>
+        <li><strong>Coordinator</strong> — whichever node received a given request; any node can play this role.</li>
+        <li><strong>Replication factor (N)</strong> — how many copies of each row the cluster keeps.</li>
+      </ul>
+    </div>
+  </details>
+  <details>
+    <summary><span class="cat">Gossip</span> Membership and failure detection</summary>
+    <div class="specbody">
+      <ul>
+        <li><strong>Gossip round</strong> — about once a second, each node exchanges cluster state with a few random peers.</li>
+        <li><strong>Phi Accrual Failure Detector</strong> — computes a confidence value that a node is down, based on recent heartbeat timing, instead of one fixed timeout.</li>
+      </ul>
+    </div>
+  </details>
+  <details>
+    <summary><span class="cat">LSM</span> The write path and compaction</summary>
+    <div class="specbody">
+      <ul>
+        <li><strong>Commit log</strong> — write-ahead log on disk, used only for crash recovery.</li>
+        <li><strong>Memtable</strong> — in-memory sorted structure holding recent writes.</li>
+        <li><strong>SSTable</strong> — immutable file a full memtable is flushed to.</li>
+        <li><strong>Bloom filter</strong> — per-SSTable check that quickly rules out "key not here," letting most reads skip most files.</li>
+        <li><strong>Tombstone</strong> — a deletion marker, since existing SSTables cannot be edited in place.</li>
+        <li><strong>Compaction</strong> — background merge of SSTables that drops overwritten data and expired tombstones.</li>
+      </ul>
+    </div>
+  </details>
+  <details>
+    <summary><span class="cat">Levels</span> Consistency levels and the quorum formula</summary>
+    <div class="specbody">
+      <ul>
+        <li><strong>ONE</strong> — a single replica. Fastest, weakest guarantee.</li>
+        <li><strong>QUORUM</strong> — <code>floor(N/2) + 1</code> replicas, a strict majority.</li>
+        <li><strong>ALL</strong> — every replica. Strongest guarantee, weakest availability.</li>
+        <li><strong>LOCAL_QUORUM</strong> — a quorum within one data center, for multi-region clusters.</li>
+        <li><strong>Strong consistency rule</strong> — guaranteed only when <code>R + W &gt; N</code>, strictly greater.</li>
+      </ul>
+    </div>
+  </details>
+  <details>
+    <summary><span class="cat">Cypher</span> Property graph basics</summary>
+    <div class="specbody">
+      <ul>
+        <li><strong>Node</strong> — an entity, can carry one or more labels and any number of properties.</li>
+        <li><strong>Relationship</strong> — a directed, typed edge between two nodes; can carry its own properties.</li>
+        <li><strong>Pattern</strong> — Cypher's ASCII-art syntax, <code>(a)-[:REL]-&gt;(b)</code>, matched literally against the graph.</li>
+        <li><strong>Variable-length path</strong> — <code>[:REL*2..5]</code>, walk a relationship type between 2 and 5 times, for unknown-depth traversals or cycles.</li>
+        <li><strong>Index-free adjacency</strong> — each node holds direct pointers to its neighbors, so one hop costs the same regardless of dataset size.</li>
+      </ul>
+    </div>
+  </details>
+</div>
+
+<div class="flashcards" data-cards='[
+  {"q":"What does it mean that Cassandra has no leader?","a":"Every node in the ring is an equal peer. Any node can act as coordinator for any client request, and there is no primary node to fail over when a node dies, because none of them was ever the leader."},
+  {"q":"What is a Cassandra token, and what produces it?","a":"A number produced by hashing a row&#8217;s partition key through a partitioner (Murmur3Partitioner by default). The node owning the token range containing that number is the row&#8217;s primary owner."},
+  {"q":"What problem do virtual nodes (vnodes) solve?","a":"Each physical node owns many small, scattered token ranges instead of one big contiguous one. That spreads load more evenly and means adding or removing a node reshuffles only a fraction of the data."},
+  {"q":"What does Cassandra&#8217;s gossip protocol actually exchange, and how often?","a":"About once a second, each node picks a few random peers and swaps what it knows about cluster state: membership, node status, token ownership, schema version. Information reaches the whole cluster in a small number of rounds with no central registry."},
+  {"q":"How does Cassandra decide a node is actually down, not just slow?","a":"A Phi Accrual Failure Detector tracks the recent history of heartbeat arrival times per node and computes a confidence value (phi) that the node is down, adapting to normal network jitter instead of using one fixed timeout."},
+  {"q":"Why is Cassandra described as write-optimized?","a":"A write is two sequential appends, to the commit log on disk and the memtable in memory, with no read-before-write and no disk seek — unlike a B-tree engine that updates rows in place."},
+  {"q":"Why are Cassandra SSTables immutable?","a":"So a flush never has to lock or rewrite a file that reads are also using. A newer write to the same key just lands in a newer SSTable, and the newest timestamp wins on read."},
+  {"q":"What does compaction do, and why does it have to run?","a":"It merges multiple SSTables into fewer, larger ones, dropping overwritten column versions and expired tombstones. Without it, the number of files a read has to check would keep growing forever."},
+  {"q":"State the quorum rule for strong consistency in Cassandra.","a":"R + W &gt; N, strictly greater, where N is the replication factor, W is how many replicas must acknowledge a write, and R is how many must respond to a read. This guarantees every read set overlaps every write set on at least one replica."},
+  {"q":"N = 3, QUORUM write and QUORUM read — why is this strongly consistent?","a":"QUORUM = floor(3/2) + 1 = 2. R + W = 4, which is greater than 3. Any two 2-out-of-3 subsets of a 3-node set must share at least one node, since 2 + 2 = 4 cannot fit into 3 without overlapping."},
+  {"q":"N = 3, QUORUM write and ONE read — is this strongly consistent?","a":"No. R + W = 2 + 1 = 3, which equals N rather than exceeding it. A write acknowledged by two nodes can be missed entirely by a read from the one node that was not in the write set."},
+  {"q":"Why did Netflix pick Cassandra for large parts of its backend?","a":"Its leaderless, multi-datacenter replication keeps accepting writes even if an entire AWS region fails, without a manual failover — a fit for a global streaming service that cannot have a single-region write bottleneck."},
+  {"q":"What is architecturally different between Cassandra and HBase, despite both being wide-column stores?","a":"Cassandra is a leaderless peer-to-peer ring with tunable consistency. HBase uses a master/RegionServer model on top of HDFS, where exactly one RegionServer owns a given region at a time, giving strong per-row consistency by default instead of a quorum dial."},
+  {"q":"What is the property graph model?","a":"A data model where both nodes (entities) and relationships (edges) carry labels and their own key-value properties. Neo4j is the most widely used database built on this model, queried with the pattern-matching language Cypher."},
+  {"q":"What is index-free adjacency, and why does it matter for multi-hop queries?","a":"Every node stores direct pointers to its adjacent relationships and nodes, so walking one hop is a pointer lookup, not an index lookup. Traversal cost scales with how much of the graph you actually visit, not with the size of the whole dataset."},
+  {"q":"Why does a three-hop friends-of-friends query get painful in SQL but stay simple in Cypher?","a":"SQL needs one more self-join per hop, and each join can multiply the intermediate row count before filtering it back down. Cypher just adds one more relationship segment to the same pattern and walks pointers directly."},
+  {"q":"How would you express a fraud transfer cycle of unknown length in Cypher?","a":"A variable-length relationship pattern, like (a)-[:TRANSFERRED_TO*2..5]-&gt;(a): walk that relationship type between 2 and 5 times and land back on the same node. SQL would need a recursive CTE with an explicit cycle guard and no pointer shortcut."}
+]'></div>

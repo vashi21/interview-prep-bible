@@ -1,0 +1,350 @@
+<p class="lede">Every real system has to answer two boring but critical questions before it can be trusted with real users or real money: who is calling, and can I actually tell what is happening inside myself right now? This chapter covers those two areas — security basics and observability — and then introduces a set of small, reusable components that later Problem Bank chapters will simply refer to by name instead of re-explaining from scratch.</p>
+
+<h2><span class="idx">01</span>Authentication vs Authorization: Two Different Questions</h2>
+<p><strong>Authentication</strong> (often shortened to "authN") answers one question: <strong>who are you?</strong> It is the act of proving your identity. Typing a password to log into your email is authentication — the system is checking that you really are the person who owns that account, usually by checking a secret only you should know (a password), something only you should have (a phone getting a code), or something only you are (a fingerprint).</p>
+<p><strong>Authorization</strong> (often shortened to "authZ") answers a completely different question: <strong>what are you allowed to do?</strong> It runs after authentication, on someone whose identity is already known and trusted. If you log into a shared document tool and try to open a folder that belongs to a different user, the system already knows exactly who you are — it just will not let you do that specific thing. That is authorization, checking permissions on an identity that authentication already confirmed.</p>
+<p>Keep these sharply separate in your head, because interviewers deliberately probe the boundary between them. A login failure ("wrong password") is an authentication problem. A logged-in user hitting a "you don't have permission" error is an authorization problem. The two almost always sit as separate checks in a real system, often even as separate services.</p>
+<div class="callout say-this"><p>"Authentication proves who you are — logging in with a password is the classic example. Authorization decides what you're allowed to do once you're known — blocking a logged-in user from opening someone else's private file is the classic example. A system can authenticate someone perfectly and still be right to refuse them almost everything."</p></div>
+
+<h2><span class="idx">02</span>OAuth2 And OIDC: Delegated Access, Then Identity On Top</h2>
+<h3>OAuth2: Letting An App Act On Your Behalf, Without Your Password</h3>
+<p>Imagine a photo-printing app that wants to print photos straight from your Google Photos account. Before OAuth2 existed, the only way to do that was to hand the printing app your actual Google username and password. That is dangerous: the printing app could now do literally anything your account can do — read your email if it's the same login, change your password, delete your photos — forever, until you notice and change your password.</p>
+<p><strong>OAuth2</strong> is the framework that fixes this. It is not primarily about login — it is about <strong>authorization</strong>: a user (OAuth2 calls this the <strong>resource owner</strong>) grants a third-party application (the <strong>client</strong>) a limited, revocable token that only allows specific, listed actions, called <strong>scopes</strong> (for example "read your photos," but not "delete your account"). That token is issued by an <strong>authorization server</strong> the user already trusts — here, Google — and the third-party app never sees the user's actual Google password at any point.</p>
+<h3>The Authorization Code Flow, Step By Step</h3>
+<p>The most common OAuth2 flow is the <strong>authorization code flow</strong>. You don't need to memorize every OAuth2 grant type to do well in an interview — you need to be able to describe this one flow out loud, cleanly, because it is the one that actually shows up in system designs.</p>
+<ol>
+  <li>The photo-printing app redirects the user's browser to Google's own login-and-consent screen, along with which app is asking (a <code>client_id</code>) and which specific scopes it wants.</li>
+  <li>The user logs into Google (if not already) and sees exactly what is being requested — "this app wants to read your photos" — and approves it.</li>
+  <li>Google redirects the browser back to the app with a short-lived <strong>authorization code</strong> in the URL. This code is not the access token yet, and it expires within minutes.</li>
+  <li>The app's own backend server — not the browser — calls Google's token endpoint directly, sending that code plus the app's own secret <strong>client secret</strong>, which only the app's backend knows. Google exchanges the code for an <strong>access token</strong>.</li>
+  <li>The app calls Google's Photos API using that access token to actually fetch the photos.</li>
+</ol>
+<p>The reason this works safely with a browser sitting in the middle is that the access token itself never touches the browser or the URL bar. Only the short-lived, single-use code does — and turning that code into a real token requires the client secret, something only the app's own backend holds. A stolen code alone is close to useless.</p>
+
+<div class="diagram" data-diagram='{
+  "title": "OAuth2 authorization code flow: a photo app requesting access to Google Photos",
+  "nodes": [
+    {"id":"browser","x":30,"y":250,"w":170,"h":70,"kind":"external","label":"User (browser)"},
+    {"id":"app","x":300,"y":250,"w":190,"h":80,"kind":"compute","label":"Photo App (Client)","sub":"wants read access to photos"},
+    {"id":"authserver","x":650,"y":90,"w":210,"h":80,"kind":"external","label":"Google Auth Server","sub":"login + consent screen"},
+    {"id":"api","x":650,"y":420,"w":210,"h":80,"kind":"external","label":"Google Photos API","sub":"resource server"}
+  ],
+  "edges": [
+    {"from":"browser","to":"authserver","label":"1. redirected to /authorize with client_id + scopes"},
+    {"from":"authserver","to":"browser","label":"2. user approves, redirected back with a short-lived code"},
+    {"from":"browser","to":"app","label":"3. code arrives at the redirect endpoint"},
+    {"from":"app","to":"authserver","label":"4. server-to-server: trade code + client secret for access token"},
+    {"from":"app","to":"api","label":"5. call Photos API with the access token"},
+    {"from":"api","to":"app","label":"6. returns the requested photos"}
+  ],
+  "groups": [
+    {"x":630,"y":70,"w":250,"h":450,"label":"Google: authorization server + resource server (two roles, one company)"}
+  ]
+}'></div>
+
+<h3>OIDC: Adding "Who Is This User" On Top</h3>
+<p>OAuth2, by itself, only proves that an app was granted some access — it doesn't standardize a way to answer "who exactly is logged in right now," which turns out to be something a lot of apps also need, for example any "Sign in with Google" button. <strong>OpenID Connect (OIDC)</strong> is a thin identity layer built directly on top of OAuth2's own flow. It adds a new kind of token, the <strong>ID token</strong>, which is a JWT (covered next) carrying standardized identity claims: <code>sub</code> (a stable, unique user ID), <code>email</code>, <code>name</code>, <code>iss</code> (which authorization server issued it), <code>aud</code> (which app it's meant for), and <code>exp</code> (when it expires). Because it's a JWT, the app can verify it locally, with no extra network call, and trust the identity claims inside.</p>
+<div class="callout say-this"><p>"OAuth2 answers 'can this app act on this data on my behalf.' OIDC answers 'who is this person logging in.' They run over the same authorization code flow, and most providers implement both together — but they're solving genuinely different problems."</p></div>
+
+<h2><span class="idx">03</span>JWT vs Server-Side Sessions</h2>
+<p>Once a user is authenticated, a system needs some way to remember that on every later request, without asking them to log in again on every single page. There are two dominant approaches, and they make almost opposite trade-offs.</p>
+<h3>What A JWT Actually Contains</h3>
+<p>A <strong>JWT</strong> (JSON Web Token) is a single string made of three parts joined by dots: <code>header.payload.signature</code>. Each part is base64url-encoded, and none of it is encrypted by default — anyone can decode and read a JWT's contents, they just can't change them undetected.</p>
+<ul>
+  <li><strong>Header</strong> — which algorithm signed the token (for example <code>HS256</code> or <code>RS256</code>) and that it is a JWT.</li>
+  <li><strong>Payload</strong> — the actual <strong>claims</strong>: standard ones like <code>sub</code> (subject, usually the user ID), <code>iss</code> (issuer), <code>exp</code> (expiry time), plus whatever custom data the app wants to embed, like a <code>role</code> field.</li>
+  <li><strong>Signature</strong> — computed over the header and payload using a secret (HMAC, symmetric: the same secret signs and verifies) or a private key (RSA/ECDSA, asymmetric: a private key signs, a matching public key verifies).</li>
+</ul>
+<p><strong>Verifying a JWT is a signature check, not a database lookup.</strong> The server recomputes the signature over the header and payload using the key it already has, and compares it to the signature attached to the token. If they match, the content hasn't been altered since it was signed, and the server trusts the claims inside — no network call, no shared storage, no round trip to anywhere. Any server holding the right key can verify any valid token completely on its own.</p>
+<h3>Server-Side Sessions</h3>
+<p>A <strong>server-side session</strong> works the opposite way. At login, the server generates a random, meaningless <strong>session ID</strong> and stores the actual session data — user ID, roles, whatever the app needs — server-side, keyed by that ID, typically in a shared store like Redis so every app server can reach it. The client holds only the opaque ID, usually in a cookie. On every request, the server takes that ID and looks the session up in the shared store before it knows anything at all about who's calling.</p>
+<div class="table-scroll">
+  <table class="spec-table compare">
+    <caption>JWT vs. server-side session</caption>
+    <thead><tr><th></th><th>JWT</th><th>Server-side session</th></tr></thead>
+    <tbody>
+      <tr><td>What the client holds</td><td>The full signed token itself (header.payload.signature)</td><td>Just an opaque, random session ID, usually in a cookie</td></tr>
+      <tr><td>What a server checks per request</td><td>The signature, using a key it already has — no network call</td><td>A lookup against the shared session store</td></tr>
+      <tr><td>Scaling across many stateless servers</td><td>Easy — any server holding the verification key can check any token alone</td><td>Needs a shared, centrally reachable store (e.g. Redis) every server can query</td></tr>
+      <tr><td>Revoking access before expiry</td><td>Hard — the token stays valid until its own <code>exp</code> claim, unless you add an extra revocation list</td><td>Trivial — delete the one record, the very next lookup fails</td></tr>
+      <tr><td>Typical home</td><td>APIs and microservices talking to many independent backends</td><td>Classic server-rendered web apps with one shared backend</td></tr>
+    </tbody>
+  </table>
+</div>
+<div class="callout tradeoff"><p>This is the real trade-off, not a style preference. JWTs scale statelessly — no shared storage, any server can verify any token — but they're genuinely hard to revoke before expiry; a stolen JWT stays valid until it naturally expires unless you build and check an extra revocation list, which quietly brings back the very per-request lookup you were trying to avoid. Sessions are trivially revocable — delete one row — but every server now depends on one shared, always-up session store, which is its own availability and scaling problem.</p></div>
+
+<h2><span class="idx">04</span>Encryption At Rest vs In Transit</h2>
+<p><strong>Encryption at rest</strong> protects data while it sits on a disk — a database's data files, a backup, an object in S3. It defends against someone who gets raw access to the storage itself without going through your application: a stolen laptop, a leaked backup file, a compromised storage snapshot, a decommissioned hard drive that wasn't wiped. Without it, anyone who gets that raw file can just read the data directly, bypassing every access check your application normally enforces.</p>
+<p><strong>Encryption in transit</strong> protects data while it moves across a network, between two points. It defends against someone intercepting the connection itself: an eavesdropper on public Wi-Fi, a compromised router along the path, a classic man-in-the-middle sitting between the client and the server. <strong>TLS</strong> (Transport Layer Security) is the concrete, everyday example — HTTPS is simply HTTP running over TLS. A TLS handshake uses asymmetric cryptography (a certificate and a public key) to safely agree on a shared secret key, then switches to fast symmetric encryption for the actual data, because symmetric encryption is far cheaper to compute at the volume a real connection needs.</p>
+<p>These two protect against different attackers at different points, and a real system needs both. Encrypting a database's files at rest does nothing if the connection between your app and that database sends the same data in plain text over the wire. TLS on every connection does nothing if someone just copies the unencrypted database file straight off a compromised disk.</p>
+<div class="callout em-angle"><p>Turning on encryption itself — at-rest encryption on a managed database, or TLS on a load balancer — is nearly free on modern cloud infrastructure, and rarely the actual design decision in an interview. The EM-level angle is <strong>key management</strong>: who holds the encryption keys, can they be rotated without downtime, and does a compromised application server also hand an attacker the keys to everything it touches.</p></div>
+
+<h2><span class="idx">05</span>API Security Basics: Keys And Per-Key Rate Limiting</h2>
+<p>An <strong>API key</strong> is a long, unique, hard-to-guess string that identifies which application or integration is calling — for example, a payments platform issuing one API key per merchant account. It is not a login credential for a human; it's an identifier for a piece of software, usually sent in a request header (like <code>Authorization: Bearer &lt;key&gt;</code>) rather than a URL query string, since anything in a URL tends to end up logged in plain text by proxies and browser history. A good API key setup lets you scope each key to specific permissions, revoke any single key independently of all the others, and rotate keys periodically without a hard cutover. One of the most common real-world security incidents is simply a live API key accidentally committed to a public source repository.</p>
+<p><strong>Rate limiting per key</strong> uses exactly the algorithms covered in Ch.5 — token bucket, leaky bucket, fixed window, sliding window — the only change is what the counter is keyed by. Instead of keying by client IP, you key by API key ID, so each integration gets its own independent quota. This matters for two reasons: many real users can legitimately share one IP (behind an office or mobile carrier NAT), so IP-based limits punish innocent bystanders, and one misbehaving integration on one key should never be able to eat into a different customer's quota. The response mechanics are the same ones already covered for GitHub's API in Ch.5 — a <code>429 Too Many Requests</code> status, with headers telling the caller its remaining quota and when it resets.</p>
+<div class="callout say-this"><p>"I'd rate limit per API key, not per IP, because in a public API many legitimate users can share one IP behind a corporate NAT, while one abusive integration on one key shouldn't be able to starve out a completely different customer's quota."</p></div>
+
+<h2><span class="idx">06</span>The Three Pillars Of Observability</h2>
+<p>Once a system is running in production, "does it work" stops being a yes/no question and becomes "can I actually tell what it's doing right now, and why." Three tools answer that, and each is genuinely good at a different part of the question.</p>
+<ul>
+  <li><strong>Logs</strong> — discrete, timestamped events, usually text: "at 14:32:07.412, request abc123 failed with this exact stack trace." Logs carry the full raw detail of one specific moment. They are the tool for digging into exactly what happened during one specific, unusual incident, because nothing else keeps that level of per-event detail.</li>
+  <li><strong>Metrics</strong> — numeric aggregates over time: counters (total requests), gauges (current memory use), histograms (the distribution of request latencies, which is where a "p99 latency" number comes from). Metrics are cheap to store and query even at huge volume, because you're storing pre-aggregated numbers instead of every raw event. They are the natural tool for dashboards, alert thresholds ("page someone if error rate exceeds 1% for five minutes"), and long-term trend lines.</li>
+  <li><strong>Traces</strong> — the path of one single request as it moves across multiple services, stitched together from timed <strong>spans</strong> (one span per unit of work — one service's handling of the request, or one database call) that all share one <strong>trace ID</strong>. Traces are the tool for finding which specific hop in a multi-service call chain is slow or failing, something a metric can't show (it only tells you something, somewhere, got slower) and a single service's own logs can't show either (they only see their own piece of the request).</li>
+</ul>
+<p>A worked example ties all three together. A metrics dashboard shows checkout p99 latency jumped from 200ms to 900ms across the whole fleet — that's the metric doing its job, flagging that <em>something</em> is wrong. You pull a trace for one slow request from that time window and see it spent 650ms of its 900ms specifically inside the Payment Service — that's the trace doing its job, narrowing down <em>where</em>. You then pull the Payment Service's own logs around that exact timestamp and find the slow query or stack trace that explains <em>why</em> — that's the log doing its job. No single pillar answers the whole question alone.</p>
+
+<div class="diagram" data-diagram='{
+  "title": "One checkout request, three services, one trace ID",
+  "nodes": [
+    {"id":"client","x":30,"y":250,"w":140,"h":60,"kind":"external","label":"Client"},
+    {"id":"gateway","x":230,"y":250,"w":150,"h":60,"kind":"compute","label":"API Gateway","sub":"trace_id=9f21 starts here"},
+    {"id":"order","x":440,"y":250,"w":150,"h":60,"kind":"compute","label":"Order Service"},
+    {"id":"payment","x":650,"y":120,"w":160,"h":60,"kind":"compute","label":"Payment Service","sub":"span: 240ms (slow)"},
+    {"id":"inventory","x":650,"y":380,"w":160,"h":60,"kind":"compute","label":"Inventory Service","sub":"span: 8ms"},
+    {"id":"paymentdb","x":860,"y":120,"w":120,"h":60,"kind":"storage","label":"Payment DB"}
+  ],
+  "edges": [
+    {"from":"client","to":"gateway","label":"1. POST /checkout"},
+    {"from":"gateway","to":"order","label":"2. span: 6ms"},
+    {"from":"order","to":"payment","label":"3. span: 240ms (slow)"},
+    {"from":"order","to":"inventory","label":"4. span: 8ms"},
+    {"from":"payment","to":"paymentdb","label":"5. query: 210ms"}
+  ],
+  "groups": [
+    {"x":210,"y":90,"w":790,"h":370,"label":"All spans share trace_id=9f21"}
+  ]
+}'></div>
+
+<div class="callout say-this"><p>"I'd reach for a trace first here, not logs — a metric only told me latency went up somewhere, and with five services in the call path I don't want to grep through five separate log streams to find which one. The trace tells me exactly which hop to look at before I open a single log line."</p></div>
+
+<h2><span class="idx">07</span>SLI vs SLO vs SLA</h2>
+<p>These three terms describe the same underlying idea at three different altitudes, and interviewers love asking for all three because mixing them up is a common, easy-to-spot mistake.</p>
+<ul>
+  <li><strong>SLI</strong> (Service Level Indicator) — a directly measured number. "Checkout API p99 latency" is an SLI. It's just a metric, with no judgment attached to it yet.</li>
+  <li><strong>SLO</strong> (Service Level Objective) — your team's internal target for that indicator. "p99 latency under 300ms for 99.9% of a rolling 30-day window" is an SLO. It's a goal the team sets for itself, used to decide when to slow down new feature work and prioritize reliability instead.</li>
+  <li><strong>SLA</strong> (Service Level Agreement) — the external, often contractual promise, usually looser than the internal SLO on purpose, with real consequences spelled out for missing it. "p99 latency under 500ms, or the customer gets a 10% service credit for that billing period" is an SLA.</li>
+</ul>
+<div class="table-scroll">
+  <table class="spec-table compare">
+    <caption>SLI, SLO, and SLA for the same metric: checkout API p99 latency</caption>
+    <thead><tr><th></th><th>SLI</th><th>SLO</th><th>SLA</th></tr></thead>
+    <tbody>
+      <tr><td>What it is</td><td>The measured indicator itself</td><td>Your internal target for that indicator</td><td>The external, often contractual promise</td></tr>
+      <tr><td>Who sets it</td><td>Whoever instruments the metric</td><td>The team that owns the service</td><td>Sales, legal, or a signed customer contract</td></tr>
+      <tr><td>Example value</td><td>p99 latency right now: 220ms</td><td>p99 under 300ms for 99.9% of a rolling 30 days</td><td>p99 under 500ms, or a 10% service credit that billing period</td></tr>
+      <tr><td>Consequence if missed</td><td>None by itself — it's just a number</td><td>Internal: slow down features, prioritize reliability work</td><td>External: a real, often financial, consequence in the contract</td></tr>
+    </tbody>
+  </table>
+</div>
+<div class="callout em-angle"><p>The SLO (300ms) is deliberately tighter than the SLA (500ms) for the exact same metric. That gap is a safety margin, not an accident — it gives the team room to notice a regression and react, by rolling back a bad deploy or paging someone, before the system actually breaches the looser, consequence-bearing promise made to a paying customer.</p></div>
+
+<h2><span class="idx">08</span>Reusable Building Block: Unique ID Generation</h2>
+<p>This is the first of several small components that later Problem Bank chapters will reference by name instead of re-explaining. Almost every system needs to hand out unique IDs — for orders, posts, messages, users — and there are four common ways to do it, each with a different trade-off along three dimensions: does it give you global ordering, how much coordination does it need between machines, and how big is the resulting ID.</p>
+<h3>Database Auto-Increment</h3>
+<p>The simplest option: let the database itself hand out the next integer (MySQL's <code>AUTO_INCREMENT</code>, Postgres's <code>SERIAL</code>). It's ordered by construction and needs zero extra code. It breaks the moment you shard the table across multiple database instances (Ch.6) — two shards generating IDs independently either collide or lose any global ordering, because each one only knows its own local counter.</p>
+<h3>UUID</h3>
+<p>A <strong>UUID</strong> (Universally Unique Identifier) is a 128-bit value, usually written as 36 characters like <code>f47ac10b-58cc-4372-a567-0e02b2c3d479</code>. The common version, UUIDv4, is generated from randomness alone, with no coordination between machines at all — the collision probability is astronomically small. The cost: it's random, so it carries no time or ordering information, and it's 16 bytes versus 8 for a plain integer. A random primary key also hurts insert performance on a B-tree index (Ch.7), since new rows land scattered across the tree instead of always appending at the end.</p>
+<h3>Twitter Snowflake ID</h3>
+<p>A <strong>Snowflake ID</strong> is a single 64-bit integer built by concatenating a few fields together, so that the number itself carries structure:</p>
+<pre><code>64-bit Snowflake ID (conceptual layout)
+1 bit    sign bit, always 0 (keeps it a positive number)
+41 bits  timestamp — milliseconds since a custom epoch, not 1970
+10 bits  machine / worker ID — assigned once per host at startup
+12 bits  per-millisecond sequence — increments if one machine
+         generates more than one ID within the same millisecond
+</code></pre>
+<p>Because the timestamp bits sit at the most significant end of the number, plain numeric comparison roughly sorts Snowflake IDs by creation time, across every machine generating them — with no central coordinator involved at ID-generation time. The only coordination needed is a one-time step: making sure each machine gets its own worker ID, usually assigned once at startup. The trade-off is a dependency on roughly synchronized clocks; if a machine's clock jumps backward, it has to pause or handle the collision carefully rather than mint an ID that looks earlier than one it already issued.</p>
+<h3>Dedicated Ticket Server</h3>
+<p>A <strong>ticket server</strong> is a small, separate service whose only job is issuing IDs — a classic example is Flickr's approach, a database table with a single auto-increment column that every request bumps and reads back. It guarantees strict global ordering if it's backed by one counter, but every ID now costs a network round trip (a real cost, mitigated in practice by handing out IDs in pre-allocated blocks, so a caller can grab 1,000 IDs at once and hand them out locally), and it's a new single point of failure unless it runs as a small, highly-available cluster.</p>
+<div class="table-scroll">
+  <table class="spec-table compare">
+    <caption>Four ways to generate a unique ID</caption>
+    <thead><tr><th></th><th>DB auto-increment</th><th>UUID (v4)</th><th>Snowflake ID</th><th>Ticket server</th></tr></thead>
+    <tbody>
+      <tr><td>Global ordering</td><td>Yes, but only within one database</td><td>No — random, no time relationship</td><td>Roughly — sorts close to creation order</td><td>Yes, if backed by one counter</td></tr>
+      <tr><td>Coordination needed</td><td>None per ID, but breaks once you shard</td><td>None, ever — fully local generation</td><td>One-time, to assign each machine a worker ID</td><td>A network round trip per ID (or per batch)</td></tr>
+      <tr><td>Typical size</td><td>4 or 8 bytes</td><td>16 bytes</td><td>8 bytes</td><td>Typically 8 bytes</td></tr>
+      <tr><td>Works across shards</td><td>No, by itself</td><td>Yes</td><td>Yes</td><td>Yes</td></tr>
+    </tbody>
+  </table>
+</div>
+<div class="callout tradeoff"><p>Pick UUID when you just need uniqueness and never plan to sort or scan by ID. Pick Snowflake when you need IDs that are roughly time-ordered and compact across many app servers with no shared bottleneck — the standard choice for a high-write, sharded system. Auto-increment is fine right up until the day you shard. A ticket server earns its network hop only when you need strict, provable global ordering that Snowflake's "roughly ordered" isn't good enough for.</p></div>
+
+<h2><span class="idx">09</span>Reusable Building Block: Geohashing And Quad-Trees</h2>
+<p>Both of these solve the same problem: <strong>proximity search</strong> — given a location, find everything nearby, without comparing against every single point in the database. The core idea they share is turning a 2D location (latitude, longitude) into a representation that's sortable or indexable as roughly one dimension, so a "nearby" query becomes a cheap prefix or range lookup instead of an expensive scan.</p>
+<h3>Geohash</h3>
+<p>A <strong>geohash</strong> recursively divides the map into a grid and encodes each cell as a string (using base-32 characters). Each extra character narrows the location into a smaller sub-cell. The useful property: two points that are physically close usually share a long common prefix in their geohash string (with some edge cases right at cell boundaries, where two nearby points can land in adjacent cells with different prefixes). That turns "find nearby points" into "find rows whose geohash column starts with a matching prefix" — a query a plain B-tree index (Ch.7) already handles, no special spatial data structure required.</p>
+<h3>Quad-Tree</h3>
+<p>A <strong>quad-tree</strong> recursively splits a 2D area into four quadrants, but only where it's actually needed. A dense area, like Manhattan, gets subdivided many times into small cells; a sparse area, like the middle of an ocean, stays as one large cell. This adapts naturally to uneven data density — something a fixed-precision geohash can't do, since every cell at a given geohash string length is the same fixed size, whether it covers a crowded city block or an empty field.</p>
+<div class="table-scroll">
+  <table class="spec-table compare">
+    <caption>Geohash vs. quad-tree for proximity search</caption>
+    <thead><tr><th></th><th>Geohash</th><th>Quad-tree</th></tr></thead>
+    <tbody>
+      <tr><td>Core representation</td><td>One string per point — more shared characters means physically closer</td><td>A tree of nested rectangles, split only where points are dense</td></tr>
+      <tr><td>Where it lives</td><td>A normal indexed string column in an existing database</td><td>Its own tree structure, built and kept in memory or a specialized store</td></tr>
+      <tr><td>Handles uneven density</td><td>No — every cell at a given precision is the same fixed size</td><td>Yes — dense areas subdivide further, sparse areas stay as one cell</td></tr>
+      <tr><td>Nearby query becomes</td><td>A prefix match on the geohash column</td><td>A tree walk that only descends into relevant rectangles</td></tr>
+    </tbody>
+  </table>
+</div>
+<p>A well-known real-world evolution of the same idea is Uber's H3 grid system, which uses hexagonal cells instead of square ones specifically to avoid the distance distortion that happens near the corners of a square cell. Whichever one you name in an interview, the point to make out loud is the same: you're converting geography into something a normal index can search.</p>
+
+<h2><span class="idx">10</span>Reusable Building Block: Trie-Based Typeahead</h2>
+<p>A <strong>trie</strong> (pronounced "try," from "retrieval") is a tree where each node represents one character, and the path from the root down to any node spells out a prefix. It is a natural fit for prefix-based autocomplete for a simple structural reason: every node in a trie already represents one exact prefix, and everything stored underneath that node is, by construction, every word in the whole dictionary that starts with it. Typing one more letter is just walking one more edge down the tree — the lookup cost depends only on how many characters the user has typed, not on how many words exist in the whole dictionary.</p>
+
+<div class="diagram" data-diagram='{
+  "title": "Trie for prefix search: car, care, cat, cats, code",
+  "nodes": [
+    {"id":"root","x":440,"y":20,"w":120,"h":50,"kind":"storage","label":"root","sub":"prefix: (empty)"},
+    {"id":"c","x":440,"y":110,"w":100,"h":50,"kind":"storage","label":"c"},
+    {"id":"ca","x":280,"y":200,"w":100,"h":50,"kind":"storage","label":"ca"},
+    {"id":"co","x":600,"y":200,"w":100,"h":50,"kind":"storage","label":"co"},
+    {"id":"car","x":150,"y":290,"w":100,"h":50,"kind":"storage","label":"car","sub":"complete word"},
+    {"id":"cat","x":410,"y":290,"w":100,"h":50,"kind":"storage","label":"cat","sub":"complete word"},
+    {"id":"cod","x":600,"y":290,"w":100,"h":50,"kind":"storage","label":"cod"},
+    {"id":"care","x":150,"y":400,"w":110,"h":50,"kind":"storage","label":"care","sub":"complete word"},
+    {"id":"cats","x":410,"y":400,"w":110,"h":50,"kind":"storage","label":"cats","sub":"complete word"},
+    {"id":"code","x":600,"y":400,"w":110,"h":50,"kind":"storage","label":"code","sub":"complete word"}
+  ],
+  "edges": [
+    {"from":"root","to":"c","label":"c"},
+    {"from":"c","to":"ca","label":"a"},
+    {"from":"c","to":"co","label":"o"},
+    {"from":"ca","to":"car","label":"r"},
+    {"from":"ca","to":"cat","label":"t"},
+    {"from":"co","to":"cod","label":"d"},
+    {"from":"car","to":"care","label":"e"},
+    {"from":"cat","to":"cats","label":"s"},
+    {"from":"cod","to":"code","label":"e"}
+  ],
+  "groups": [
+    {"x":140,"y":190,"w":390,"h":270,"label":"Typing the prefix ca lands here; everything below is a candidate completion"}
+  ]
+}'></div>
+
+<p>At real scale, a production typeahead service doesn't walk the whole subtree live on every single keystroke — that would mean scanning potentially thousands of nodes for a popular short prefix, on every character the user types, for every user typing at once. Instead, the common approach precomputes and caches the top-K most popular completions at each node (or in a separate cache keyed by prefix), refreshed periodically from real usage data, so a live request is just a cache read.</p>
+<div class="callout em-angle"><p>The interesting engineering problem in a real typeahead system usually isn't the trie itself — it's keeping the cached top-K suggestions at each node fresh as popularity shifts, without recomputing the entire structure from scratch on every update. That's a batch-refresh-and-swap problem, not a live-write problem.</p></div>
+
+<h2><span class="idx">11</span>Reusable Building Block: Distributed Rate Limiter And Distributed Lock As Services</h2>
+<h3>Distributed Rate Limiter As Its Own Service</h3>
+<p>Ch.5 covered the algorithms — token bucket, leaky bucket, fixed and sliding windows. This section frames rate limiting as a standalone, reusable network service that other services call, rather than logic each service re-implements for itself. The reason to centralize it: if every service instance tracks its own local counter in memory, and you're running ten instances behind a load balancer, you've quietly allowed ten times the intended rate — each instance has its own independent, incomplete view of "how many requests has this key made." A shared Rate Limiter service, backed by one fast store like Redis, keeps one true count that every caller checks against, typically with an atomic increment-and-check operation (a single Redis command, or a small Lua script when the check needs more than one command to stay atomic under concurrent hits).</p>
+<h3>Distributed Lock As Its Own Service</h3>
+<p>Ch.13 covered the mechanics — Redis Redlock, ZooKeeper's ephemeral sequential znodes, and fencing tokens to make a confused lock holder harmless. This section frames the same thing as a standalone service other teams call instead of re-solving: a small Lock Service with a simple contract, something like <code>POST /locks/{resource_id}/acquire</code> returning a lock token and a TTL, and <code>POST /locks/{resource_id}/release</code>. A payment-processing worker, for example, acquires a lock on <code>order:1234</code> before charging a card, so if the same job gets retried and picked up by a second worker, that second worker simply fails to acquire the lock and skips the work — instead of every team that needs locking re-implementing Redlock or a ZooKeeper recipe from scratch. The service still hands back a fencing token per Ch.13, so the protected resource itself stays safe even if the lock service, or a client, makes a mistake.</p>
+
+<div class="diagram" data-diagram='{
+  "title": "Distributed rate limiter and distributed lock, called as shared services",
+  "nodes": [
+    {"id":"svcA","x":30,"y":60,"w":160,"h":60,"kind":"compute","label":"Service A"},
+    {"id":"svcB","x":30,"y":250,"w":160,"h":60,"kind":"compute","label":"Service B"},
+    {"id":"svcC","x":30,"y":440,"w":160,"h":60,"kind":"compute","label":"Service C"},
+    {"id":"ratelimiter","x":380,"y":100,"w":200,"h":70,"kind":"compute","label":"Rate Limiter Service","sub":"checks and increments a counter per API key"},
+    {"id":"lockservice","x":380,"y":380,"w":200,"h":70,"kind":"compute","label":"Distributed Lock Service","sub":"grants and releases named locks"},
+    {"id":"redis1","x":750,"y":100,"w":170,"h":70,"kind":"storage","label":"Redis: counters","sub":"token or window state per key"},
+    {"id":"redis2","x":750,"y":380,"w":170,"h":70,"kind":"storage","label":"Redis or ZooKeeper","sub":"lock state, see Ch.13"}
+  ],
+  "edges": [
+    {"from":"svcA","to":"ratelimiter","label":"allowed?"},
+    {"from":"svcB","to":"ratelimiter","label":"allowed?"},
+    {"from":"svcC","to":"ratelimiter","label":"allowed?"},
+    {"from":"svcA","to":"lockservice","label":"acquire lock"},
+    {"from":"svcB","to":"lockservice","label":"acquire lock"},
+    {"from":"svcC","to":"lockservice","label":"acquire lock"},
+    {"from":"ratelimiter","to":"redis1","label":"INCR and check"},
+    {"from":"lockservice","to":"redis2","label":"SET NX or znode"}
+  ],
+  "groups": [
+    {"x":360,"y":80,"w":230,"h":130,"label":"Shared rate-limit path"},
+    {"x":360,"y":360,"w":230,"h":130,"label":"Shared lock path"}
+  ]
+}'></div>
+
+<div class="callout say-this"><p>"I'd pull rate limiting and locking out into their own small internal services rather than let every team re-implement token bucket or Redlock themselves — that way the hard, easy-to-get-wrong parts, like atomic check-and-increment or fencing tokens, live in one place, and every caller gets the same simple contract."</p></div>
+<div class="callout em-angle"><p>Before building either of these as an in-house service, check what you already have. API gateways (AWS API Gateway, Envoy, Kong) already ship per-key rate limiting out of the box. Managed databases often give you a locking primitive for free — a conditional write (DynamoDB's conditional expressions, a SQL <code>UPDATE ... WHERE version = ?</code>) can substitute for a dedicated lock service in plenty of designs. Build the standalone service once an off-the-shelf option genuinely can't express what you need, not by default.</p></div>
+
+<div class="specsheet">
+  <details>
+    <summary><span class="cat">Grants</span> Other OAuth2 grant types worth recognizing by name</summary>
+    <div class="specbody">
+      <ul>
+        <li><strong>Client credentials grant</strong> — service-to-service, no user involved at all; the app authenticates as itself, not on behalf of anyone.</li>
+        <li><strong>Refresh token grant</strong> — trade a long-lived refresh token for a new access token without asking the user to log in again.</li>
+        <li><strong>PKCE</strong> (Proof Key for Code Exchange) — an extra step added to the authorization code flow for apps that can't safely hold a client secret, like mobile apps and single-page apps.</li>
+        <li><strong>Device code grant</strong> — for devices with no easy way to type, like a smart TV: it shows a short code, and the user enters that code on a phone or laptop to approve access.</li>
+      </ul>
+    </div>
+  </details>
+  <details>
+    <summary><span class="cat">Codes</span> 401 vs 403: a status-code naming trap</summary>
+    <div class="specbody">
+      <ul>
+        <li><strong>401 Unauthorized</strong> — really means authentication is missing or failed; the server doesn't know who you are yet.</li>
+        <li><strong>403 Forbidden</strong> — authentication succeeded, but this specific action isn't allowed for this identity.</li>
+      </ul>
+    </div>
+  </details>
+  <details>
+    <summary><span class="cat">Tokens</span> JWT signing algorithm families</summary>
+    <div class="specbody">
+      <ul>
+        <li><strong>HS256</strong> — HMAC-SHA256, symmetric: one shared secret both signs and verifies. Simple, but every verifier needs that same secret, so anyone holding it could also forge tokens.</li>
+        <li><strong>RS256 / ES256</strong> — RSA or ECDSA, asymmetric: a private key signs, a public key verifies. Lets you hand the public key to many other services so they can verify tokens without ever being able to mint new ones.</li>
+      </ul>
+    </div>
+  </details>
+  <details>
+    <summary><span class="cat">Pillars</span> Logs, metrics, and traces in one line each</summary>
+    <div class="specbody">
+      <ul>
+        <li><strong>Logs</strong> — discrete, timestamped events; for digging into one specific incident.</li>
+        <li><strong>Metrics</strong> — numeric aggregates over time; for dashboards, trends, and alerts.</li>
+        <li><strong>Traces</strong> — the path of one request across services; for finding which hop is slow.</li>
+      </ul>
+    </div>
+  </details>
+  <details>
+    <summary><span class="cat">IDs</span> Unique ID generation strategies at a glance</summary>
+    <div class="specbody">
+      <ul>
+        <li><strong>Auto-increment</strong> — simplest, ordered, breaks across shards.</li>
+        <li><strong>UUID</strong> — zero coordination, unsortable, 16 bytes.</li>
+        <li><strong>Snowflake</strong> — timestamp + machine ID + sequence packed into 64 bits, roughly sortable.</li>
+        <li><strong>Ticket server</strong> — dedicated ID-issuing service, strict ordering, a network hop per ID.</li>
+      </ul>
+    </div>
+  </details>
+  <details>
+    <summary><span class="cat">Geo</span> Geohash vs. quad-tree, one line each</summary>
+    <div class="specbody">
+      <ul>
+        <li><strong>Geohash</strong> — encode location as a string; nearby points share a prefix; fits a normal DB index.</li>
+        <li><strong>Quad-tree</strong> — recursively split space into quadrants; adapts to uneven point density.</li>
+      </ul>
+    </div>
+  </details>
+</div>
+
+<div class="flashcards" data-cards='[
+  {"q":"What question does authentication answer, and what question does authorization answer?","a":"Authentication answers &#39;who are you&#39; — proving identity, for example logging in with a password. Authorization answers &#39;what are you allowed to do&#39; — checking permissions on an already-identified user, for example blocking access to another user&#39;s private folder even though they&#39;re logged in correctly."},
+  {"q":"What problem does OAuth2 solve, in one sentence?","a":"It lets a user grant a third-party app limited, revocable access to their data on another service, without ever handing that app the user&#39;s real password."},
+  {"q":"Walk through the OAuth2 authorization code flow, in order.","a":"The app redirects the user to the authorization server&#39;s login and consent screen with the scopes it wants. The user approves and gets redirected back with a short-lived authorization code. The app&#39;s own backend then exchanges that code plus its client secret for an access token, server to server, never through the browser. Finally the app calls the resource server&#39;s API using that access token."},
+  {"q":"What does OIDC add on top of plain OAuth2?","a":"A standardized ID token — a JWT carrying identity claims like sub, email, and exp — so the app can answer &#39;who is this user,&#39; not just &#39;what can this app access.&#39;"},
+  {"q":"What are the three parts of a JWT, separated by dots?","a":"A header (which algorithm signed it, and the token type), a payload (the actual claims — sub, iss, exp, plus any custom data the app adds), and a signature computed over the header and payload using a secret or private key."},
+  {"q":"How does a server verify a JWT, and why isn&#39;t that a database lookup?","a":"It recomputes the signature using the key it already holds — a shared secret for HMAC, or a public key for RSA and ECDSA — and checks it matches. A match means the content hasn&#39;t been tampered with since signing. No database call or shared storage is involved at all."},
+  {"q":"What&#39;s the real trade-off between JWTs and server-side sessions?","a":"JWTs verify locally with just a signature check, so they scale statelessly across many servers, but they can&#39;t be revoked before their own expiry without bolting on an extra revocation list. Sessions are trivially revocable, just delete the record, but every server needs a lookup against one shared, centrally reachable session store on every request."},
+  {"q":"What does encryption at rest protect against, versus encryption in transit?","a":"At rest protects data sitting on disk — a stolen laptop, a leaked backup, a compromised storage snapshot — from being read directly off the storage medium. In transit, with TLS as the concrete example, it protects data moving across a network from being read or altered by whoever sits between the two endpoints."},
+  {"q":"What does an API key actually identify?","a":"Which application or integration is calling — it&#39;s an identifier for a piece of software, not a login credential for a human — and it should be scoped to specific permissions, revocable on its own, and rotated periodically."},
+  {"q":"How does rate limiting per API key differ from rate limiting per IP address?","a":"It uses the exact same algorithms as Ch.5 — token bucket, sliding window, and so on — but keys the bucket by API key ID instead of client IP. One integration&#39;s misbehavior can&#39;t eat into a different customer&#39;s quota, and it doesn&#39;t matter how many real users happen to share one IP address."},
+  {"q":"What is each of the three observability pillars actually for, in one line?","a":"Logs are discrete, timestamped events — best for digging into exactly what happened during one specific, unusual incident. Metrics are numeric aggregates over time — cheap at huge scale, best for dashboards, trend lines, and alert thresholds. Traces follow one request across multiple services — best for finding which specific hop in a call chain is slow or failing."},
+  {"q":"In a p99 latency spike investigation, what order would you typically reach for logs, metrics, and traces?","a":"A metrics dashboard flags that something&#39;s wrong first — p99 jumped from 200ms to 900ms. A trace on one slow request during that window shows which service in the chain actually ate most of the time. That service&#39;s logs, pulled for the exact timestamp of the slow trace, show the real error or slow query behind it."},
+  {"q":"Define SLI, SLO, and SLA using the same example metric.","a":"SLI: the measured number itself — checkout p99 latency is 220ms right now. SLO: the team&#39;s internal target for that number — p99 under 300ms for 99.9% of a rolling 30-day window. SLA: the external, often contractual promise — p99 under 500ms, or the customer gets a service credit."},
+  {"q":"Why is the internal SLO usually stricter than the external SLA for the same metric?","a":"So the team has room to notice and react — roll back a bad deploy, page someone — before the system actually breaches the looser, consequence-bearing customer contract. The gap between SLO and SLA is a deliberate safety margin, not an accident."},
+  {"q":"What are the four common ways to generate a unique ID, and what does each trade off?","a":"Database auto-increment is simple and ordered but doesn&#39;t survive sharding across multiple DB instances. A UUID needs zero coordination and is globally unique, but is random, unsortable, and bigger than an integer. A Snowflake ID packs a timestamp, a machine ID, and a per-millisecond counter into 64 bits — roughly time-sortable and compact, with no per-ID coordination. A dedicated ticket server guarantees ordering through one counter, at the cost of a network hop and, without an HA cluster, a new single point of failure."},
+  {"q":"What three fields are conceptually packed into a Twitter Snowflake ID?","a":"A timestamp (the most significant bits, so raw numeric comparison roughly sorts IDs by creation time), a machine or worker ID (assigned once per host, not per ID), and a per-millisecond sequence number, in case one machine mints more than one ID in the same millisecond."},
+  {"q":"What core idea do geohashing and quad-trees share?","a":"Both turn a 2D location into a representation that&#39;s sortable or indexable as roughly one dimension, so a nearby-search becomes a cheap prefix or range lookup instead of comparing against every point in the database."},
+  {"q":"How does a geohash string turn a nearby-search into a database index lookup?","a":"Two physically close points usually share a long common prefix in their geohash string, so nearby-search becomes a prefix match on one indexed string column — a plain B-tree index handles it directly, no special spatial structure needed."},
+  {"q":"Why does a quad-tree handle uneven data density better than a fixed-precision geohash grid?","a":"It only subdivides an area further where points are actually dense — a city center gets many small cells, open ocean stays one big cell — instead of giving every cell the same fixed size no matter how many points fall inside it."},
+  {"q":"Why is a trie a natural fit for prefix-based autocomplete?","a":"Every node in a trie already represents one exact prefix, and everything stored below that node is, by construction, every word that starts with it, so lookup cost is proportional to how many characters the user typed, not how big the whole dictionary is."},
+  {"q":"Why run a distributed rate limiter as its own shared service instead of letting each server instance track local counters?","a":"Local counters give every server instance its own independent view of how many requests a key has made — with N instances running, that quietly multiplies the real allowed rate by N. A shared service backed by one fast store, like Redis, keeps a single true count that every caller checks against."},
+  {"q":"Why would multiple services call one shared distributed lock service instead of each building its own locking logic?","a":"It centralizes the actually hard part — Ch.13&#39;s Redlock or ZooKeeper mechanics, plus fencing tokens — in one place nobody else has to re-solve, and it gives every caller the same simple acquire-and-release contract no matter which lock backend sits behind it."}
+]'></div>

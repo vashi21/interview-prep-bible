@@ -1,0 +1,27 @@
+/* Personal-site-only additions (build_spa.py). Not used by the standalone
+   Claude Artifact pages (assemble.py) — kept separate so that bundle stays lean. */
+
+#app{min-height:100vh;}
+
+.volume-grid{display:grid;grid-template-columns:repeat(2,1fr);gap:1.1rem;}
+@media (max-width:620px){ .volume-grid{grid-template-columns:1fr;} }
+
+.volume-card{
+  display:block;border:1px solid var(--border-strong);border-radius:2px;background:var(--bg-inset);
+  padding:1.4rem 1.5rem;text-decoration:none;color:inherit;
+}
+.volume-card:not(.disabled):hover{border-color:var(--accent);background:var(--bg-raised);}
+.volume-card.disabled{opacity:.55;cursor:default;}
+.volume-card-tag{
+  display:inline-flex;font-family:var(--font-mono);font-size:.64rem;letter-spacing:.06em;text-transform:uppercase;
+  padding:.15em .55em;border-radius:2px;margin-bottom:.7rem;
+}
+.volume-card:not(.disabled) .volume-card-tag{color:var(--good);border:1px solid var(--good);}
+.volume-card.disabled .volume-card-tag{color:var(--ink-faint);border:1px solid var(--border-strong);}
+.volume-card h2{font-family:var(--font-display);font-size:1.5rem;font-weight:800;color:var(--ink);margin-bottom:.5rem;}
+.volume-card p{color:var(--ink-dim);font-size:.92rem;margin:0;}
+
+.site-footer{
+  margin-top:3rem;padding-top:1.2rem;border-top:1px solid var(--border);
+  font-family:var(--font-mono);font-size:.72rem;color:var(--ink-faint);text-align:center;
+}

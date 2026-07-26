@@ -1,0 +1,274 @@
+<p class="lede">This chapter builds one system, ten times. Each version fixes the exact bottleneck that broke the version before it — the same walk interviewers expect you to narrate live, ending at an architecture that almost every "design X at scale" problem in this book borrows pieces from.</p>
+
+<h2><span class="idx">01</span>Why we climb the ladder instead of jumping to the final design</h2>
+<p>A common mistake in an HLD (high-level design) interview is drawing the final, fully-scaled architecture in the first five minutes. That skips the part the interviewer actually wants to hear: which bottleneck showed up first, why the fix you chose solves that specific bottleneck, and what new problem the fix creates. This chapter walks through ten revisions, numbered 0 through 9, of the same product. Revision 0 is one server. Revision 9 is a multi-region, cached, queued, sharded system. Nothing here is exotic — every step is a direct answer to a concrete, nameable bottleneck.</p>
+<p>Revision 0 is the honest starting point: a domain name, one server, and a database, all doing their jobs on a single machine. A user's browser resolves the domain to an IP address using DNS (Domain Name System — a third-party service that maps human-readable names to IP addresses; you almost never run your own), then sends an HTTP request straight to that IP. On the box itself, a web/app server process (something like Node, Rails, or a Java application server) and a database (say, MySQL) both run and both compete for the same CPU, memory, and disk.</p>
+<div class="diagram" data-diagram='{
+  "title": "Revision 0 — one server does it all",
+  "nodes": [
+    {"id":"dns","x":60,"y":80,"w":170,"h":70,"kind":"external","label":"DNS","sub":"third-party service"},
+    {"id":"user","x":60,"y":280,"w":170,"h":70,"kind":"external","label":"User Browser"},
+    {"id":"server","x":470,"y":240,"w":260,"h":100,"kind":"compute","label":"Single Server","sub":"web app + MySQL, one box"}
+  ],
+  "edges": [
+    {"from":"dns","to":"user","label":"returns IP for the domain"},
+    {"from":"user","to":"server","label":"HTTP request to that IP"}
+  ]
+}'></div>
+<p><strong>Bottleneck:</strong> there is no "before" here — this is the starting point every real system passes through while traffic is small enough that one machine can handle everything. A single well-tuned server can often absorb a few hundred to a couple thousand simple requests per second before something gives, and for a brand-new product that is usually plenty.</p>
+<p><strong>What changed:</strong> nothing yet — this is the baseline the rest of the chapter reacts to.</p>
+<div class="callout tradeoff"><p>One machine is a single point of failure (SPOF): if it crashes, gets a bad deploy, or needs a restart, every user is down at once. It also forces the web process and the database process to fight over the same CPU, RAM, and disk I/O, so a single slow query directly hurts request latency for everyone else.</p></div>
+<div class="callout say-this"><p>"I'd name this as the baseline — one server running the app and the database. It is fine at low traffic. The interesting part of this problem is which bottleneck breaks it first, and that is almost always resource contention or a single point of failure, not raw request volume."</p></div>
+
+<h2><span class="idx">02</span>Revisions 1 and 2 — split the tiers, then scale the web tier out</h2>
+<h3>Revision 1 — split the web tier from the database tier</h3>
+<p><strong>Bottleneck:</strong> the web app and the database are fighting for the same CPU and memory on one box. A heavy query can starve the web process of CPU, and a traffic spike can starve the database of memory — and because they are not independent, you cannot fix one without risking the other.</p>
+<p><strong>What changed:</strong> the database moves to its own machine. There are now two tiers — a web/application-server tier and a database tier — talking to each other over the network instead of over localhost.</p>
+<div class="callout tradeoff"><p>You get independent scaling and independent failure: a database restart no longer has to take the web tier down with it. The cost is a new network hop between tiers (small, but real and non-zero) and now two machines' worth of OS patches, monitoring, and access control to manage instead of one.</p></div>
+<div class="callout say-this"><p>"The first split is not about capacity yet, it is about decoupling failure domains — a database restart should not force an application restart, and a bad app deploy should not be able to touch the same disk the data lives on."</p></div>
+
+<h3>Revision 2 — add a load balancer and a second web server</h3>
+<p><strong>Bottleneck:</strong> a single web server has a hard ceiling on concurrent connections and CPU-bound request handling. Past that ceiling, requests queue up — and that one web server is now a second single point of failure, on top of the database tier from Revision 1.</p>
+<p><strong>What changed:</strong> a load balancer (LB) sits in front of the web tier as the one address clients actually connect to. It spreads incoming requests across two or more identical web servers using a strategy such as round robin (rotate through servers in order) or least connections (send the next request to whichever server currently has the fewest open connections). Ch.5 covers load-balancing algorithms and health checks in full.</p>
+<div class="callout tradeoff"><p>You gain horizontal scalability — add smaller servers instead of buying one bigger one — and you can lose one web server without full downtime. But the load balancer is now a new potential SPOF unless it is deployed redundantly, and if the app stores anything in a server's local memory (like "is this user logged in"), a second server will not have it. That specific problem does not get solved until Revision 6 — flag it now, fix it later.</p></div>
+<div class="callout say-this"><p>"Adding a second web server behind a load balancer buys redundancy and horizontal scale, but only if the web tier is stateless. If I am storing session state in server memory right now, I would call that out as a problem I plan to fix by the time I talk about autoscaling, not something I am ignoring."</p></div>
+
+<h2><span class="idx">03</span>Revisions 3 to 5 — protect the data, then stop hitting it so often</h2>
+<h3>Revision 3 — database replication: one master, many slaves</h3>
+<p><strong>Bottleneck:</strong> two web servers can now fire far more queries than before, so the single database becomes the new bottleneck — and it is still a SPOF: if that one machine dies, the whole product goes down no matter how many web servers are running.</p>
+<p><strong>What changed:</strong> database replication. One server is the master (or primary) and is the only one that accepts writes. One or more slave servers (replicas) continuously copy the master's changes — for example, via MySQL's binary replication log — and serve read queries. The application now writes to the master and reads from replicas.</p>
+<div class="callout tradeoff"><p>You get read scalability (add more replicas for more read capacity) and a failover target if the master dies. But replication is asynchronous by default, so replicas lag behind the master by some amount — usually small, but it can spike under load. That is replication lag, and it means a user can write something and, on their very next read, not see it yet if that read lands on a lagging replica. This is a concrete case of eventual consistency (the guarantee that all replicas converge to the same value eventually, but not necessarily immediately).</p></div>
+<div class="callout say-this"><p>"Master-slave replication buys availability and read scale, but I need to be explicit that reads from replicas are eventually consistent. If a feature needs read-your-own-write behavior — like showing a user their own comment right after they post it — I would route that specific read back to the master, or to whichever replica served the write."</p></div>
+
+<h3>Revision 4 — add a cache in front of the database</h3>
+<p><strong>Bottleneck:</strong> even with replicas, the same popular rows — a trending post, a bestselling product page — get re-read from disk or re-computed for every single request, even though the answer has not changed since the last request.</p>
+<p><strong>What changed:</strong> an in-memory key-value cache, such as Redis or Memcached, sits between the web tier and the database. The most common pattern is cache-aside: the app checks the cache first; on a miss, it reads the database, then writes that result into the cache before returning it. The next request for the same key hits the cache and never touches the database. Ch.4 is a full deep dive on caching patterns.</p>
+<div class="callout tradeoff"><p>Reads get dramatically faster — memory access is on the order of microseconds versus milliseconds for a disk-backed query — and database load drops a lot. The cost: you now have two copies of the truth that can disagree. You need an eviction policy for when the cache fills up (LRU is the common default) and an invalidation strategy for when the underlying data changes. And if the cache starts cold, or one very popular key expires for everyone at once, every request that would have hit the cache instead piles onto the database at the same instant — a thundering herd, also called a cache stampede.</p></div>
+<div class="callout say-this"><p>"I would add cache-aside caching for the hottest reads, but I would flag two failure modes up front on purpose: cache invalidation — when a stale value actually gets refreshed — and thundering herd, where a cold cache or a mass key expiry sends every request straight to the database at once."</p></div>
+<p>Stack Revisions 2 through 4 together and this is what the system looks like: a load balancer spreading requests across a redundant web tier, a cache absorbing the hottest reads, and a master database replicating to a slave for read scale and failover.</p>
+<div class="diagram" data-diagram='{
+  "title": "Revisions 2-4 — load-balanced web tier, cached, master/slave replicated",
+  "nodes": [
+    {"id":"client","x":40,"y":260,"w":140,"h":60,"kind":"external","label":"Client"},
+    {"id":"lb","x":250,"y":260,"w":140,"h":60,"kind":"compute","label":"Load Balancer"},
+    {"id":"web1","x":480,"y":100,"w":170,"h":70,"kind":"compute","label":"Web Server 1"},
+    {"id":"web2","x":480,"y":400,"w":170,"h":70,"kind":"compute","label":"Web Server 2"},
+    {"id":"cache","x":740,"y":40,"w":170,"h":70,"kind":"storage","label":"Cache","sub":"Redis or Memcached"},
+    {"id":"masterdb","x":740,"y":240,"w":170,"h":70,"kind":"storage","label":"Master DB","sub":"handles all writes"},
+    {"id":"slavedb1","x":740,"y":440,"w":170,"h":70,"kind":"storage","label":"Slave DB","sub":"read replica"}
+  ],
+  "edges": [
+    {"from":"client","to":"lb","label":"HTTP request"},
+    {"from":"lb","to":"web1","label":"round robin"},
+    {"from":"lb","to":"web2","label":"round robin"},
+    {"from":"web1","to":"cache","label":"cache-aside"},
+    {"from":"web2","to":"cache","label":"cache-aside"},
+    {"from":"web1","to":"masterdb","label":"writes"},
+    {"from":"web2","to":"masterdb","label":"writes"},
+    {"from":"masterdb","to":"slavedb1","label":"async replication","dashed":true}
+  ],
+  "groups": [
+    {"x":460,"y":80,"w":220,"h":410,"label":"Web tier, behind LB"},
+    {"x":720,"y":20,"w":210,"h":510,"label":"Data tier"}
+  ]
+}'></div>
+
+<h3>Revision 5 — push static assets to a CDN</h3>
+<p><strong>Bottleneck:</strong> images, video, CSS, and JavaScript bundles never change per request, yet they are still served by your own web tier for every user — work that has nothing to do with your business logic, and slow for anyone far from your data center.</p>
+<p><strong>What changed:</strong> static assets move to a CDN (Content Delivery Network) — a globally distributed network of edge servers, run by a third party such as Cloudflare, Akamai, or a cloud provider's own CDN, that caches your files close to the user. On a pull CDN (the common default), the first request for a file still goes back to your origin server; every request after that, from any nearby user, is served from the edge — often in tens of milliseconds instead of hundreds. A push CDN, where you upload assets ahead of time instead of waiting for a cache miss, is the less common alternative, usually reserved for large files you know will be requested heavily right away.</p>
+<div class="callout tradeoff"><p>Lower latency for distant users, and a large chunk of traffic taken off your own infrastructure entirely. The costs: a real, recurring bill that scales with bandwidth, a global cache-invalidation problem (shipping a new CSS file means a new URL or waiting out a TTL — time-to-live — everywhere), and a CDN outage, rare but real, can take your static assets down even if your servers are fine.</p></div>
+<div class="callout say-this"><p>"Static assets — images, JS bundles, video — belong on a CDN, not on my own web servers. That is close to a free latency win for users far from my data center, and it is one entire category of request my own servers never have to handle."</p></div>
+
+<h2><span class="idx">04</span>Revisions 6 and 7 — make the web tier disposable, then go multi-region</h2>
+<h3>Revision 6 — stateless web tier plus autoscaling</h3>
+<p><strong>Bottleneck:</strong> a debt from Revision 2 comes due. If any web server keeps state in its own memory — a logged-in session, an in-progress upload, a cart not yet saved to a database — the load balancer cannot freely send a user's next request to a different server. You either pin users to "their" server (sticky sessions) or you cannot add and remove servers without breaking people who are mid-session.</p>
+<p><strong>What changed:</strong> the web tier becomes stateless — no web server keeps anything in memory that would be lost, or that another server would not have, if the load balancer routed the next request elsewhere. Session data moves to a shared store, usually a fast shared cache like Redis. Once servers are truly interchangeable, they go into an auto-scaling group: a policy that adds servers automatically when a metric — CPU usage, queue depth, requests per second — crosses a threshold, and removes them when load drops.</p>
+<div class="callout tradeoff"><p>Elastic capacity — you pay for roughly the servers you need instead of a fixed peak-sized fleet sitting idle most of the day — plus much better fault tolerance, since any server can replace any other. The cost: every request that needs session data now pays an extra network hop to the shared cache instead of a free local-memory read, and autoscaling has its own tuning problem — scale up too slowly and users see errors during a spike, scale too aggressively and you pay for capacity you did not need, and new servers take real time to boot and warm up, so autoscaling always reacts a little late, not instantly.</p></div>
+<div class="callout say-this"><p>"Making the web tier stateless is the precondition for autoscaling and free failover, not a nice-to-have alongside them. I would move session state to a shared cache before I even talk about scaling policies."</p></div>
+
+<h3>Revision 7 — multiple data centers plus GeoDNS</h3>
+<p><strong>Bottleneck:</strong> everything so far still lives in one physical location — one data center or one cloud region. One region-wide event — a power outage, a fiber cut, a cloud provider's regional outage — takes the whole product down at once. Every user, no matter where in the world they are, also pays the network latency of reaching that single location.</p>
+<p><strong>What changed:</strong> the whole stack — load balancer, web tier, data tier — runs in two or more geographically separate data centers. A GeoDNS (a DNS provider with geo-routing or latency-based routing) resolves the same domain name to a different data center's IP address depending on where the request originates, sending each user to the nearest or healthiest location.</p>
+<div class="diagram" data-diagram='{
+  "title": "Revision 7 — two data centers behind GeoDNS",
+  "nodes": [
+    {"id":"user","x":40,"y":250,"w":140,"h":60,"kind":"external","label":"User"},
+    {"id":"geodns","x":230,"y":250,"w":170,"h":60,"kind":"external","label":"GeoDNS","sub":"latency-based routing"},
+    {"id":"dc1app","x":480,"y":100,"w":190,"h":70,"kind":"compute","label":"US Data Center","sub":"LB + web tier"},
+    {"id":"dc1data","x":740,"y":100,"w":190,"h":70,"kind":"storage","label":"US Data Store"},
+    {"id":"dc2app","x":480,"y":380,"w":190,"h":70,"kind":"compute","label":"EU Data Center","sub":"LB + web tier"},
+    {"id":"dc2data","x":740,"y":380,"w":190,"h":70,"kind":"storage","label":"EU Data Store"}
+  ],
+  "edges": [
+    {"from":"user","to":"geodns","label":"1. resolve domain"},
+    {"from":"geodns","to":"dc1app","label":"2a. nearest DC, US"},
+    {"from":"geodns","to":"dc2app","label":"2b. nearest DC, EU"},
+    {"from":"dc1app","to":"dc1data","label":"reads and writes"},
+    {"from":"dc2app","to":"dc2data","label":"reads and writes"},
+    {"from":"dc1data","to":"dc2data","label":"cross-region sync","dashed":true}
+  ],
+  "groups": [
+    {"x":460,"y":60,"w":490,"h":180,"label":"Data Center, US-East"},
+    {"x":460,"y":340,"w":490,"h":180,"label":"Data Center, EU-West"}
+  ]
+}'></div>
+<div class="callout tradeoff"><p>Real disaster recovery — a whole region can fail and the product stays up from the other one — plus lower latency for spread-out users. The hard question this creates: how does data stay consistent across regions? Replicate the whole database cross-region (adds real, ongoing latency and its own lag), or shard by region so each data center mostly owns its own users' data (which then complicates any feature that needs to look across regions, like a single global leaderboard). This is also where data-residency law — for example, GDPR restricting transfers of EU users' personal data outside the EU/EEA unless an approved safeguard, such as an adequacy decision or standard contractual clauses, is in place — starts shaping the architecture, not just performance.</p></div>
+<div class="callout say-this"><p>"Going multi-region is not only a latency win, it is an availability and compliance decision. I would ask the interviewer whether this product has a data-residency requirement, because that decides whether I replicate everything everywhere or shard user data by region."</p></div>
+<div class="callout em-angle"><p>An EM-level answer adds the cost angle out loud: running a second data center roughly doubles infrastructure spend, and if either region needs enough spare capacity to absorb 100% of traffic when the other one fails, you are provisioning for a disaster that — with luck — never happens. That is a real conversation with finance, not just an engineering decision.</p></div>
+
+<h2><span class="idx">05</span>Revisions 8 and 9 — decouple with a queue, then shard the data</h2>
+<h3>Revision 8 — message queue plus logging, metrics, and automation</h3>
+<p><strong>Bottleneck:</strong> some work triggered by a request does not need to finish before you reply to the user — sending a confirmation email, generating a thumbnail, updating a recommendation model. If the web tier does that work synchronously, in the same request/response cycle, the user waits for it, and a slow downstream dependency (a flaky email provider, say) backs up the entire web tier. Separately, after seven revisions of growth, there is no longer one place to look to tell whether the whole system is healthy — a slow query buried in one of several services is invisible until users complain.</p>
+<p><strong>What changed:</strong> two additions, both about operability rather than raw throughput. A message queue (Kafka, RabbitMQ, or a managed queue like SQS) sits between the web tier, which publishes small messages such as "send welcome email to user 42," and background workers, which consume them whenever they can — decoupling request latency from that task's actual duration. Alongside it, centralized logging, metrics, and automation: every service ships logs and numeric metrics (request rate, error rate, latency percentiles) to one place, and automated systems — CI/CD pipelines, alerting rules, auto-remediation scripts — react to what those systems show instead of waiting for a human to notice.</p>
+<div class="callout tradeoff"><p>The queue buys resilience against slow downstream dependencies and lets background work scale independently of the web tier. But "message accepted" is no longer the same thing as "task finished" — you need a way to tell a user their thumbnail is still processing, and you need to survive a worker crashing mid-task without losing or duplicating that message (Ch.14 covers at-least-once versus exactly-once delivery in depth). The observability stack, meanwhile, is pure added cost and complexity with no user-facing feature to show for it — which is exactly why teams tend to skip it until an outage makes the bill for skipping it very clear.</p></div>
+<div class="callout say-this"><p>"Anything that does not need to block the response — sending an email, resizing an image, updating a model — I would move off the request path onto a queue. And I would say up front that centralized logging and metrics are not optional at this scale. Without them, you are debugging a multi-service system by guessing."</p></div>
+<div class="callout em-angle"><p>An EM-level answer treats the queue choice as build-vs-buy: a managed queue like SQS is usually cheaper to run than self-hosted Kafka for the first couple of years of a product's life, and only becomes the wrong call once you need Kafka-specific features — very high sustained throughput, long retention, replaying a stream from an offset.</p></div>
+
+<h3>Revision 9 — database sharding: the final architecture</h3>
+<p><strong>Bottleneck:</strong> one database — even with read replicas and a cache in front of it — still has exactly one master accepting writes, and that master has a ceiling on write throughput and on how much data comfortably fits on one machine's disk and in its memory. Once write volume, or total data size, outgrows what a single very large master can hold, replication alone cannot save you. The data itself has to split across machines.</p>
+<p><strong>What changed:</strong> the database is sharded (partitioned): instead of one giant table on one server, rows split across N servers by a shard key — for example <code>hash(user_id) % N</code>, so a given user's data always lands on the same shard, or a range split (users A–H on shard 1, I–P on shard 2, and so on). Each shard is a full, independent database, usually still replicated internally for its own availability per Revision 3. The application, or a routing layer in front of it, computes the shard key and sends each query to the right shard. Ch.6 covers sharding strategies and consistent hashing mechanics in full — this section focuses on why sharding is the last domino to fall, not how the hashing works.</p>
+<div class="diagram" data-diagram='{
+  "title": "Revision 9 — the final architecture: queue, workers, and a sharded data tier",
+  "nodes": [
+    {"id":"cdn","x":15,"y":40,"w":130,"h":60,"kind":"external","label":"CDN","sub":"static assets"},
+    {"id":"user","x":15,"y":260,"w":130,"h":60,"kind":"external","label":"User"},
+    {"id":"lb","x":200,"y":260,"w":120,"h":60,"kind":"compute","label":"Load Balancer"},
+    {"id":"webtier","x":370,"y":255,"w":150,"h":70,"kind":"compute","label":"Web Tier","sub":"stateless, autoscaled"},
+    {"id":"cache","x":560,"y":50,"w":130,"h":60,"kind":"storage","label":"Cache"},
+    {"id":"queue","x":560,"y":190,"w":130,"h":60,"kind":"queue","label":"Message Queue"},
+    {"id":"worker","x":560,"y":400,"w":130,"h":60,"kind":"compute","label":"Async Workers"},
+    {"id":"metrics","x":190,"y":460,"w":150,"h":55,"kind":"storage","label":"Logs and Metrics"},
+    {"id":"shardrouter","x":730,"y":255,"w":130,"h":70,"kind":"compute","label":"Shard Router","sub":"hash(user_id) % 3"},
+    {"id":"shard1","x":890,"y":20,"w":100,"h":50,"kind":"storage","label":"Shard 1","sub":"hash % 3 == 0"},
+    {"id":"shard1replica","x":890,"y":85,"w":100,"h":45,"kind":"storage","label":"Shard 1 Replica"},
+    {"id":"shard2","x":890,"y":240,"w":100,"h":70,"kind":"storage","label":"Shard 2","sub":"hash % 3 == 1"},
+    {"id":"shard2replica","x":890,"y":325,"w":100,"h":50,"kind":"storage","label":"Shard 2 Replica"},
+    {"id":"shard3","x":890,"y":430,"w":100,"h":50,"kind":"storage","label":"Shard 3","sub":"hash % 3 == 2"},
+    {"id":"shard3replica","x":890,"y":495,"w":100,"h":45,"kind":"storage","label":"Shard 3 Replica"}
+  ],
+  "edges": [
+    {"from":"user","to":"cdn","label":"static assets"},
+    {"from":"user","to":"lb","label":"dynamic request"},
+    {"from":"lb","to":"webtier","label":"round robin"},
+    {"from":"webtier","to":"cache","label":"cache-aside"},
+    {"from":"webtier","to":"queue","label":"enqueue job"},
+    {"from":"queue","to":"worker","label":"consume"},
+    {"from":"webtier","to":"shardrouter","label":"app query"},
+    {"from":"shardrouter","to":"shard1","label":"hash to shard"},
+    {"from":"shardrouter","to":"shard2","label":"hash to shard"},
+    {"from":"shardrouter","to":"shard3","label":"hash to shard"},
+    {"from":"shard1","to":"shard1replica","label":"replicates","dashed":true},
+    {"from":"shard2","to":"shard2replica","label":"replicates","dashed":true},
+    {"from":"shard3","to":"shard3replica","label":"replicates","dashed":true},
+    {"from":"worker","to":"shard2","label":"async write","dashed":true},
+    {"from":"webtier","to":"metrics","label":"telemetry","dashed":true},
+    {"from":"worker","to":"metrics","label":"telemetry","dashed":true}
+  ],
+  "groups": [
+    {"x":190,"y":245,"w":350,"h":90,"label":"App tier"},
+    {"x":715,"y":10,"w":285,"h":540,"label":"Data tier, 3 shards, each replicated"}
+  ]
+}'></div>
+<div class="callout tradeoff"><p>Near-linear write scalability — add more shards, get more write capacity — and each shard holds less data, so backups, indexes, and queries on it stay fast. The cost is real application complexity: a query that used to be "join two tables" can now mean joining across two different physical databases, which most databases will not do for you, so you either denormalize (duplicate data so one shard has what it needs) or join in application code. Resharding — changing N, or moving data once one shard outgrows the rest — is a genuinely hard, usually manual-heavy operation. And you can still get a hot shard, often called the celebrity problem: if the shard key is <code>user_id</code> and one account has millions of followers, that single user's shard takes disproportionate load no matter how evenly the rest of the key space is split. The fix is usually to spread one busy entity's data or load across multiple shards, or to give it dedicated extra capacity as a special case.</p></div>
+<div class="callout say-this"><p>"I would only shard the database as a last resort, after caching and read replicas — it is the point where you trade a lot of application complexity for write throughput you cannot get any other way. And I would flag the celebrity problem specifically: whatever shard key I pick, I would check whether one unusually busy entity could overload a single shard on its own."</p></div>
+
+<h2><span class="idx">06</span>Quick-reference: the whole build-up in one table</h2>
+<p>If you get asked to walk through this build-up cold, this table is the shape of the answer. Each row is one revision: the bottleneck that forced it, the fix, and the new trade-off that fix introduces.</p>
+<div class="table-scroll">
+  <table class="spec-table">
+    <thead><tr><th>Revision</th><th>Bottleneck</th><th>Fix</th><th>New trade-off</th></tr></thead>
+    <tbody>
+      <tr><td>0</td><td>Starting point — no prior bottleneck</td><td>Everything on one server</td><td>Single point of failure, resource contention</td></tr>
+      <tr><td>1</td><td>Web app and DB compete for the same CPU/RAM</td><td>Split web tier and DB tier onto separate machines</td><td>Network hop between tiers; two machines to run</td></tr>
+      <tr><td>2</td><td>One web server hits a request/CPU ceiling</td><td>Load balancer plus a second web server</td><td>LB is a new SPOF unless redundant; web tier must go stateless eventually</td></tr>
+      <tr><td>3</td><td>Single DB is a SPOF and a read bottleneck</td><td>Master-slave replication</td><td>Replication lag; reads are eventually consistent</td></tr>
+      <tr><td>4</td><td>Same hot rows re-read from disk every request</td><td>Cache in front of the DB, cache-aside</td><td>Two copies of the truth; invalidation and thundering herd risk</td></tr>
+      <tr><td>5</td><td>Static assets served by your own web tier</td><td>Push static assets to a CDN</td><td>Recurring third-party cost; global cache invalidation</td></tr>
+      <tr><td>6</td><td>Session state pins users to one server</td><td>Stateless web tier plus autoscaling</td><td>Session data needs a shared store; scaling always reacts a little late</td></tr>
+      <tr><td>7</td><td>Everything lives in one region</td><td>Multiple data centers plus GeoDNS</td><td>Cross-region consistency and data-residency decisions</td></tr>
+      <tr><td>8</td><td>Slow background work blocks requests; no system-wide visibility</td><td>Message queue plus logging, metrics, automation</td><td>"Accepted" is not "done"; observability is overhead until an outage proves otherwise</td></tr>
+      <tr><td>9</td><td>One master DB caps write throughput and data size</td><td>Shard the database by a shard key</td><td>Cross-shard joins/transactions get hard; celebrity/hot-shard risk</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<div class="specsheet">
+  <details>
+    <summary><span class="cat">Eviction</span> Cache eviction policies</summary>
+    <div class="specbody">
+      <ul>
+        <li><strong>LRU</strong> — evicts the least-recently-used entry. Most common default, since recently-used data tends to be requested again soon.</li>
+        <li><strong>LFU</strong> — evicts the least-frequently-used entry. Better than LRU when access frequency matters more than recency.</li>
+        <li><strong>FIFO</strong> — evicts the oldest entry regardless of how often or recently it was used. Simple, but ignores actual usage patterns.</li>
+        <li><strong>TTL expiry</strong> — not really an eviction policy, but often combined with one: an entry is removed once a fixed time-to-live passes, regardless of how much cache space is free.</li>
+      </ul>
+    </div>
+  </details>
+  <details>
+    <summary><span class="cat">NoSQL</span> When to reach for NoSQL instead of staying relational</summary>
+    <div class="specbody">
+      <ul>
+        <li>Write volume or total data size is outgrowing what sharding a relational database comfortably handles.</li>
+        <li>The schema is naturally document-shaped (nested, variable fields — MongoDB) or graph-shaped (deep relationship traversal — Neo4j).</li>
+        <li>You need horizontal read/write scale-out without taking on a heavy manual sharding project — many NoSQL stores shard and rebalance automatically (Cassandra, DynamoDB).</li>
+        <li>Access patterns are simple key-value lookups at very high throughput, and you do not need multi-row ACID transactions across entities.</li>
+        <li>None of this is "NoSQL is faster" — it is a trade of strict consistency and rich joins for horizontal scale and schema flexibility. Ch.8 and Ch.9 cover the specific engines in depth.</li>
+      </ul>
+    </div>
+  </details>
+  <details>
+    <summary><span class="cat">Sharding</span> The celebrity / hot-shard problem</summary>
+    <div class="specbody">
+      <p>Any shard key eventually meets an entity that is far busier than average — a celebrity account, a viral product. That entity's shard absorbs disproportionate load no matter how evenly the rest of the key space is split. Two common fixes: spread that one entity's data or traffic across multiple shards instead of one (for example, splitting a celebrity's followers across several shards), or give that entity dedicated extra capacity as a named special case.</p>
+    </div>
+  </details>
+  <details>
+    <summary><span class="cat">Scaling</span> Vertical vs horizontal scaling</summary>
+    <div class="specbody">
+      <ul>
+        <li><strong>Vertical scaling</strong> — buy a bigger single machine (more CPU/RAM/disk). Simple, but has a hard ceiling and zero redundancy: it is still one machine.</li>
+        <li><strong>Horizontal scaling</strong> — add more machines of roughly the same size. Scales further and survives one machine dying, at the cost of needing a load balancer and, usually, a stateless design.</li>
+      </ul>
+    </div>
+  </details>
+  <details>
+    <summary><span class="cat">CDN</span> Push vs pull CDN</summary>
+    <div class="specbody">
+      <p><strong>Pull</strong> — the CDN fetches and caches a file from your origin server automatically on the first request (a cache miss), then serves every later request from the edge. This is the common default. <strong>Push</strong> — you upload assets to the CDN ahead of time, before any user requests them. Push is used less often, mainly when you know a large file will be hit hard immediately and cannot afford even one slow pull-through request.</p>
+    </div>
+  </details>
+</div>
+
+<h2><span class="idx">07</span>Self-test: the highest-value recall points</h2>
+<p>Flip each card before you check the answer. These pull the facts most likely to come up as a follow-up question, across every revision in this chapter.</p>
+<div class="flashcards" data-cards='[
+  {"q":"What breaks first as a single-server system takes on real traffic?","a":"Contention between the web/app process and the database process for the same CPU, memory, and disk I/O on one machine, plus the fact that one machine is a single point of failure."},
+  {"q":"What does a stateless web tier mean, and why does it matter for autoscaling?","a":"No web server keeps data in its own memory that another server would not also have — session data lives in a shared cache or DB instead. Without this, a load balancer cannot safely route a user&#39;s next request to a different server, so servers cannot be added or removed freely."},
+  {"q":"Cache-aside pattern — what happens on a cache miss?","a":"The app reads the database directly, then writes that result into the cache before returning it, so the next read for the same key is a cache hit."},
+  {"q":"LRU vs LFU vs FIFO eviction — what is the difference?","a":"LRU evicts whichever entry was used least recently (the common default). LFU evicts whichever entry is used least often overall. FIFO evicts the oldest entry regardless of how often it is used."},
+  {"q":"What is a thundering herd, also called a cache stampede?","a":"When a cache goes cold or a very popular key expires, every request that would have hit the cache instead lands on the database at the same instant, which can overwhelm it."},
+  {"q":"What is replication lag, and what problem can it cause?","a":"The delay between a write landing on the master database and that write showing up on a read replica. It can cause a user to write something and then not see it on their very next read, if that read hits a lagging replica — a concrete case of eventual consistency."},
+  {"q":"Push CDN vs pull CDN — what is the difference?","a":"Push means you upload assets to the CDN ahead of time. Pull means the CDN fetches and caches from your origin automatically on the first request for a file. Pull is the more common default."},
+  {"q":"What is the celebrity problem, also called a hot shard, in database sharding?","a":"One entity, such as a celebrity account, generates far more traffic than average, so its shard takes disproportionate load no matter how evenly the rest of the key space is split. Fixed by spreading that entity&#39;s data or load across multiple shards, or giving it dedicated capacity."},
+  {"q":"Name three concrete signals that it may be time to consider a NoSQL database.","a":"Any three of: write volume or data size outgrowing what sharding a relational DB comfortably handles; a naturally document- or graph-shaped schema; needing automatic horizontal scale-out; very high-throughput simple key-value access; not needing multi-row ACID transactions across entities."},
+  {"q":"Why is database sharding usually the last step in a scaling build-up, not an early one?","a":"It fixes write throughput and per-machine data size, but it breaks cross-shard joins and transactions and makes resharding hard, so cheaper fixes — replicas, caching, CDN, stateless scaling — get exhausted first."},
+  {"q":"Vertical vs horizontal scaling — what is the practical difference?","a":"Vertical scaling means buying a bigger single machine; it has a hard ceiling and no redundancy. Horizontal scaling means adding more machines of the same size; it scales further and survives one machine dying, at the cost of a load balancer and usually a stateless design."},
+  {"q":"In master-slave replication, which node accepts writes?","a":"Only the master. Slaves accept reads and continuously copy the master&#39;s changes; the application must route writes to the master and can route reads to replicas."},
+  {"q":"What does GeoDNS add on top of ordinary DNS?","a":"It resolves the same domain name to a different IP address, and therefore a different data center, depending on where the request is coming from, routing each user to the nearest or healthiest region instead of always the same one."},
+  {"q":"What core trade-off does adding a message queue introduce?","a":"\"Accepted\" is no longer the same as \"finished.\" You decouple request latency from a background task&#39;s duration, but you now need to track task status separately and handle a worker crashing mid-task without losing or duplicating work."},
+  {"q":"What does centralized logging, metrics, and automation buy you that a single server never needed?","a":"Visibility into whether a many-service system is healthy from one place, alerting before users notice a problem, and automated reactions such as CI/CD and auto-remediation instead of waiting for a human to spot the issue."}
+]'></div>
+
+<h2><span class="idx">08</span>The closing checklist — this is the final answer</h2>
+<p>If an interviewer asks how you would scale a system to millions of users, everything in this chapter compresses into eight lines. Say them, then be ready to defend any single one of them with the reasoning above.</p>
+<ol>
+  <li>Keep the web tier stateless.</li>
+  <li>Build redundancy at every tier.</li>
+  <li>Cache data as much as you can.</li>
+  <li>Support multiple data centers.</li>
+  <li>Host static assets in a CDN.</li>
+  <li>Scale your data tier by sharding.</li>
+  <li>Split tiers into individual services.</li>
+  <li>Monitor your system and use automation tools.</li>
+</ol>
+<div class="callout em-angle"><p>Point 7 — splitting tiers into individual services — is where this chapter ends and the rest of the book begins: Ch.14 covers the messaging patterns that connect those services, and Ch.15 covers the resiliency patterns (circuit breakers, retries, service discovery) you need once "the system" means many independently-deployed services instead of one.</p></div>

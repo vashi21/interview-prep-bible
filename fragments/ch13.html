@@ -1,0 +1,248 @@
+<p class="lede">A single database gives you atomicity for free — one transaction either fully happens or fully does not. The moment a business operation spans two or more independent services or databases, that guarantee gets much harder to keep, and the honest answer used in production is usually "don't try to keep it exactly" — accept a temporary in-between state and know how to clean it up if something fails.</p>
+
+<h2><span class="idx">01</span>Two-Phase Commit: How It Works, And Why It's Dangerous At Scale</h2>
+<p>Say a single logical transaction has to touch two databases at once — maybe an order row in one shard and an inventory row in another. A normal transaction can't span both, because each database only guarantees atomicity for its own writes (Ch.7 covers this for a single MySQL instance). <strong>Two-phase commit (2PC)</strong> is the classic protocol for making a transaction atomic across several independent nodes anyway. One node acts as the <strong>coordinator</strong>; the other nodes involved, called <strong>participants</strong>, each hold a piece of the transaction's work.</p>
+
+<h3>Phase 1 — Prepare (The Vote)</h3>
+<p>The coordinator sends a <strong>PREPARE</strong> message to every participant. Each participant does the actual work — applies the write to its own local storage — but does not make it permanent yet. It writes everything to its own durable transaction log, takes out any locks it needs on the affected rows, and replies with a vote: <strong>YES</strong> ("I can commit this") or <strong>NO</strong> ("I can't"). Once a participant votes YES, it has made a promise: it can no longer change its mind and abort on its own. It must keep holding its locks and wait to be told what to do next.</p>
+
+<h3>Phase 2 — Commit (The Decision)</h3>
+<p>The coordinator collects every vote. If all participants voted YES, it decides the transaction is a global commit and sends <strong>COMMIT</strong> to everyone. If even one participant voted NO (or never answered in time), it decides global abort and sends <strong>ABORT</strong> to everyone. Each participant carries out that decision, releases its locks, and acknowledges back to the coordinator.</p>
+
+<p>The dangerous part is the gap between those two phases. Imagine the coordinator collects three YES votes, sends COMMIT to two participants, and then <strong>crashes</strong> — a process dies, a machine reboots, whatever the cause — before sending COMMIT to the third. Now two participants have already committed and released their locks. The third is still sitting in the "I voted YES" state: it cannot commit on its own (it doesn't know for certain that everyone else agreed), and it cannot abort on its own either (the transaction might already be committed everywhere else, and aborting now would make the third participant's data permanently disagree with the other two). It has no safe move except to wait — and it keeps holding its row locks the entire time it waits, which means every other transaction that wants to touch those same rows is blocked too. This is why 2PC is called a <strong>blocking protocol</strong>: a crashed coordinator doesn't just lose one transaction, it can freeze a chunk of the system's write capacity until a human intervenes or the coordinator comes back and finishes the job.</p>
+
+<div class="diagram" data-diagram='{
+  "title": "2PC&#39;s blocking failure: the coordinator sends COMMIT to two participants, then crashes before reaching the third",
+  "nodes": [
+    {"id":"coord","x":390,"y":40,"w":220,"h":70,"kind":"compute","label":"Transaction Coordinator","sub":"crashed right here"},
+    {"id":"orderdb","x":80,"y":300,"w":230,"h":75,"kind":"storage","label":"Order Service / DB","sub":"got COMMIT — committed, locks released"},
+    {"id":"invdb","x":385,"y":300,"w":230,"h":75,"kind":"storage","label":"Inventory Service / DB","sub":"got COMMIT — committed, locks released"},
+    {"id":"paydb","x":690,"y":300,"w":230,"h":75,"kind":"storage","label":"Payment Service / DB","sub":"COMMIT never arrived — still holding locks"}
+  ],
+  "edges": [
+    {"from":"coord","to":"orderdb","label":"2. COMMIT (sent)"},
+    {"from":"coord","to":"invdb","label":"2. COMMIT (sent)"},
+    {"from":"coord","to":"paydb","label":"2. COMMIT — never sent"}
+  ],
+  "groups": [
+    {"x":60,"y":280,"w":880,"h":115,"label":"All three voted YES in Phase 1 and have been holding locks ever since"}
+  ]
+}'></div>
+
+<div class="callout say-this"><p>"Two-phase commit gives you atomicity across nodes, but it's a blocking protocol — if the coordinator dies between collecting votes and broadcasting the decision, any participant that already voted YES is stuck holding its locks, unable to safely commit or abort on its own, until the coordinator recovers."</p></div>
+
+<div class="callout tradeoff"><p>Even without a crash, 2PC costs latency on every single transaction: two full network round trips (vote, then decision) instead of one, and every participant holds its locks for the entire duration of both round trips, not just its own local write. That's fine for a transaction that touches two shards inside one data center. It gets expensive fast once participants are spread across regions, because now the round trip itself is tens to low-hundreds of milliseconds, and every other write to those same rows queues up behind it.</p></div>
+
+<h2><span class="idx">02</span>Three-Phase Commit: The Extra Phase That Only Partly Helps</h2>
+<p><strong>Three-phase commit (3PC)</strong> tries to fix 2PC's blocking problem by splitting phase 2 into two smaller steps, so participants share enough information that a stuck one can usually figure out the right move without waiting forever for the original coordinator.</p>
+<ul>
+<li><strong>CanCommit</strong> — same idea as 2PC's PREPARE: the coordinator asks, participants vote YES or NO.</li>
+<li><strong>PreCommit</strong> — the new phase. If every vote was YES, the coordinator broadcasts PRE-COMMIT. A participant that receives this now knows, for a fact, that every other participant also voted YES — the whole group has already agreed to commit, it's just waiting for the final go-ahead.</li>
+<li><strong>DoCommit</strong> — the coordinator tells everyone to actually commit.</li>
+</ul>
+<p>The payoff is that a participant stuck after PreCommit is in a much safer spot than a participant stuck after 2PC's single PREPARE: it already knows the group agreed to commit, so if the coordinator disappears, the surviving participants can talk to each other, confirm they all reached PreCommit, and go ahead and commit without the original coordinator — no indefinite blocking.</p>
+<p>That guarantee only holds under an assumption that rarely survives contact with the real world: a <strong>synchronous network</strong>, where message delay has a known upper bound, so a participant can reliably tell "the coordinator crashed" apart from "the coordinator's reply is just late." Real networks don't give you that (Section 10 covers exactly why). If the cluster suffers a genuine <strong>network partition</strong> instead of a clean crash — some participants can reach each other but not the coordinator — you can end up with one group of participants correctly concluding "commit" while another, cut off with different information, times out and does something else. 3PC also adds a full extra round trip of messages to every transaction, on top of an already expensive protocol. The combination of "still not safe under partitions" and "even slower than 2PC" is why essentially no mainstream production database implements classic 3PC — real systems either accept 2PC's blocking risk for short, tightly-scoped transactions, or sidestep distributed atomicity entirely with the Saga pattern below.</p>
+
+<h2><span class="idx">03</span>The Saga Pattern: Giving Up Atomicity On Purpose</h2>
+<p>A <strong>saga</strong> breaks one business operation into a sequence of separate local transactions, one per service, each committed immediately in that service's own database — no locks held across services, no coordinator holding everyone hostage. If a later step fails, the saga doesn't roll back the way a database transaction does. Instead, it runs <strong>compensating transactions</strong>: new, forward-moving operations that semantically undo the effect of each step that already completed, in reverse order. There are two ways to wire up who decides what happens next.</p>
+
+<h3>Choreography — No Central Brain</h3>
+<p>Each service does its local transaction and then publishes an event describing what happened (for example, "order created," "stock reserved," "payment failed"). Other services subscribe to the events they care about and decide for themselves what to do in reaction — there is no single service that knows the whole flow end to end. This keeps services loosely coupled and avoids a single point of control, but it comes at a real cost: to understand what a checkout actually does, you have to trace event handlers scattered across every service involved, there's no one place to look, and adding a new step means touching several services' event subscriptions instead of one place.</p>
+
+<h3>Orchestration — One Coordinator Calls The Shots</h3>
+<p>A dedicated <strong>orchestrator</strong> service explicitly calls each step in order, tracks the saga's current state (which steps have completed), and — critically — is the one that decides to fire compensating transactions when a step fails. This makes the whole flow visible in one place, easy to test, and easy to reason about as an explicit state machine. The cost is that the orchestrator becomes a service everyone depends on: it needs to be highly available, and it needs to know the API of every service it calls, which is a form of coupling too — just a more visible, centralized kind instead of a scattered one.</p>
+
+<div class="callout tradeoff"><p>Neither shape removes coupling — choreography trades it for hidden, distributed coupling through shared events; orchestration trades it for visible, centralized coupling through one service that knows everyone's API. Most teams running more than four or five saga steps end up preferring orchestration, purely because "what actually happens during checkout" needs to be answerable by reading one file, not by tracing events across a dozen services.</p></div>
+
+<h2><span class="idx">04</span>Worked Example: An Order-Checkout Saga</h2>
+<p>Take a checkout flow spanning three independently owned services, each with its own database: <strong>Inventory</strong>, <strong>Payment</strong>, and <strong>Shipping</strong>, coordinated by an orchestrator that also owns the Order record. Here is the happy path first, then the failure.</p>
+<ol>
+<li>Customer submits checkout. The orchestrator creates an Order row with status <code>PENDING</code> — a local transaction in the Order database, already committed.</li>
+<li>Orchestrator calls Inventory: reserve the ordered items. Inventory decrements available stock and creates a reservation row — its own local, already-committed transaction. It returns success.</li>
+<li>Orchestrator calls Payment: charge the customer's card for the order total. Payment's local transaction runs, and it returns success or failure.</li>
+<li>If Payment succeeded, orchestrator calls Shipping: create a shipment record and schedule a pickup — another local, committed transaction.</li>
+<li>Orchestrator marks the Order <code>CONFIRMED</code>.</li>
+</ol>
+<p>Now the failure case the brief for this chapter asks about directly: <strong>Payment fails at step 3, after Inventory has already reserved stock at step 2.</strong> The reservation is real and committed — it is not sitting inside some open, roll-back-able transaction, because sagas never hold a transaction open across services. The orchestrator has to actively undo it. It calls Inventory again, this time hitting a <em>different</em> endpoint — a compensating action such as "release reservation" — which increments the available stock back up and deletes the reservation row. Shipping is never called at all, because the saga never reached step 4, so there is nothing there to compensate. The orchestrator then marks the Order <code>CANCELLED</code> and, typically, surfaces a failure message to the customer.</p>
+
+<div class="diagram" data-diagram='{
+  "title": "Order-checkout saga: payment fails after inventory was already reserved, so step 2 gets compensated",
+  "nodes": [
+    {"id":"client","x":30,"y":265,"w":150,"h":60,"kind":"external","label":"Customer"},
+    {"id":"orch","x":260,"y":260,"w":220,"h":70,"kind":"compute","label":"Order Orchestrator","sub":"owns saga state"},
+    {"id":"inv","x":610,"y":60,"w":210,"h":65,"kind":"compute","label":"Inventory Service","sub":"own DB"},
+    {"id":"pay","x":610,"y":260,"w":210,"h":65,"kind":"compute","label":"Payment Service","sub":"charge fails here"},
+    {"id":"ship","x":610,"y":460,"w":210,"h":65,"kind":"compute","label":"Shipping Service","sub":"never called"}
+  ],
+  "edges": [
+    {"from":"client","to":"orch","label":"1. checkout"},
+    {"from":"orch","to":"inv","label":"2. reserve stock — OK"},
+    {"from":"orch","to":"pay","label":"3. charge card — FAILS"},
+    {"from":"orch","to":"inv","label":"4. COMPENSATE: release reservation"}
+  ],
+  "groups": [
+    {"x":590,"y":40,"w":250,"h":500,"label":"Each owns its own DB — no shared transaction, no shared locks"}
+  ]
+}'></div>
+
+<div class="callout"><p>Notice what a compensating transaction is not: it is not a database rollback. Inventory's reservation was already durably committed to its own database. "Release the reservation" is a brand-new, forward-moving write — a second local transaction whose business effect happens to cancel out the first one. If Payment had instead failed <em>after</em> Shipping already created a shipment, the compensation for that step might be "cancel the shipment if it hasn't left the warehouse yet," which is a real business action with its own edge cases, not a mechanical undo.</p></div>
+
+<div class="callout tradeoff"><p>The price of a saga is <strong>isolation</strong> — the "I" in ACID (Ch.7). Between step 2 and step 3, the system is genuinely in a state that would never exist in a single ACID transaction: stock is reserved, but no payment has happened yet. If another customer checks stock levels during that window, or a report runs against the Inventory database, they can see that in-between state. Sagas trade the database's built-in "nobody sees a half-finished transaction" guarantee for the ability to scale each service independently — and that trade has to be made on purpose, not discovered by accident in production.</p></div>
+
+<h2><span class="idx">05</span>Idempotency: Making Retries Safe</h2>
+<p>Networks between services are unreliable: a request can time out, or a response can get lost, even after the server fully processed the request. The client can't tell "my request never arrived" apart from "it arrived, worked, and the reply got lost" — so the only safe client behavior is to retry. But blindly retrying a "charge the card" or "create the order" request risks doing it <em>twice</em>. The fix is to make the operation <strong>idempotent</strong>: calling it once has the same effect as calling it many times with the same input.</p>
+<p>The standard mechanism is an <strong>idempotency key</strong>: the client generates a unique key (commonly a UUID) once, before the first attempt at an operation, and sends that same key on every retry of that specific attempt. The server keeps a small table mapping idempotency keys to the outcome of the request that used them. The first time it sees a key, it does the real work and stores the result against that key. On a retry with the same key, it skips the real work entirely and just returns the stored result.</p>
+<p>Concretely: a checkout click generates <code>idempotency-key: 8f3a...</code> and calls the Payment service to charge $49.00. The request goes through, the card is charged, and the service stores <code>{key: 8f3a..., status: SUCCEEDED, charge_id: ch_123}</code> — but the response packet is lost on the way back, so the client's HTTP call times out. The client's retry logic fires the exact same request again, with the exact same idempotency key. Payment looks up <code>8f3a...</code>, finds a stored <code>SUCCEEDED</code> result, and returns <code>charge_id: ch_123</code> straight from that table — no second charge to the card. (Stripe's public API documents exactly this pattern with an <code>Idempotency-Key</code> header, a well-known real example of it in production.) The one sharp edge to design for: if a retry arrives while the first attempt is still <code>IN_PROGRESS</code> — genuinely still running, not finished — the server has to make the second request wait or reject it, rather than let two attempts race to charge the card at the same time.</p>
+
+<div class="callout say-this"><p>"Any operation that can be retried over the network needs to be idempotent, and the standard way to get that is a client-generated idempotency key stored server-side against the outcome — not a database unique constraint alone, because the constraint only stops a true duplicate row, not a client that legitimately needs to know the result of an attempt it's not sure succeeded."</p></div>
+
+<h2><span class="idx">06</span>Vector Clocks And Lamport Timestamps: Ordering Events Without A Shared Clock</h2>
+<p>On one machine, "which of these two things happened first" is a solved problem — there's one clock and one memory. Across machines, there is no shared clock. Each node's local clock can drift, and even a small drift is enough to make wall-clock timestamps from two different machines untrustworthy for deciding what really happened first, especially when two events are close together in time. Two techniques from distributed-systems theory address this — conceptually, not something you need to hand-compute in an interview.</p>
+<p>A <strong>Lamport timestamp</strong> gives every event in the system a number such that if event A caused event B (for example, A is a message send and B is that message's receipt), A's number is guaranteed to be smaller than B's. Each node just keeps a counter, increments it for every local event, and whenever it sends a message it attaches its current counter; the receiver sets its own counter to whichever is bigger — its own or the received one — plus one. This gives a full, usable ordering (useful for something like "highest timestamp wins" tie-breaking), but it has a real blind spot: it happily assigns an order to two events that have no causal relationship at all, so a smaller Lamport timestamp does not prove "happened first" in any real sense — only "happened first, or is unrelated."</p>
+<p>A <strong>vector clock</strong> closes exactly that gap. Instead of one counter, every node keeps a whole vector — one slot per node in the system. A node increments its own slot on every local event, and when it sends a message it attaches its entire vector; the receiver merges by taking the element-wise maximum of the two vectors, then increments its own slot. Comparing two vector clocks tells you one of exactly three things: one event causally happened before the other, the other happened before the first, or — if neither vector is fully greater-or-equal to the other — the two events are <strong>concurrent</strong>: genuinely unrelated writes that neither caused nor witnessed each other.</p>
+<p>That third case is the whole point. Picture a shopping cart replicated across two data centers that briefly lose their connection to each other. A customer's phone talks to data center A and adds an item; at the same moment, a stale browser tab talks to data center B and removes a different item. Neither replica knows about the other's write. When the two data centers reconnect, comparing vector clocks tells the system these are concurrent, conflicting writes, not that one simply overwrote the other — so the application can merge them (union the two carts) instead of silently discarding one customer's action. This is precisely why Amazon's Dynamo paper — the 2007 design behind DynamoDB's and Cassandra's shared heritage — introduced vector clocks, and why Riak, built directly on that paper's ideas, still uses them to surface these as "sibling" values for the application to resolve. Cassandra itself (Ch.9) deliberately chose a simpler, cheaper mechanism instead — plain per-write timestamps and last-write-wins — trading away precise conflict detection for lower overhead.</p>
+
+<div class="table-scroll">
+  <table class="spec-table compare">
+    <caption>Lamport timestamps vs. vector clocks</caption>
+    <thead><tr><th></th><th>Lamport timestamp</th><th>Vector clock</th></tr></thead>
+    <tbody>
+      <tr><td>State kept per node</td><td>One integer counter</td><td>One vector, one slot per node in the system</td></tr>
+      <tr><td>What it guarantees</td><td>Causally-ordered pairs get correctly ordered numbers</td><td>Causally-ordered pairs get correctly ordered vectors, <em>and</em> unrelated pairs are detectably concurrent</td></tr>
+      <tr><td>Blind spot</td><td>Cannot distinguish "happened first" from "unrelated" — both just get different numbers</td><td>None for ordering; cost is a vector that grows with cluster size</td></tr>
+      <tr><td>Typical use</td><td>Cheap total ordering, e.g. tie-breaking</td><td>Detecting conflicting concurrent writes that need merging (Dynamo, Riak)</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<h2><span class="idx">07</span>Distributed Locks: Redis Redlock, ZooKeeper, And Split-Brain</h2>
+<p>Sometimes two processes on two different machines must not both act on the same resource at once — only one worker should process a given job, only one node should currently act as leader. A normal in-process mutex only works within one machine's memory, so distributed systems reach for a <strong>distributed lock</strong>: a shared service that grants exclusive ownership of a named resource to one client at a time.</p>
+<p><strong>Redis-based locks</strong> use a simple building block: <code>SET lock_key unique_value NX PX 30000</code> — set the key only if it does not already exist (<code>NX</code>), with a time-to-live (<code>PX</code>, here 30 seconds) so the lock releases itself automatically if the holder crashes and never calls unlock. <strong>Redlock</strong> is an algorithm built on top of that, using several independent Redis instances (the original write-up suggests five) instead of one: a client only holds the lock if it acquires it on a majority of those instances within a tight time budget, so a single Redis instance failing doesn't silently hand the lock to two clients at once. Redlock is genuinely useful for reducing accidental double-work in common cases, but it's also a well-known point of debate in the distributed-systems community — a widely read critique from Martin Kleppmann argues it doesn't give a rigorous safety guarantee, because it still assumes clocks and process pauses behave within reasonable bounds, an assumption a long garbage-collection pause or a paused VM can violate.</p>
+<p><strong>ZooKeeper-based locks</strong> use a different building block: an <strong>ephemeral znode</strong> — a node in ZooKeeper's tree that automatically disappears the moment the client's session ends, whether from a clean disconnect or a crash. The standard lock recipe has each client create an ephemeral, <strong>sequentially numbered</strong> child node under a shared lock path; whoever holds the lowest sequence number owns the lock, and everyone else watches the node just ahead of them in line, waking up to re-check only when that one disappears. This gives you a fair queue for free, something Redlock doesn't provide, and it's backed by ZooKeeper's own consensus protocol (ZAB), which is a much more rigorous foundation than several independent Redis instances racing on TTL expiry.</p>
+<p>Both are trying to prevent the same failure: <strong>split-brain</strong> — two different clients each genuinely believing, at the same moment, that they hold the exclusive lock. This happens when a lock holder gets paused for longer than the lock's lifetime — a long garbage-collection pause, a hypervisor pausing the VM, a thread starved of CPU — the lock service reasonably decides it's dead and hands the lock to someone else, and then the first holder wakes up, still believing it holds the lock, and goes ahead and writes.</p>
+
+<div class="diagram" data-diagram='{
+  "title": "Split-brain: two nodes both believe they hold the same lock",
+  "nodes": [
+    {"id":"lock","x":390,"y":40,"w":220,"h":65,"kind":"storage","label":"Lock Service","sub":"Redis TTL or ZK session"},
+    {"id":"a","x":100,"y":290,"w":210,"h":65,"kind":"compute","label":"Node A","sub":"GC-paused past the TTL"},
+    {"id":"b","x":690,"y":290,"w":210,"h":65,"kind":"compute","label":"Node B","sub":"granted lock after A timed out"},
+    {"id":"resource","x":390,"y":470,"w":220,"h":65,"kind":"storage","label":"Shared Resource","sub":"e.g. a file, a DB row"}
+  ],
+  "edges": [
+    {"from":"lock","to":"a","label":"1. grants lock, TTL 10s"},
+    {"from":"lock","to":"b","label":"2. TTL expired, grants lock to B"},
+    {"from":"b","to":"resource","label":"3. writes safely"},
+    {"from":"a","to":"resource","label":"4. wakes up, writes too — SPLIT BRAIN"}
+  ]
+}'></div>
+
+<p>The defense that actually closes this gap, regardless of which lock service you use, is a <strong>fencing token</strong>: the lock service hands out a number that only ever increases with each new lock grant, and the resource itself — not the lock service — rejects any write tagged with a token older than the newest one it has already seen. A confused Node A above still sends its write with the old token, and the resource simply refuses it, because it already accepted a write carrying Node B's newer token. ZooKeeper gives you this almost for free — the sequence number in its lock recipe already increases monotonically, so it can double as the fencing token; Redlock alone, unlike ZooKeeper, does not hand you an equivalent number by default.</p>
+
+<div class="table-scroll">
+  <table class="spec-table compare">
+    <caption>Redis Redlock vs. ZooKeeper-based locks</caption>
+    <thead><tr><th></th><th>Redis Redlock</th><th>ZooKeeper</th></tr></thead>
+    <tbody>
+      <tr><td>Mechanism</td><td>TTL-based key on a majority of N independent Redis instances</td><td>Ephemeral, sequentially numbered znode tied to a client session</td></tr>
+      <tr><td>Fairness / queueing</td><td>None built in — clients just retry</td><td>Built in — lowest sequence number always wins next</td></tr>
+      <tr><td>Natural fencing token</td><td>Not provided by default</td><td>Sequence number / zxid increases monotonically — usable as-is</td></tr>
+      <tr><td>Correctness under process pauses</td><td>Debated — depends on clock and timing assumptions holding</td><td>Stronger — backed by ZAB consensus, but a paused client can still resume after its session expired</td></tr>
+      <tr><td>Reach for it when</td><td>Redis is already in your stack and the cost of an occasional double-grant is low</td><td>You need strict correctness or fair queueing and can run (or already run) a ZooKeeper ensemble</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<div class="callout em-angle"><p>Standing up a ZooKeeper ensemble purely to get locking is a real operational cost — it's another stateful cluster someone has to run, patch, and page for. If Redis is already deployed for caching, Redlock (used with fencing tokens on the resource side) is often the pragmatic choice even though it's the theoretically weaker guarantee. Reach for ZooKeeper when the cost of a double-grant is genuinely high — leader election for a database, say — not as a default.</p></div>
+
+<h2><span class="idx">08</span>Quorum Reads And Writes, Revisited</h2>
+<p>The same majority-overlap idea shows up any time data is replicated across N nodes: require <strong>W</strong> replicas to acknowledge a write and <strong>R</strong> replicas to answer a read, and if <strong>R + W &gt; N</strong>, every possible read set is mathematically guaranteed to overlap every possible write set on at least one replica — so a read can never completely miss the latest acknowledged write. Ch.9 works this formula in full numeric detail for Cassandra's tunable consistency levels; the same math underlies the "durable once enough replicas have it" language Ch.8 uses for DynamoDB's replication.</p>
+<p>Consensus protocols like Paxos and Raft (Ch.12) use the same majority idea for a different purpose: instead of tuning consistency per read or write, they require a majority of nodes to durably agree before a value counts as <strong>committed</strong> at all. That's what lets a Raft cluster of five nodes keep working correctly with two nodes down — a majority of three can still be reached — and it's the same "more than half" arithmetic as the R + W &gt; N rule, just applied to leader election and log replication instead of to individual reads and writes.</p>
+
+<h2><span class="idx">09</span>Gossip Protocol, Briefly</h2>
+<p>A cluster with no single leader still needs every node to agree on who's currently in the cluster and who's down — and gossip is the usual answer: nodes periodically pick a few random peers and exchange what they currently know, the way a rumor spreads through a crowd with no announcement board. Information reaches the whole cluster in a small number of rounds without any node ever having to talk to everybody. Ch.9's Cassandra section covers the mechanics in full, including the Phi Accrual Failure Detector Cassandra layers on top of gossip to decide, with a tunable confidence level, whether a quiet node is actually down.</p>
+
+<h2><span class="idx">10</span>Failure Detection: Heartbeats And The Timeout That's Really A Guess</h2>
+<p>The simplest way any system decides a remote node is still alive is a <strong>heartbeat</strong>: the node periodically sends a small "I'm still here" message, and if one doesn't arrive within some timeout window, everyone else treats it as dead.</p>
+<p>The fundamental problem is that a missing heartbeat is genuinely ambiguous. It could mean the node crashed. It could also mean the node is alive but overloaded and hasn't gotten around to sending it, or that the network dropped or delayed the packet, or that the node sent it and the ack got lost on the way back. From the outside, using only message timing, <strong>there is no way to tell these apart with certainty</strong> — this isn't just an engineering gap, it's a known theoretical limit. The FLP impossibility result (Fischer, Lynch, and Paterson, 1985) proves that in a network with no guaranteed bound on message delay, no algorithm can always tell a crashed node apart from a merely slow one and still guarantee reaching a decision. A timeout is therefore not a fact about the world — it's a bet: pick it too short and healthy, just-slow nodes get declared dead constantly (triggering pointless failovers or duplicate work); pick it too long and a real failure takes that much longer to notice, hurting availability the whole time.</p>
+<p>This exact ambiguity is why the failure modes earlier in this chapter are hard, not just annoying. A 2PC participant can't tell "the coordinator crashed, it's safe to act" from "the coordinator is just slow, wait" — so it doesn't, and it blocks. A distributed lock holder can't tell "I'm still healthy and holding the lock" from "I've been paused so long the lock service already gave up on me" — so fencing tokens exist precisely to make that mistake harmless instead of trying to prevent it outright. Consensus protocols (Ch.12) route around the problem rather than solving it: they never wait for a specific node to confirm anything, only for a majority — a group small enough to usually be reachable, large enough to guarantee correctness even if the timeout guess about some individual node turns out to be wrong.</p>
+
+<div class="specsheet">
+  <details>
+    <summary><span class="cat">2PC</span> Two-phase commit, phase by phase</summary>
+    <div class="specbody">
+      <ul>
+        <li><strong>Phase 1 (Prepare)</strong> — coordinator asks all participants to do the work and vote; a YES vote is a binding promise, locks stay held.</li>
+        <li><strong>Phase 2 (Commit)</strong> — coordinator broadcasts the decision (commit if all YES, else abort); participants act and release locks.</li>
+        <li><strong>Blocking failure</strong> — coordinator crashes mid-Phase-2; any participant that already voted YES is stuck holding locks until the coordinator recovers.</li>
+        <li><strong>3PC's fix</strong> — adds a PreCommit phase so a stuck participant already knows the group agreed to commit; still fails under real network partitions, and costs an extra round trip, so it's rarely used in production.</li>
+      </ul>
+    </div>
+  </details>
+  <details>
+    <summary><span class="cat">Saga</span> Choreography vs. orchestration, and compensation</summary>
+    <div class="specbody">
+      <ul>
+        <li><strong>Choreography</strong> — services react to each other's events, no central coordinator; loosely coupled but hard to trace end to end.</li>
+        <li><strong>Orchestration</strong> — one service explicitly calls each step and fires compensations; easy to reason about, but the orchestrator must be highly available.</li>
+        <li><strong>Compensating transaction</strong> — a new, forward-moving operation that undoes a step's business effect (e.g. release a reservation) — never a database rollback.</li>
+        <li><strong>Cost</strong> — sagas give up isolation; other readers can see the system mid-saga, in a state no single ACID transaction would ever expose.</li>
+      </ul>
+    </div>
+  </details>
+  <details>
+    <summary><span class="cat">Idempotency</span> The retry-safety recipe</summary>
+    <div class="specbody">
+      <ul>
+        <li><strong>Idempotency key</strong> — client-generated unique ID, sent unchanged on every retry of the same logical attempt.</li>
+        <li><strong>Server behavior</strong> — store the outcome keyed by that ID on first execution; on a retry, return the stored outcome instead of redoing the work.</li>
+        <li><strong>Race to guard</strong> — a retry that arrives while the first attempt is still in progress must wait or be rejected, not run concurrently.</li>
+      </ul>
+    </div>
+  </details>
+  <details>
+    <summary><span class="cat">Ordering</span> Lamport timestamps and vector clocks</summary>
+    <div class="specbody">
+      <ul>
+        <li><strong>Problem solved</strong> — ordering events, or detecting conflicting concurrent writes, with no shared clock across machines.</li>
+        <li><strong>Lamport timestamp</strong> — one counter per node; guarantees causally-related events get correctly ordered numbers, but can't flag unrelated events as unrelated.</li>
+        <li><strong>Vector clock</strong> — one counter per node, tracked for every node in the system; can positively detect two writes as concurrent (neither caused the other), which is what lets a system surface "sibling" values for merging instead of silently picking one.</li>
+      </ul>
+    </div>
+  </details>
+  <details>
+    <summary><span class="cat">Locks</span> Distributed locks and split-brain</summary>
+    <div class="specbody">
+      <ul>
+        <li><strong>Split-brain</strong> — two clients simultaneously believing they hold the same exclusive lock; usually caused by one holder being paused past the lock's expiry.</li>
+        <li><strong>Redlock</strong> — majority-of-N-Redis-instances TTL lock; simple, but debated as a rigorous safety guarantee under process pauses.</li>
+        <li><strong>ZooKeeper</strong> — ephemeral sequential znodes; built-in fair queueing, backed by ZAB consensus.</li>
+        <li><strong>Fencing token</strong> — a monotonically increasing number the protected resource itself checks, so a confused old lock holder's write gets rejected even if the lock system already made a mistake.</li>
+      </ul>
+    </div>
+  </details>
+</div>
+
+<div class="flashcards" data-cards='[
+  {"q":"What are the two phases of 2PC, in order?","a":"Phase 1, Prepare: the coordinator asks all participants to do the work and vote YES or NO, and a YES vote is a binding promise to keep holding locks. Phase 2, Commit: the coordinator broadcasts the final decision (commit if all voted YES, otherwise abort) and participants act on it."},
+  {"q":"Why is 2PC called a &#39;blocking&#39; protocol?","a":"If the coordinator crashes after a participant votes YES but before that participant gets the final decision, the participant cannot safely commit or abort on its own — it has to keep holding its locks and wait, which can block other unrelated transactions on the same rows."},
+  {"q":"What extra phase does 3PC add, and what does it buy?","a":"A PreCommit phase between voting and the final decision. A participant that reaches PreCommit knows every other participant also voted YES, so if the coordinator disappears, surviving participants can confirm this among themselves and commit without waiting on it forever."},
+  {"q":"Why is 3PC still rarely used in production?","a":"Its non-blocking guarantee assumes a synchronous network with bounded message delay. Under a real network partition, participants can end up with different information and reach conflicting decisions anyway — and it costs an extra round trip on every transaction even when nothing goes wrong."},
+  {"q":"What is the Saga pattern, at its core?","a":"Breaking one business operation into a sequence of local transactions, each committed immediately in its own service, with no cross-service locking. If a later step fails, compensating transactions undo the effects of already-completed steps instead of rolling back."},
+  {"q":"Choreography vs. orchestration — one line each.","a":"Choreography: services react to each other&#39;s events with no central coordinator, loosely coupled but hard to trace as a whole. Orchestration: one service explicitly calls each step and issues compensations, easy to reason about but must be highly available."},
+  {"q":"In the order-checkout saga, what happens when payment fails after inventory was already reserved?","a":"The orchestrator calls a compensating action on Inventory — release the reservation, which increments stock back up and deletes the reservation row — then marks the order cancelled. Shipping is never called, so nothing there needs compensating."},
+  {"q":"Is a compensating transaction the same thing as a database rollback?","a":"No. The original step (e.g. the stock reservation) was already durably committed. A compensating transaction is a brand-new, forward-moving write whose business effect cancels out the first one — not an undo of a still-open transaction."},
+  {"q":"What isolation cost does the Saga pattern accept?","a":"Other parts of the system can observe the in-between state of a saga — for example, stock reserved but payment not yet attempted — a state a single ACID transaction would never expose to a concurrent reader."},
+  {"q":"Why does every retriable network operation need an idempotency key?","a":"A client can&#39;t tell &#39;my request never arrived&#39; apart from &#39;it arrived and worked, but the response got lost,&#39; so it must retry — and retrying a non-idempotent operation like a charge risks doing it twice. An idempotency key lets the server recognize a retry and return the stored result instead of repeating the work."},
+  {"q":"Walk through a duplicate payment request being safely deduplicated.","a":"A charge request with idempotency-key 8f3a succeeds, and the server stores {key: 8f3a, status: SUCCEEDED, charge_id: ch_123} — but the response is lost, so the client times out and retries with the same key. The server looks up 8f3a, finds the stored result, and returns ch_123 directly without charging the card again."},
+  {"q":"What problem do vector clocks and Lamport timestamps both solve?","a":"Ordering events, or detecting conflicting writes, in a distributed system where there is no shared clock and each machine&#39;s local clock can drift enough to make wall-clock comparisons untrustworthy."},
+  {"q":"What can a vector clock detect that a Lamport timestamp cannot?","a":"That two writes are truly concurrent — neither caused the other — rather than just assigning them some order. A Lamport timestamp gives every event a number, but a smaller number doesn&#39;t prove &#39;happened first,&#39; only &#39;happened first or unrelated.&#39;"},
+  {"q":"Why does detecting concurrent writes actually matter in practice?","a":"It lets an application merge genuinely independent updates — like two data centers each modifying the same shopping cart while disconnected — instead of one write silently overwriting the other when the replicas reconnect."},
+  {"q":"What is split-brain, in the context of distributed locks?","a":"Two different clients simultaneously believing they each hold the same exclusive lock — typically because the first holder was paused (GC pause, VM pause) longer than the lock&#39;s expiry, so the lock service handed the lock to a second client while the first was still unaware it lost it."},
+  {"q":"How does Redlock try to make a lock safer than a single Redis instance?","a":"It requires acquiring the lock on a majority of several independent Redis instances (commonly five) within a tight time budget, so one instance failing can&#39;t silently hand the lock to two different clients."},
+  {"q":"What is the ZooKeeper lock recipe, mechanically?","a":"Each client creates an ephemeral, sequentially numbered znode under a shared lock path. Whoever has the lowest sequence number holds the lock; everyone else watches the node just ahead of them and re-checks only when it disappears."},
+  {"q":"What is a fencing token, and why does it matter regardless of which lock service you use?","a":"A monotonically increasing number issued with each lock grant that the protected resource itself checks, rejecting any write carrying an older token than one it has already accepted. It makes a confused, still-believes-it-holds-the-lock client harmless even if the lock service already made a mistake."},
+  {"q":"State the quorum rule for strong consistency, and where it also shows up.","a":"R + W > N, strictly greater, guarantees every read set overlaps every write set on at least one replica (Ch.9 works this in full for Cassandra). Consensus protocols like Paxos and Raft (Ch.12) use the same majority-overlap idea to decide when a value is durably committed."},
+  {"q":"What does gossip solve in a leaderless cluster, and where is it covered in depth?","a":"How nodes agree on membership and detect failures with no central node to ask — nodes periodically exchange state with a few random peers, and information spreads through the whole cluster in a small number of rounds. Ch.9&#39;s Cassandra section covers the full mechanics, including the Phi Accrual Failure Detector."},
+  {"q":"Why can&#39;t a heartbeat timeout ever be a certainty that a node is dead?","a":"A missing heartbeat is ambiguous — it could mean the node crashed, or that it&#39;s just overloaded, or that the network delayed or dropped a packet. The FLP impossibility result proves that in a network with no guaranteed message-delay bound, no algorithm can always tell a crashed node apart from a slow one. A timeout is an engineering trade-off, not a fact."}
+]'></div>

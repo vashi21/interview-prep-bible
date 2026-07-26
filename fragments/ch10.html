@@ -1,0 +1,349 @@
+<p class="lede">Every app has two very different appetites for data: the live system serving one user at a time, and the reports that need to look across everyone at once. This chapter covers why those two jobs cannot share one production database, and the stack most companies build instead — lakes, warehouses, lakehouses, and the file and table formats that hold them together.</p>
+
+<h2><span class="idx">01</span>OLTP Vs OLAP: Two Very Different Workloads</h2>
+<p><strong>OLTP</strong> stands for <strong>online transaction processing</strong>. It is the workload behind almost every feature you use in an app: placing an order, liking a post, updating an address, checking whether an item is in stock. Each of these operations touches a handful of rows, usually found through an index, and finishes in single-digit milliseconds. There are a lot of these operations happening at once — thousands per second on a busy service — but each one is cheap.</p>
+<p><strong>OLAP</strong> stands for <strong>online analytical processing</strong>. It is the workload behind reports and dashboards: "what was our revenue by region last quarter," "how many users churned this month," "which product category is growing fastest." Each of these queries scans a huge slice of historical data — millions or billions of rows — and computes an aggregate over it (a sum, a count, an average, a group-by). There are far fewer of these queries running at any moment, but each one is expensive, and can take seconds to minutes instead of milliseconds.</p>
+<pre><code>-- OLTP: one indexed row, a few milliseconds
+UPDATE inventory SET qty = qty - 1
+WHERE sku = 'ABC123' AND warehouse_id = 42;
+
+-- OLAP: scans a year of history, seconds to minutes
+SELECT region, SUM(revenue)
+FROM orders
+WHERE order_date BETWEEN '2025-01-01' AND '2025-12-31'
+GROUP BY region;</code></pre>
+<p>The two workloads also shape their tables differently. OLTP tables are normalized (see Ch.7) to avoid duplicating data on every write, and indexed for point lookups. OLAP tables are often deliberately denormalized (section 06 below) because scanning is cheaper when the engine does not have to join five tables together to answer one question.</p>
+
+<div class="table-scroll">
+  <table class="spec-table compare">
+    <caption>OLTP vs OLAP, side by side</caption>
+    <thead><tr><th>Concept</th><th>OLTP</th><th>OLAP</th></tr></thead>
+    <tbody>
+      <tr><td>Typical query</td><td>Insert/update/read one row or a few rows</td><td>Aggregate (SUM/COUNT/GROUP BY) over millions to billions of rows</td></tr>
+      <tr><td>Rows touched per query</td><td>A handful, via an index</td><td>A large fraction of a table, often a full scan</td></tr>
+      <tr><td>Latency target</td><td>Single-digit milliseconds</td><td>Seconds to minutes is normal</td></tr>
+      <tr><td>Query volume</td><td>Thousands to millions per second, system-wide</td><td>Far fewer queries, each much heavier</td></tr>
+      <tr><td>Data scope</td><td>Current state — the live row right now</td><td>Historical — weeks, months, or years of records</td></tr>
+      <tr><td>Schema shape</td><td>Normalized, optimized to avoid write duplication</td><td>Often denormalized (star schema), optimized to avoid joins during a scan</td></tr>
+      <tr><td>Real examples</td><td>MySQL, PostgreSQL, MongoDB serving an app</td><td>Snowflake, BigQuery, Redshift serving a BI tool</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<h3>Lock Contention</h3>
+<p>MySQL's InnoDB engine uses <strong>MVCC</strong> (multi-version concurrency control, see Ch.7) — readers see a consistent snapshot without blocking writers. But that snapshot has a cost: as long as a transaction holds it open, InnoDB cannot throw away old row versions that writers have since replaced, because that transaction might still need to read them. A long-running analytical query — say, five minutes to scan a year of orders — holds its read view open for those full five minutes. Every row any other transaction updates during that window creates one more old version InnoDB has to keep around. This shows up as a growing "history list length": the undo log (the storage InnoDB uses to keep those old versions) balloons, eating disk space and crowding the buffer pool cache that live checkout traffic depends on. A plain ad hoc <code>SELECT</code> like that report, on its own, does not take any locks at all under InnoDB's default isolation level, REPEATABLE READ, or under READ COMMITTED — it is a non-locking read that only reads a snapshot. Gap locks (locks on the empty space between index entries, so nothing new can be inserted into that gap) only come from locking reads (<code>SELECT ... FOR UPDATE</code> or <code>LOCK IN SHARE MODE</code>) or from a write with a range predicate, such as an <code>UPDATE</code> or <code>DELETE</code> that matches "all orders in March." The one isolation level (Ch.7) where an ordinary <code>SELECT</code> itself takes gap locks is SERIALIZABLE, which is exactly why production systems rarely run at that level — the locking cost is too high.</p>
+<p>MongoDB's WiredTiger storage engine has its own version of this: it hands out a limited number of concurrency tickets to reads and writes, and a heavy aggregation pipeline holding tickets for a long stretch leaves fewer tickets available for the app's normal reads and writes, which start queueing behind it.</p>
+
+<h3>Scan Cost</h3>
+<p>OLTP databases store data row by row on disk (see section 03). To compute <code>SUM(revenue) GROUP BY region</code> over a year of orders, the engine has to read every row for that year off disk — including every column in that row, even the ones the query never asked for — because a row store cannot pull out just one column without reading the whole row it lives in. Say checkout writes roughly 2,000 orders per second at peak. Treating that peak rate as if it ran non-stop for a full year — real traffic is far lower most of the day, so this is a ceiling, not the real total — gives roughly 2,000 × 86,400 seconds × 365 days ≈ 63 billion order-events. Even the real, average-load figure is a small fraction of that ceiling, and it is still comfortably in the billions of rows for a year, so a single month's slice is still billions of rows to pull off disk for one report. That is a lot of disk I/O and CPU, all competing with the same disk and CPU the live system needs for its normal millisecond-scale reads and writes.</p>
+
+<h3>Blast Radius On Live Traffic</h3>
+<p>Put lock contention and scan cost together and the real risk becomes clear: the analytical query and the live app share the exact same machine — the same CPU, the same memory buffer pool, the same disk I/O bandwidth, and often the same fixed pool of database connections. A single heavy report can push CPU to its limit, evict the buffer pool pages the live app needs (forcing its queries back to slower disk reads), or hold connections for minutes at a time until the connection pool has none left for real users. If the query runs against the primary and grows the undo log enough, it can even slow down replication, because the primary now has more work to do just keeping its own storage engine healthy. None of this requires a bug — a single well-formed report query is enough to become an incident if it runs against the same box serving live traffic.</p>
+
+<div class="diagram" data-diagram='{
+  "title": "Same box, two workloads: why an ad hoc report can slow down checkout",
+  "nodes": [
+    {"id":"checkout","x":30,"y":40,"w":160,"h":60,"kind":"external","label":"Checkout traffic","sub":"thousands of users"},
+    {"id":"appsrv","x":260,"y":40,"w":160,"h":60,"kind":"compute","label":"App servers"},
+    {"id":"mysqlprod","x":520,"y":120,"w":190,"h":70,"kind":"storage","label":"MySQL Primary (OLTP)","sub":"serves live orders"},
+    {"id":"analyst","x":30,"y":280,"w":160,"h":60,"kind":"external","label":"Analyst / BI tool"},
+    {"id":"reportjob","x":260,"y":280,"w":160,"h":60,"kind":"compute","label":"Ad hoc report query","sub":"full scan, GROUP BY"},
+    {"id":"impact","x":780,"y":120,"w":190,"h":70,"kind":"external","label":"Effect: slow checkout","sub":"lock waits, timeouts, replica lag"}
+  ],
+  "edges": [
+    {"from":"checkout","to":"appsrv","label":"places order"},
+    {"from":"appsrv","to":"mysqlprod","label":"insert order, indexed, ms"},
+    {"from":"analyst","to":"reportjob","label":"runs monthly report"},
+    {"from":"reportjob","to":"mysqlprod","label":"full table scan, minutes"},
+    {"from":"mysqlprod","to":"impact","label":"shared CPU, memory, locks, connections"}
+  ],
+  "groups": [
+    {"x":500,"y":100,"w":230,"h":110,"label":"One shared box"}
+  ]
+}'></div>
+
+<div class="callout say-this"><p>"I would never point a BI dashboard at the production MySQL primary. A GROUP BY over a year of orders holds a read view open, InnoDB cannot purge old row versions under that transaction, and the undo log grows until it crowds out the cache the checkout path needs. I would offload that query to a read replica at minimum, and to a warehouse for anything that runs on a schedule."</p></div>
+
+<div class="callout em-angle"><p>An EM-level answer adds the cost angle: a serverless query engine like Athena bills per byte scanned, and a small team's ad hoc analytics rarely justifies running and patching a dedicated Spark cluster in year one. The build-vs-buy call is usually: pay per query on managed infrastructure until the analytics workload is big and steady enough to justify owning the compute.</p></div>
+
+<h2><span class="idx">02</span>Data Lake Vs Data Warehouse Vs Lakehouse: What Each One Is For</h2>
+<p>A <strong>data lake</strong> exists to store raw data of any shape — structured tables, semi-structured JSON, unstructured logs, images, video — cheaply and at huge scale, without deciding the schema upfront. This is called <strong>schema-on-read</strong>: you write the data first and figure out its structure when you query it, instead of designing tables before a single row lands. The point of a lake is to hold data you might not know how to use yet: raw event logs, ML training data, archived records for future reprocessing. It is normally built on commodity object storage (Amazon S3, Google Cloud Storage, Azure Blob Storage), which costs a small fraction of what database storage costs per gigabyte.</p>
+<p>A <strong>data warehouse</strong> exists to store modeled, structured data optimized for fast answers to questions the business already knows it wants to ask. This is <strong>schema-on-write</strong>: the shape of the data — the tables, the columns, usually a star schema (section 06) — is decided before loading, so every BI dashboard and every analyst runs against clean, consistent, well-understood tables. Warehouses (Snowflake, BigQuery, Redshift, and older systems like Teradata) are built and priced for fast, repeated analytical queries, not for holding arbitrary raw files cheaply.</p>
+<p>A <strong>lakehouse</strong> exists to close the gap between the two. The old pattern was to keep raw data in a lake and a separate, curated copy in a warehouse — which means transforming the data twice, paying for storage twice, and living with the risk that the two copies drift out of sync. A lakehouse puts warehouse-style guarantees (ACID transactions, schema enforcement, fast queries, the table formats in section 04) directly on top of lake-style cheap object storage, so raw processing, machine learning, and BI dashboards can all query the same underlying files instead of two separate systems.</p>
+
+<div class="table-scroll">
+  <table class="spec-table compare">
+    <caption>Data lake vs data warehouse vs lakehouse</caption>
+    <thead><tr><th>Concept</th><th>Data Lake</th><th>Data Warehouse</th><th>Lakehouse</th></tr></thead>
+    <tbody>
+      <tr><td>Built for</td><td>Cheap storage of any raw data</td><td>Fast, known analytical queries</td><td>Both, on one copy of the data</td></tr>
+      <tr><td>Schema</td><td>Schema-on-read — decided at query time</td><td>Schema-on-write — decided before loading</td><td>Schema enforced, but evolvable in place</td></tr>
+      <tr><td>Data shapes accepted</td><td>Structured, semi-structured, unstructured</td><td>Structured only</td><td>Structured and semi-structured</td></tr>
+      <tr><td>ACID transactions</td><td>None, natively</td><td>Yes, built in</td><td>Yes, via a table format (section 04)</td></tr>
+      <tr><td>Storage cost</td><td>Lowest, plain object storage</td><td>Higher, compute and storage often bundled</td><td>Lake-level, object storage underneath</td></tr>
+      <tr><td>Real examples</td><td>S3/GCS with partitioned Parquet files</td><td>Snowflake, BigQuery, Redshift, Teradata</td><td>Databricks (Delta Lake), Iceberg on Spark/Trino/Athena</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<div class="callout"><p>A lake with no governance turns into what practitioners call a "data swamp" — files nobody trusts, because nothing enforced a schema or tracked which files even belong to a valid, consistent version of a dataset. Table formats (section 04) exist specifically to stop that from happening.</p></div>
+
+<h2><span class="idx">03</span>File Formats: Parquet, ORC, And Avro</h2>
+<p>Underneath a lake or a warehouse, data has to sit in some file format. The biggest split is <strong>row-based</strong> versus <strong>columnar</strong> storage.</p>
+<p>A row-based format stores every field of one record next to each other, then the next record, and so on — the same order you would write it by hand. A columnar format instead stores every record's value for column A together, then every record's value for column B together, and so on.</p>
+
+<h3>Why Columnar Wins For Analytics</h3>
+<p>Take the OLAP query from section 01: <code>SELECT region, SUM(revenue) FROM orders GROUP BY region</code>. It only needs two columns, <code>region</code> and <code>revenue</code>, out of a table that might have fifty. A columnar file lets the query engine read only the column chunks for those two columns off disk and skip every other column entirely. A row-based file cannot do that — reading any part of a row means reading the whole row, so the engine ends up pulling all fifty columns off disk just to use two of them.</p>
+<p>Columnar layout also compresses much better. Values in one column tend to be similar — a <code>region</code> column has only a handful of distinct values, a <code>status</code> column is close to an enum. Storing those values contiguously lets the format use dictionary encoding (store each distinct value once, reference it by a small number), run-length encoding (store a repeated value once plus a count), and similar tricks far more effectively than a row-oriented layout ever could. Both Parquet and ORC also store per-column-chunk statistics — minimum and maximum values, null counts — so the query engine can skip whole chunks that cannot match a filter, without even decompressing them.</p>
+<p><strong>Parquet</strong> was created by engineers at Twitter and Cloudera, inspired by Google's Dremel paper, and is now an Apache project. It is the closest thing to a default columnar format across the modern lake ecosystem — Spark, Athena, Presto/Trino, and BigQuery's external tables all read it natively.</p>
+<p><strong>ORC</strong> (Optimized Row Columnar) grew out of the Apache Hive project, built by Hortonworks and Facebook engineers to replace an earlier format called RCFile. It is columnar in the same sense as Parquet, with its own built-in lightweight indexes, and remains the common default in Hive- and Hadoop-heavy shops.</p>
+
+<h3>Where Row-Based Avro Wins Instead</h3>
+<p><strong>Avro</strong> is a row-based serialization format from the Apache Hadoop project. Its defining feature is that the schema travels with the data — either embedded in the file or, in streaming systems, referenced from a schema registry — and Avro has well-defined rules for evolving that schema (adding a field with a default value, for example) without breaking readers still using an older version. Because it writes one record at a time without needing to buffer a whole batch to build a column chunk, it is fast to serialize and matches how a stream actually produces data: one event at a time, as it happens. That is why Avro, not Parquet, is the standard choice for messages flowing through Kafka (see Ch.14) — a write-heavy, one-record-at-a-time workload is exactly what row-based storage is good at.</p>
+
+<div class="table-scroll">
+  <table class="spec-table compare">
+    <caption>Parquet vs ORC vs Avro</caption>
+    <thead><tr><th>Concept</th><th>Parquet</th><th>ORC</th><th>Avro</th></tr></thead>
+    <tbody>
+      <tr><td>Layout</td><td>Columnar</td><td>Columnar</td><td>Row-based</td></tr>
+      <tr><td>Origin</td><td>Twitter and Cloudera, inspired by Dremel</td><td>Apache Hive project (Hortonworks, Facebook)</td><td>Apache Hadoop project</td></tr>
+      <tr><td>Best for</td><td>Ad hoc analytical scans, wide tables</td><td>Analytical scans, Hive/Hadoop-heavy stacks</td><td>Streaming writes, one record at a time</td></tr>
+      <tr><td>Schema handling</td><td>Embedded in the file</td><td>Embedded in the file</td><td>Travels with the data or via a schema registry, built for evolution</td></tr>
+      <tr><td>Typical ecosystem</td><td>Spark, Athena, Trino/Presto, BigQuery</td><td>Hive, Hadoop</td><td>Kafka and other streaming pipelines</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<div class="callout tradeoff"><p>Columnar formats are not free at write time. Building a Parquet column chunk means buffering enough rows in memory first, which adds latency you cannot afford for a single Kafka message. That is exactly why streaming pipelines write Avro record by record and only convert to Parquet once the data has landed and been batched — see section 07 for that conversion happening in practice.</p></div>
+
+<h2><span class="idx">04</span>Table Formats: Delta Lake, Iceberg, And Hudi</h2>
+<p>A file format decides how one file is laid out. A <strong>table format</strong> decides how a collection of files becomes something you can trust like a database table. Plain Parquet files sitting in an S3 folder have none of the guarantees a database gives you by default:</p>
+<ul>
+  <li><strong>No atomicity</strong> — if a job writing thousands of files crashes halfway through, readers can see a half-finished, inconsistent mix of old and new files. There is no concept of "this write either fully happened or did not happen" for a folder of files.</li>
+  <li><strong>No isolation</strong> — two jobs writing to the same table at the same time can step on each other with no locking or conflict detection.</li>
+  <li><strong>No schema enforcement</strong> — nothing stops one bad job from writing files with a different schema and silently breaking every downstream reader.</li>
+  <li><strong>No cheap row-level update or delete</strong> — updating one row has historically meant rewriting an entire file or partition, which makes something like a single-user data-deletion request expensive.</li>
+  <li><strong>No time travel</strong> — no built-in way to ask "what did this table look like an hour ago," and no easy way to roll back a bad write.</li>
+</ul>
+<p><strong>Delta Lake</strong>, <strong>Apache Iceberg</strong>, and <strong>Apache Hudi</strong> all solve this the same general way: they add a transaction log or metadata layer next to the data files that tracks exactly which files make up which version of the table. A write commits by atomically adding one new entry to that log — either the whole entry lands or none of it does — which gives you ACID transactions, safe schema evolution (the log tracks schema versions too), and time travel (query, or roll back to, any earlier version by number or timestamp), all on top of storage that has none of that natively.</p>
+<p><strong>Delta Lake</strong> was built by Databricks and open-sourced; it uses a JSON transaction log (a folder called <code>_delta_log</code>) recording every file added or removed by each commit.</p>
+<p><strong>Iceberg</strong> was built inside Netflix specifically to fix problems with using plain Hive tables on top of S3 — slow file listing and unreliable partition tracking, among others — and was later donated to the Apache Software Foundation. It is now broadly adopted outside Netflix, with Snowflake, AWS Glue/Athena, Trino, and Spark all able to read and write Iceberg tables.</p>
+<p><strong>Hudi</strong> (Hadoop Upserts Deletes and Incrementals) was built at Uber to handle upsert-heavy ingestion — the kind of continuous, row-level updates you get from a CDC stream (section 07) — on top of Hadoop- and S3-style storage. Hudi offers two table types: <strong>copy-on-write</strong>, which rewrites the affected data file on every update, and <strong>merge-on-read</strong>, which appends changes to a small delta log and merges them in at read time.</p>
+
+<div class="table-scroll">
+  <table class="spec-table compare">
+    <caption>Delta Lake vs Iceberg vs Hudi</caption>
+    <thead><tr><th>Concept</th><th>Delta Lake</th><th>Iceberg</th><th>Hudi</th></tr></thead>
+    <tbody>
+      <tr><td>Origin</td><td>Databricks</td><td>Netflix, now Apache</td><td>Uber, now Apache</td></tr>
+      <tr><td>Metadata mechanism</td><td>JSON transaction log (<code>_delta_log</code>)</td><td>Manifest files and snapshots</td><td>Timeline of commits plus an index</td></tr>
+      <tr><td>Standout strength</td><td>Deep integration with Spark and Databricks tooling</td><td>Broad, engine-neutral adoption (Snowflake, Trino, Athena, Spark)</td><td>Fast upserts for CDC-style, continuously-updating ingestion</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<div class="callout tradeoff"><p>Hudi's two table types trade off in opposite directions. Copy-on-write rewrites the whole affected file on every update, so writes are slower but every read is simple and fast, with nothing to merge. Merge-on-read keeps writes cheap by appending to a delta log, but every read pays a merge cost until the next compaction cleans that log up. Choosing between them is choosing whether your pipeline is more write-heavy or more read-heavy.</p></div>
+
+<h2><span class="idx">05</span>ETL Vs ELT</h2>
+<p><strong>ETL</strong> stands for <strong>extract, transform, load</strong>: pull data out of the source system, clean and reshape it in a separate processing step, and only then load the already-transformed data into the destination. This was the standard pattern when warehouse compute was expensive and tightly coupled to its storage, so you wanted the warehouse doing as little work as possible and only ever holding clean, modeled data.</p>
+<p><strong>ELT</strong> stands for <strong>extract, load, transform</strong>: pull data out and load it into the destination — usually a lake or a cloud warehouse — close to its raw form first, then run the transformation using the destination's own compute (for example, dbt running SQL models inside Snowflake or BigQuery). This became the more common pattern once cloud warehouses decoupled storage from compute and made that compute cheap and elastic enough to absorb the transformation work itself. It also means you always keep an untouched copy of the raw data, so if a transformation has a bug or the requirements change, you can reprocess from the original instead of having already thrown it away.</p>
+
+<div class="table-scroll">
+  <table class="spec-table compare">
+    <caption>ETL vs ELT</caption>
+    <thead><tr><th>Concept</th><th>ETL</th><th>ELT</th></tr></thead>
+    <tbody>
+      <tr><td>Order of operations</td><td>Extract, transform in a separate step, then load</td><td>Extract, load raw, transform inside the destination</td></tr>
+      <tr><td>Where transform runs</td><td>Dedicated ETL tooling/servers</td><td>The warehouse or lake engine itself</td></tr>
+      <tr><td>Raw data kept?</td><td>Usually not — only the modeled output is loaded</td><td>Yes — raw and transformed data both exist</td></tr>
+      <tr><td>Best fit</td><td>Fixed, well-understood transforms; limited destination compute</td><td>Cheap elastic destination compute; transforms that will keep changing</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<div class="callout say-this"><p>"For this pipeline I would pick ELT: land the raw CDC events in the lake untouched, and run the star-schema transformation as dbt models inside the warehouse. That way, if a transformation ships a bug, I still have the original raw data to reprocess from — with ETL, the untransformed version is usually already gone by the time you notice."</p></div>
+
+<h2><span class="idx">06</span>Star Schema Vs Snowflake Schema</h2>
+<p>Both schemas organize a warehouse around the same idea: one <strong>fact table</strong> holding the events you care about (an order, a click, a shipment) with numeric measures (revenue, quantity) and foreign keys, surrounded by <strong>dimension tables</strong> that describe those events (who the customer was, what the product was, what day it happened on).</p>
+<p>A <strong>star schema</strong> keeps every dimension table denormalized (flat) — <code>dim_product</code> repeats its category name directly on every row instead of pointing to a separate categories table. Every dimension is exactly one join away from the fact table, which keeps queries simple for both a human writing SQL by hand and a query engine planning the joins.</p>
+<p>A <strong>snowflake schema</strong> takes it one step further and normalizes the dimensions themselves — <code>dim_product</code> might point to a separate <code>dim_category</code> table, which might point to a <code>dim_department</code> table. This removes duplicate data (a category name is stored once, not on every product row) and keeps values consistent if something changes. The cost is extra joins: a single BI query can now have to walk fact → product → category → department instead of a single hop, which is more work for a columnar query engine and more complexity for whoever is writing the query.</p>
+
+<div class="table-scroll">
+  <table class="spec-table compare">
+    <caption>Star vs snowflake schema</caption>
+    <thead><tr><th>Concept</th><th>Star Schema</th><th>Snowflake Schema</th></tr></thead>
+    <tbody>
+      <tr><td>Dimension shape</td><td>Denormalized, flat</td><td>Normalized into sub-dimensions</td></tr>
+      <tr><td>Joins per query</td><td>One join, fact to dimension</td><td>Multiple joins through normalized chains</td></tr>
+      <tr><td>Storage redundancy</td><td>Some repeated values across rows</td><td>Little to none — each value stored once</td></tr>
+      <tr><td>Best fit</td><td>Fast, self-serve BI; the common default today</td><td>Very large, slowly-changing dimensions where redundancy really matters</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<div class="diagram" data-diagram='{
+  "title": "One join vs a normalized chain: star schema vs snowflake schema",
+  "nodes": [
+    {"id":"fact1","x":180,"y":240,"w":160,"h":60,"kind":"storage","label":"fact_orders"},
+    {"id":"dimA","x":40,"y":60,"w":150,"h":55,"kind":"storage","label":"dim_customer"},
+    {"id":"dimB","x":280,"y":60,"w":150,"h":55,"kind":"storage","label":"dim_product"},
+    {"id":"dimC","x":40,"y":420,"w":150,"h":55,"kind":"storage","label":"dim_date"},
+    {"id":"dimD","x":280,"y":420,"w":150,"h":55,"kind":"storage","label":"dim_region"},
+    {"id":"fact2","x":560,"y":250,"w":160,"h":60,"kind":"storage","label":"fact_orders"},
+    {"id":"dimCust2","x":560,"y":70,"w":160,"h":55,"kind":"storage","label":"dim_customer"},
+    {"id":"dimProd2","x":800,"y":180,"w":160,"h":55,"kind":"storage","label":"dim_product"},
+    {"id":"dimCat2","x":800,"y":350,"w":160,"h":55,"kind":"storage","label":"dim_category"}
+  ],
+  "edges": [
+    {"from":"fact1","to":"dimA","label":"1 join"},
+    {"from":"fact1","to":"dimB","label":"1 join"},
+    {"from":"fact1","to":"dimC","label":"1 join"},
+    {"from":"fact1","to":"dimD","label":"1 join"},
+    {"from":"fact2","to":"dimCust2","label":"1 join"},
+    {"from":"fact2","to":"dimProd2","label":"1 join"},
+    {"from":"dimProd2","to":"dimCat2","label":"2nd join, normalized"}
+  ],
+  "groups": [
+    {"x":10,"y":20,"w":450,"h":500,"label":"Star schema: one join to any dimension"},
+    {"x":540,"y":20,"w":440,"h":500,"label":"Snowflake schema: normalized, extra joins"}
+  ]
+}'></div>
+
+<div class="callout tradeoff"><p>Snowflaking a dimension saves storage and keeps values consistent, but every extra join is one more thing a columnar query engine has to match and shuffle across nodes. For most BI workloads today storage is the cheap resource and query latency is the expensive one — which is why star schemas, or even one wide denormalized table, are the more common default in cloud warehouses now.</p></div>
+
+<h2><span class="idx">07</span>One Full Pipeline, End To End: From MySQL And MongoDB To A BI Dashboard</h2>
+<p>Everything above is easier to hold onto as one concrete flow. Here is a single e-commerce example that uses all of it: an app that writes orders to MySQL and product-view events to MongoDB (the same two databases from Ch.6, Ch.7, and Ch.8), ending in a dashboard a business team actually looks at.</p>
+
+<h3>Step 1: Writes Land In MySQL And MongoDB</h3>
+<p>Checkout inserts a row into a MySQL <code>orders</code> table — normalized, indexed on <code>order_id</code> and <code>user_id</code>, a few-millisecond write. Every product page view inserts a document into a MongoDB <code>product_views</code> collection — semi-structured, high write volume, no fixed schema across every event type. Both are textbook OLTP writes from section 01: small, fast, touching only what one request needs.</p>
+
+<h3>Step 2: Getting Data Out Without Touching Production</h3>
+<p>There are two ways to move this data out, and the choice depends on how fresh the analytics need to be.</p>
+<ul>
+  <li><strong>CDC (change data capture)</strong> — a tool like Debezium tails MySQL's <strong>binlog</strong> directly, the same replication stream MySQL already uses to feed read replicas (see Ch.6). For MongoDB, Debezium instead watches MongoDB's <strong>change streams</strong> API, which is itself built on top of the oplog — the same underlying log MongoDB uses for its own replication, just not read as a raw file the way the binlog is. Either way, Debezium turns every insert, update, and delete into an event, continuously and near real time, without ever issuing a query against the live database. This is the low-risk option: it adds no scan cost and no extra locking to production, because it is just another consumer of a stream that already exists.</li>
+  <li><strong>Batch export</strong> — for data where near-real-time is not needed, a scheduled job runs an export (a <code>mysqldump</code>-style extract, a <code>mongoexport</code>) on a fixed schedule, pointed at a read replica rather than the primary, and ideally during low-traffic hours. This bounds the blast radius from section 01 by keeping the heavy read entirely off the primary.</li>
+</ul>
+
+<h3>Step 3: Landing In The Lake As Parquet</h3>
+<p>A pipeline — commonly Kafka Connect running the Debezium connectors, feeding a Kafka topic (Ch.14), read by a Spark or Flink job, or a managed equivalent like AWS DMS — writes these change events into Amazon S3, converting them into <strong>Parquet</strong> files as they land, partitioned by date (for example, <code>s3://lake/orders/dt=2025-07-26/</code>). Landing in Parquet instead of raw JSON is the payoff from section 03: any later analytical query only pays for the column chunks and column statistics it actually needs, not for the whole record.</p>
+
+<h3>Step 4: Making The Lake Reliable With A Table Format</h3>
+<p>Those Parquet files get registered as an <strong>Iceberg</strong> table (Delta Lake works the same way) rather than being left as loose files in a folder. That means a schema change — say the app team adds a new <code>discount_code</code> field — does not silently break every downstream reader, and a bad ingestion run can be rolled back with time travel instead of someone manually deleting files. <strong>AWS Glue Data Catalog</strong> stores the table's schema and partition metadata so query engines know what exists without scanning the files first.</p>
+
+<h3>Step 5: Querying The Lake Directly</h3>
+<p><strong>Athena</strong> (a serverless engine built on Presto/Trino) or a <strong>Spark</strong> job can now run ad hoc SQL directly against these Iceberg-backed files in S3, paying only for the bytes scanned, without ever touching MySQL or MongoDB again. This is the layer a data scientist or an analyst doing one-off exploration reaches for.</p>
+
+<h3>Step 6: Curating Into A Warehouse For BI</h3>
+<p>A scheduled job — dbt running SQL, an ELT pattern from section 05 — reads from the Iceberg tables and models the data into a star schema (section 06): a <code>fact_orders</code> table plus <code>dim_customer</code>, <code>dim_product</code>, and <code>dim_date</code> tables, loaded into <strong>Snowflake</strong>, <strong>BigQuery</strong>, or <strong>Redshift</strong>. This is the curated, fast layer that BI tools (Looker, Tableau, Metabase) actually query for dashboards — known questions, pre-modeled, sub-second responses.</p>
+<p>Notice what never happens anywhere in this chain: at no point does a dashboard, a scheduled report, or an analyst's ad hoc query run against the MySQL or MongoDB instances serving live checkout and page-view traffic. Every one of the operational risks from section 01 — lock contention, scan cost, blast radius — is designed out by construction, because the analytical workload physically runs on a different system, built and priced for exactly that job.</p>
+
+<div class="diagram" data-diagram='{
+  "title": "End to end: MySQL and MongoDB to a BI dashboard",
+  "nodes": [
+    {"id":"mysql","x":20,"y":40,"w":170,"h":60,"kind":"storage","label":"MySQL: orders","sub":"OLTP, primary"},
+    {"id":"mongo","x":20,"y":160,"w":170,"h":60,"kind":"storage","label":"MongoDB: product views","sub":"OLTP, primary"},
+    {"id":"replica","x":20,"y":280,"w":170,"h":60,"kind":"storage","label":"MySQL read replica","sub":"batch export source"},
+    {"id":"cdc","x":230,"y":100,"w":180,"h":70,"kind":"compute","label":"Debezium CDC","sub":"binlog + change streams"},
+    {"id":"batchjob","x":230,"y":280,"w":180,"h":60,"kind":"compute","label":"Batch export job","sub":"nightly, off peak"},
+    {"id":"s3lake","x":450,"y":100,"w":180,"h":70,"kind":"storage","label":"S3 data lake","sub":"raw Parquet files"},
+    {"id":"icebergtable","x":450,"y":220,"w":180,"h":60,"kind":"storage","label":"Iceberg table","sub":"ACID, schema, time travel"},
+    {"id":"catalog","x":450,"y":340,"w":180,"h":60,"kind":"compute","label":"Glue Data Catalog","sub":"schema and partitions"},
+    {"id":"athena","x":650,"y":40,"w":170,"h":60,"kind":"compute","label":"Athena / Spark SQL","sub":"ad hoc queries on the lake"},
+    {"id":"dbt","x":650,"y":220,"w":170,"h":60,"kind":"compute","label":"dbt (ELT)","sub":"builds the star schema"},
+    {"id":"warehouse","x":850,"y":140,"w":140,"h":70,"kind":"storage","label":"Snowflake / BigQuery","sub":"fact and dim tables"},
+    {"id":"bi","x":850,"y":280,"w":140,"h":60,"kind":"external","label":"BI dashboards","sub":"Looker, Tableau"}
+  ],
+  "edges": [
+    {"from":"mysql","to":"cdc","label":"binlog stream"},
+    {"from":"mongo","to":"cdc","label":"change stream"},
+    {"from":"replica","to":"batchjob","label":"nightly export"},
+    {"from":"cdc","to":"s3lake","label":"write Parquet"},
+    {"from":"batchjob","to":"s3lake","label":"write Parquet"},
+    {"from":"s3lake","to":"icebergtable","label":"table snapshot"},
+    {"from":"icebergtable","to":"catalog","label":"schema, partitions"},
+    {"from":"catalog","to":"athena","label":"table metadata"},
+    {"from":"icebergtable","to":"athena","label":"column-pruned scan"},
+    {"from":"icebergtable","to":"dbt","label":"reads raw rows"},
+    {"from":"dbt","to":"warehouse","label":"loads star schema"},
+    {"from":"warehouse","to":"bi","label":"dashboard queries"}
+  ],
+  "groups": [
+    {"x":10,"y":20,"w":200,"h":340,"label":"Production OLTP, never queried by BI"},
+    {"x":220,"y":20,"w":410,"h":400,"label":"S3 data lake: Parquet + Iceberg"},
+    {"x":640,"y":20,"w":190,"h":380,"label":"Query and transform"},
+    {"x":840,"y":110,"w":160,"h":260,"label":"Warehouse for BI"}
+  ]
+}'></div>
+
+<div class="callout say-this"><p>"Checkout writes to MySQL and product-view events land in MongoDB. Debezium tails MySQL's binlog directly and watches MongoDB's change streams, which are built on top of the oplog — both hook into replication mechanisms the databases already run, so capturing changes costs production nothing extra. Those change events land in S3 as Parquet, registered as an Iceberg table for schema safety and time travel. Athena and Spark query that table directly for ad hoc analysis, and a nightly dbt job reshapes it into a star schema inside Snowflake, which is what the BI dashboards actually query. Production never sees a single analytical query."</p></div>
+
+<div class="callout em-angle"><p>An EM-level answer names the build-vs-buy choice at each hop: self-hosted Debezium plus Kafka Connect versus a managed CDC service like AWS DMS or Fivetran; a self-run Spark cluster versus serverless Athena; Iceberg or Delta tables in your own S3 buckets versus fully managed Snowflake or BigQuery storage. Every one of those is "pay with engineering time" versus "pay with a bigger cloud bill," and the right side of that trade shifts as data volume and team size grow.</p></div>
+
+<div class="specsheet">
+  <details>
+    <summary><span class="cat">Workload</span> OLTP vs OLAP, one line each</summary>
+    <div class="specbody">
+      <ul>
+        <li><strong>OLTP</strong> — many small reads/writes touching a few indexed rows, millisecond latency, current-state data.</li>
+        <li><strong>OLAP</strong> — fewer but much heavier queries scanning millions to billions of rows, seconds-to-minutes latency, aggregates over history.</li>
+      </ul>
+    </div>
+  </details>
+  <details>
+    <summary><span class="cat">Formats</span> Parquet vs ORC vs Avro, one line each</summary>
+    <div class="specbody">
+      <ul>
+        <li><strong>Parquet</strong> — columnar, from Twitter/Cloudera, the default across Spark/Athena/BigQuery.</li>
+        <li><strong>ORC</strong> — columnar, grew out of Hive, common default in Hadoop/Hive-heavy stacks.</li>
+        <li><strong>Avro</strong> — row-based, schema travels with the data, the standard for Kafka messages.</li>
+      </ul>
+    </div>
+  </details>
+  <details>
+    <summary><span class="cat">Tables</span> Delta Lake vs Iceberg vs Hudi, one line each</summary>
+    <div class="specbody">
+      <ul>
+        <li><strong>Delta Lake</strong> — built by Databricks; JSON transaction log (<code>_delta_log</code>) of file adds/removes.</li>
+        <li><strong>Iceberg</strong> — built at Netflix to fix Hive-on-S3 problems; now Apache, broadly adopted.</li>
+        <li><strong>Hudi</strong> — built at Uber for upsert-heavy CDC ingestion; copy-on-write and merge-on-read table types.</li>
+      </ul>
+    </div>
+  </details>
+  <details>
+    <summary><span class="cat">Pipeline</span> ETL vs ELT, one line each</summary>
+    <div class="specbody">
+      <ul>
+        <li><strong>ETL</strong> — transform before loading, in a separate step; less destination compute, raw data usually not kept.</li>
+        <li><strong>ELT</strong> — load raw first, transform inside the destination; keeps raw data, transform logic lives as versioned SQL.</li>
+      </ul>
+    </div>
+  </details>
+  <details>
+    <summary><span class="cat">Schema</span> Star vs snowflake schema, one line each</summary>
+    <div class="specbody">
+      <ul>
+        <li><strong>Star</strong> — denormalized dimensions, one join from fact to any dimension, fast and simple.</li>
+        <li><strong>Snowflake</strong> — normalized dimensions, extra joins, less redundant storage, more schema complexity.</li>
+      </ul>
+    </div>
+  </details>
+</div>
+
+<div class="flashcards" data-cards='[
+  {"q":"What is the core difference between an OLTP query and an OLAP query?","a":"OLTP touches a handful of rows through an index and finishes in milliseconds, like inserting one order. OLAP scans millions to billions of rows to compute an aggregate, like summing revenue by region over a year, and can take seconds to minutes."},
+  {"q":"Why does a long-running analytical read hurt a production MySQL database even though it only reads?","a":"Under InnoDB&#39;s MVCC, a long read holds an old read view open, which blocks the purge thread from cleaning up old row versions. The undo log grows, eating disk and cache space the live OLTP workload needs. A plain SELECT itself takes no gap locks under the default REPEATABLE READ or under READ COMMITTED &mdash; only locking reads, a write with a range predicate, or the rarely-used SERIALIZABLE isolation level can take gap locks that block inserts."},
+  {"q":"What does &#39;blast radius&#39; mean when running analytics on a production database?","a":"The analytics query competes with live traffic for the same CPU, memory buffer pool, disk I/O, and connection pool. One heavy query can slow down or time out every user request sharing that machine, not just the analytics job itself."},
+  {"q":"What is a data lake for?","a":"Storing raw data of any shape, structured, semi-structured, or unstructured, cheaply and at scale on object storage, without deciding the schema upfront (schema-on-read), so it can be explored or reprocessed later."},
+  {"q":"What is a data warehouse for?","a":"Storing modeled, structured data with the schema decided upfront (schema-on-write), organized for fast, known, repeatable BI queries and dashboards."},
+  {"q":"What problem does a lakehouse solve?","a":"It puts warehouse-style guarantees, ACID transactions, schema enforcement, fast queries, on top of cheap lake-style object storage, so you avoid keeping two separate copies of the data (one in the lake, one in the warehouse) that can drift out of sync."},
+  {"q":"Why do columnar formats like Parquet and ORC win for analytics?","a":"A query needing 2 of 50 columns only reads those column chunks off disk, and values of one type stored together compress far better than row-oriented data. Both effects cut scan cost a lot."},
+  {"q":"Why is Avro, a row-based format, preferred for Kafka streaming instead of Parquet?","a":"Avro serializes and deserializes one record at a time fast, matching how a stream produces messages, and its schema travels with the data so producers and consumers can evolve independently. Parquet needs to buffer many rows to build a column chunk before writing, which does not fit a per-message stream."},
+  {"q":"What problem do table formats like Delta Lake, Iceberg, and Hudi solve?","a":"Plain files in object storage have no ACID transactions, no schema enforcement, and no time travel. These formats add a transaction log or metadata layer on top of the files, giving atomic commits, safe schema evolution, and the ability to query or roll back to a past version of the table."},
+  {"q":"Where did Iceberg and Hudi each originate?","a":"Iceberg was built at Netflix to fix problems with Hive tables on S3, later donated to Apache. Hudi was built at Uber to handle upsert-heavy, CDC-style ingestion on Hadoop/S3-style storage."},
+  {"q":"ETL vs ELT, what is the practical difference?","a":"ETL transforms data in a separate step before loading it into the destination, so the warehouse only stores modeled data. ELT loads raw data into the destination first and transforms it there using the destination&#39;s own compute, so you keep a raw copy and transform logic lives as versioned code, like dbt models."},
+  {"q":"Star schema vs snowflake schema, what is the trade-off?","a":"Star schema denormalizes dimension tables so every dimension is one join from the fact table, fast and simple with some redundant data. Snowflake schema normalizes dimensions further, removing redundancy, but adds extra joins that cost more on a columnar query engine."},
+  {"q":"What is CDC (change data capture), and why does it add no load to the production database?","a":"CDC tools like Debezium read the database&#39;s existing replication mechanism &mdash; MySQL&#39;s binlog directly, or MongoDB&#39;s change streams API, which is itself built on the oplog &mdash; instead of running a query against the live database. Either way it is just another consumer of a stream the database already produces to feed read replicas, so capturing every change this way costs the production system nothing extra."},
+  {"q":"In the worked pipeline, why does the BI dashboard never query MySQL or MongoDB directly?","a":"CDC and batch export move the data into an S3-based lake and then a warehouse, and every analytical query, ad hoc or scheduled, runs against those systems instead. That isolates dashboard load from the systems serving live checkout and product-view traffic, so a bad query cannot cause a production outage."},
+  {"q":"What does the AWS Glue Data Catalog do in a lake-based pipeline?","a":"It stores the schema and partition metadata for tables sitting in S3, so query engines like Athena and Spark know what columns and partitions exist without scanning the files first."}
+]'></div>

@@ -1,0 +1,1441 @@
+<p class="lede">This chapter is a bank of fifteen full system-design interview problems built from social and content products — feeds, live comments and voting, live video and audio, and the write-heavy behaviors (likes, votes, comments, plays) that show up whenever a huge audience gathers around user-generated content. Work a handful of these end-to-end rather than skimming all fifteen; the same small toolbox of techniques keeps reappearing.</p>
+
+<h2><span class="idx">00</span>How to use this chapter</h2>
+<p>Almost every problem here reduces to the same shape: a small number of writes (one tweet, one vote, one broadcast frame) need to reach a huge number of readers within a second or two, without the write path ever blocking on how many readers there are. The differences between problems are mostly about <em>which</em> tool from a shared toolbox fits the read/write ratio, the consistency bar, and the fan-out size — not about needing a completely new architecture each time. The specsheet below is a quick-lookup reference for the techniques that recur across several problems in this chapter; when a deep dive says "the same pattern as," this is the shared vocabulary it means.</p>
+
+<div class="specsheet">
+  <details>
+    <summary><span class="cat">Fan-out</span> Fan-out on write vs. fan-out on read (the celebrity problem)</summary>
+    <div class="specbody">
+      <ul>
+        <li><strong>Fan-out on write (push):</strong> when content is created, immediately push a pointer to it into every follower's precomputed feed/cache. Cheap reads (one cache lookup), but a write's cost scales with the follower count.</li>
+        <li><strong>Fan-out on read (pull):</strong> don't precompute anything; assemble the feed at read time by pulling from everyone the reader follows. Cheap, bounded writes, but reads get more expensive as the number of people followed grows.</li>
+        <li><strong>The hybrid almost every real system lands on:</strong> push for ordinary accounts (a few hundred followers), pull for accounts above a follower threshold — so one celebrity's post can never turn into millions of cache writes at once.</li>
+        <li>Used by: Twitter/X, Instagram, Facebook-style feed, Medium, Snapchat stories, LinkedIn — anywhere a single writer's audience size varies by orders of magnitude.</li>
+      </ul>
+    </div>
+  </details>
+  <details>
+    <summary><span class="cat">Counters</span> Write-behind, approximate counters</summary>
+    <div class="specbody">
+      <ul>
+        <li>Writing a database row and re-running an exact aggregate on every like, vote, or play does not survive a viral moment — thousands of writes per second would serialize against the same row.</li>
+        <li>The fix: increment a value in a fast in-memory store (commonly Redis) synchronously for what the UI shows, and periodically reconcile that count against the durable source of truth asynchronously.</li>
+        <li>Watch the exception: a per-user vote or play record that guards against double-counting (fraud, royalties) usually still needs a strongly consistent, durable write — only the <em>aggregate number shown to users</em> gets the loose, fast treatment.</li>
+        <li>Used by: Instagram likes, Reddit vote scores, Spotify play counts (with a stricter, separate ledger for royalty-grade counts), TikTok/Pinterest engagement signals.</li>
+      </ul>
+    </div>
+  </details>
+  <details>
+    <summary><span class="cat">Caching</span> Cache-aside plus CDN for hot, read-heavy content</summary>
+    <div class="specbody">
+      <ul>
+        <li>The durable copy of content lives in a database or object store; a cache (in-memory for structured data, a CDN for media bytes) sits in front and is rebuilt from that source of truth whenever it is missing or stale.</li>
+        <li>Content that is public and close to immutable once published (a tweet, an article, a video segment) is the easiest thing in the whole system to cache aggressively — the hard part is usually a <em>different</em> piece of data (a personal quota check, a per-user vote) that must never be served from the same shared cache.</li>
+        <li>Used by: nearly every problem in this chapter in some form — Twitter/X's tweet cache, Instagram/YouTube/Spotify media behind a CDN, Medium's article cache next to an always-uncached paywall check.</li>
+      </ul>
+    </div>
+  </details>
+  <details>
+    <summary><span class="cat">Real-time</span> Layered fan-out trees for massive concurrent push</summary>
+    <div class="specbody">
+      <ul>
+        <li>No single origin server can hold millions of open sockets or push gigabytes per second of updates to them directly.</li>
+        <li>The fix is a tree: origin publishes once to a handful of regional relay nodes, each relay re-publishes to hundreds of edge gateways, and each edge gateway pushes to the thousands of clients it personally holds — the same broadcast idea as pub/sub, stretched across multiple hops because no single hop can carry the whole fan-out factor.</li>
+        <li>Used by: live comments/voting, Twitch-style chat, Clubhouse's listener relay layer — anywhere a single event needs to reach millions of live connections within a second or two.</li>
+      </ul>
+    </div>
+  </details>
+  <details>
+    <summary><span class="cat">Ranking</span> Multi-stage candidate-generation-then-ranking funnels</summary>
+    <div class="specbody">
+      <ul>
+        <li>You cannot run an expensive relevance model against an entire catalog for every request. The standard shape is a funnel: cheap candidate generation pulls a few hundred to a few thousand plausible items, a lightweight pass narrows that further, and only the survivors get scored by the expensive final model.</li>
+        <li>Each stage trades some accuracy for speed, so the heaviest compute only ever runs on the small set that survived cheaper filters.</li>
+        <li>Used by: TikTok's For You feed, Facebook-style news feed, Pinterest's similarity search, Quora's expert routing, LinkedIn's people-you-may-know.</li>
+      </ul>
+    </div>
+  </details>
+</div>
+<article class="problem">
+  <h3>Design Twitter/X (Feed and Timeline)</h3>
+
+  <h4>Problem framing</h4>
+  <p>Twitter/X lets people post short text messages ("tweets") and follow other people. The feature interviewers care about most is the home timeline: a feed built from the tweets of everyone you follow, shown roughly newest-first. Strip away search, ads, and direct messages and this problem is really about one thing: a small number of writes need to fan out to a huge number of reads, fast.</p>
+
+  <h4>Clarifying questions</h4>
+  <ul>
+    <li><strong>Is the timeline strictly chronological, or algorithmically ranked?</strong> — decides whether we can just merge time-sorted lists or need a scoring/ranking step, like the Facebook-style feed covered later in this chapter.</li>
+    <li><strong>What's the maximum tweet length, and can tweets carry photos or video?</strong> — media changes storage and adds an encoding pipeline like the one used for Instagram or the video-streaming problem.</li>
+    <li><strong>Are retweets and replies first-class objects, or just pointers to an existing tweet?</strong> — a retweet-as-pointer keeps write volume and storage far lower than a retweet-as-copy.</li>
+    <li><strong>How many followers can a single account have?</strong> — this decides whether we can always fan out a new tweet to every follower's cache the moment it's posted, or need a special case for huge accounts.</li>
+    <li><strong>Is it acceptable for a tweet to reach a follower's timeline a few seconds late?</strong> — this decides how much consistency we can trade away for fan-out throughput.</li>
+  </ul>
+
+  <h4>Requirements</h4>
+  <p><strong>Functional requirements:</strong></p>
+  <ul>
+    <li>Post a tweet (up to 280 characters, optional media).</li>
+    <li>Follow and unfollow other users.</li>
+    <li>Fetch the home timeline: tweets from people you follow, newest first.</li>
+    <li>Fetch a single user's own tweets.</li>
+    <li>Like and retweet a tweet.</li>
+  </ul>
+  <p><strong>Non-functional requirements:</strong></p>
+  <ul>
+    <li>Home timeline reads should return in under 200ms at the 99th percentile (p99 — 99 out of 100 requests are at least this fast).</li>
+    <li>Posting a tweet must never block on delivering it to millions of followers; the write path has to stay fast regardless of follower count.</li>
+    <li>Eventual consistency is fine for timelines — a follower seeing a tweet a few seconds late is acceptable.</li>
+    <li>Reads must stay highly available; a stale timeline is a better failure than an error page.</li>
+    <li>Once a tweet's write is acknowledged, it must never be lost.</li>
+  </ul>
+
+  <h4>Capacity estimate</h4>
+  <p>Assume 200 million daily active users (DAU). Assume each DAU posts an average of 2 tweets a day, which gives 400 million tweets/day.</p>
+  <p>Write QPS (queries per second) ≈ 400,000,000 / 86,400 seconds ≈ 4,630/sec average. Using roughly 4x for peak traffic on a global, diurnal product gives about 18,500/sec at peak.</p>
+  <p>Reads dominate. Assume each DAU checks the home timeline about 30 times a day, each fetch pulling roughly 20 tweets. That's 200,000,000 × 30 = 6 billion timeline-fetch requests/day. Read QPS ≈ 6,000,000,000 / 86,400 ≈ 69,400/sec average, peak ≈ 280,000/sec. In this estimate that's roughly 15 reads for every write — this is a read-heavy system, and the exact multiple in a real product depends on exactly how often people check versus post.</p>
+  <p>Storage: a tweet row (id, user_id, text, timestamps, counters) is roughly 300 bytes. 400,000,000 × 300 bytes ≈ 120GB/day of text alone, around 44TB a year. Assume 15% of tweets attach media averaging 300KB (a compressed photo): 400,000,000 × 0.15 × 300KB ≈ 18TB/day — media dwarfs text almost immediately.</p>
+  <p>The social graph: 200 million users with an average of 200 follow-edges each is 40 billion edges. At roughly 16 bytes per edge (two 8-byte IDs) that's about 640GB before any indexes — enough that the follower graph usually gets its own dedicated store rather than living inside the tweet database.</p>
+
+  <h4>API design</h4>
+  <pre><code>POST   /v1/tweets              {text, media_ids[]} -> {tweet_id, created_at}
+DELETE /v1/tweets/{id}
+POST   /v1/users/{id}/follow
+DELETE /v1/users/{id}/follow
+GET    /v1/timeline/home?cursor=&amp;limit=20 -> {tweets[], next_cursor}
+GET    /v1/users/{id}/tweets?cursor=&amp;limit=20
+POST   /v1/tweets/{id}/like</code></pre>
+
+  <h4>High-level design</h4>
+  <p>A write service durably stores each tweet, then an async pipeline fans it out to follower timeline caches; a read path serves from that cache and falls back to fanning in when the cache is cold.</p>
+  <div class="diagram" data-diagram='{
+    "title": "Twitter/X tweet write path, async fan-out, and timeline read path",
+    "nodes": [
+      {"id":"client","x":30,"y":270,"w":150,"h":60,"kind":"external","label":"Client apps"},
+      {"id":"gw","x":220,"y":270,"w":150,"h":60,"kind":"compute","label":"API Gateway / LB","sub":"authn, rate limit"},
+      {"id":"tweetsvc","x":420,"y":30,"w":180,"h":60,"kind":"compute","label":"Tweet Service","sub":"write path"},
+      {"id":"timelinesvc","x":420,"y":270,"w":180,"h":60,"kind":"compute","label":"Timeline Service","sub":"read path"},
+      {"id":"fanoutq","x":650,"y":30,"w":170,"h":60,"kind":"queue","label":"Fan-out Queue"},
+      {"id":"fanoutwk","x":850,"y":30,"w":130,"h":60,"kind":"compute","label":"Fan-out Workers"},
+      {"id":"tweetdb","x":650,"y":150,"w":170,"h":60,"kind":"storage","label":"Tweet Store","sub":"sharded by tweet_id"},
+      {"id":"timelinecache","x":650,"y":270,"w":170,"h":60,"kind":"storage","label":"Timeline Cache","sub":"Redis list per user"},
+      {"id":"graphdb","x":650,"y":460,"w":170,"h":60,"kind":"storage","label":"Social Graph Store","sub":"follower/following edges"}
+    ],
+    "edges": [
+      {"from":"client","to":"gw","label":"post / read timeline"},
+      {"from":"gw","to":"tweetsvc","label":"post tweet"},
+      {"from":"gw","to":"timelinesvc","label":"GET home timeline"},
+      {"from":"tweetsvc","to":"tweetdb","label":"durable write"},
+      {"from":"tweetsvc","to":"fanoutq","label":"enqueue fan-out job"},
+      {"from":"fanoutq","to":"fanoutwk"},
+      {"from":"fanoutwk","to":"graphdb","label":"read follower list"},
+      {"from":"fanoutwk","to":"timelinecache","label":"push tweet_id to followers"},
+      {"from":"timelinesvc","to":"timelinecache","label":"read cached list"},
+      {"from":"timelinesvc","to":"tweetdb","label":"fan-in for celebrities / cold cache"}
+    ],
+    "groups": [
+      {"x":630,"y":10,"w":370,"h":220,"label":"Async fan-out pipeline"}
+    ]
+  }'></div>
+
+  <h4>Deep dive</h4>
+  <p><strong>1) Fan-out on write versus fan-out on read (the celebrity problem).</strong> For most accounts (a few hundred followers), fan-out-on-write is cheap: when a tweet is posted, a job goes on a queue, and workers look up the poster's follower list and push the new tweet_id onto every follower's precomputed timeline cache (a capped Redis list, maybe 800 entries per user). Reading a timeline then costs one cache read. But an account with 100 million followers would turn a single tweet into 100 million cache writes, enough to overwhelm the fan-out workers. The standard fix is a hybrid: fan out normally below a follower threshold, skip fan-out above it, and merge each celebrity's recent tweets in at read time instead. This caps the worst-case write cost regardless of follower count.</p>
+  <p><strong>2) The timeline cache is a materialized view, not the source of truth.</strong> The durable copy of every tweet lives in the tweet store, sharded by tweet_id (see Ch.6 for sharding strategies). The per-user timeline cache is a derived list that can be rebuilt any time by fanning in — querying the tweets of everyone the user follows and merge-sorting by time. This is the same cache-aside idea from Ch.4, applied to a list instead of a single key: normally read the cache, rebuild it from the source of truth when it's missing.</p>
+  <p><strong>3) Hot keys and thundering herds.</strong> A viral tweet gets read by millions of timelines within minutes. Cache the tweet object itself once, separately from the per-user timeline pointers, so it's fetched once and referenced many times rather than duplicated per follower. Apply the request-coalescing and jittered-TTL (time-to-live) techniques from Ch.4 so the timeline cache doesn't stampede the tweet store the moment a hot entry expires.</p>
+
+  <h4>Trade-offs</h4>
+  <div class="callout tradeoff"><p>At 10x scale, the follower-graph lookup ("who follows this user?") tends to become a bottleneck before the tweet write path does — a fast-growing account crossing the fan-out threshold mid-burst can double queue depth in seconds. The trade-off is lowering the celebrity threshold aggressively (some followers get delayed delivery) versus over-provisioning fan-out workers for a burst you might only see once a year.</p></div>
+
+  <h4>Say this</h4>
+  <div class="callout say-this"><p>"For a feed problem like this, I'd default to fan-out-on-write because timeline reads vastly outnumber writes here, but I'd carve out a fan-out-on-read exception for accounts above a follower threshold — otherwise one celebrity's tweet turns into a queue backlog that delays fan-out for everyone else."</p></div>
+
+  <h4>Final design</h4>
+  <p>One picture: a write service durably stores the tweet, then hands off to an async fan-out pipeline that pushes tweet_ids into each follower's Redis timeline list. Accounts above a follower threshold skip fan-out and get merged in at read time instead. The tweet store is sharded by tweet_id; the social graph lives in its own store optimized for "give me this user's followers" lookups.</p>
+
+  <h4>EM-level follow-up</h4>
+  <div class="callout em-angle"><p>On rollout: the fan-out pipeline is usually owned by a different team than tweet storage, so the follower-threshold constant becomes a cross-team API contract, not a config value one team can silently change. On build-vs-buy: the queue in front of fan-out (see Ch.14) is a fine candidate for a managed service like SQS early on; the timeline cache is worth self-hosting once you hit this scale, because the eviction and list-capping logic is custom to this product.</p></div>
+</article>
+
+<article class="problem">
+  <h3>Design Instagram (Photo Sharing and Feed)</h3>
+
+  <h4>Problem framing</h4>
+  <p>Instagram is a photo-and-video sharing app: people upload media, follow other people, and scroll a feed built from posts by who they follow. Compared with Twitter/X, the object being stored and served is large binary media, not short text — so the interesting engineering here is the media pipeline, not just the social fan-out.</p>
+
+  <h4>Clarifying questions</h4>
+  <ul>
+    <li><strong>Photos only, or photos and short videos?</strong> — video needs a transcoding pipeline closer to the one in the video-streaming problem, not just image resizing.</li>
+    <li><strong>Is the feed chronological or ranked?</strong> — Instagram's real feed is ranked, not pure chronological, which turns the read path into "score and re-rank a candidate set" instead of just "merge sorted lists."</li>
+    <li><strong>Can a post carry multiple photos (a carousel)?</strong> — changes the post's data model from one media reference to an ordered list of them.</li>
+    <li><strong>What's the expected read-to-write ratio?</strong> — sets how aggressively the feed can be cached versus needing fresher reads.</li>
+    <li><strong>Are ephemeral Stories in scope, or just the permanent feed?</strong> — Stories have a very different storage lifetime (auto-expiring) and are covered as their own problem elsewhere in this chapter; assume out of scope here.</li>
+  </ul>
+
+  <h4>Requirements</h4>
+  <p><strong>Functional requirements:</strong></p>
+  <ul>
+    <li>Upload a post (one or more photos/videos plus a caption).</li>
+    <li>Follow and unfollow other users.</li>
+    <li>Fetch a ranked home feed.</li>
+    <li>Fetch a user's profile grid.</li>
+    <li>Like and comment on a post.</li>
+  </ul>
+  <p><strong>Non-functional requirements:</strong></p>
+  <ul>
+    <li>An upload should feel instant even though encoding takes seconds — the app acknowledges quickly and processes in the background.</li>
+    <li>Feed reads should return in under 300ms at p99.</li>
+    <li>All media is served through a CDN (content delivery network — a network of edge servers close to users); origin storage should almost never serve a read directly.</li>
+    <li>Once an upload is confirmed, the media must never be lost.</li>
+    <li>The feed can be a few seconds to a few minutes stale — freshness is not the top priority.</li>
+  </ul>
+
+  <h4>Capacity estimate</h4>
+  <p>Assume 500 million DAU, and that 20% of DAU upload at least one post a day, giving 100 million posts/day.</p>
+  <p>Write QPS ≈ 100,000,000 / 86,400 ≈ 1,160/sec average, peak (roughly 5x) ≈ 5,800/sec.</p>
+  <p>Reads: assume each DAU opens the feed 15 times a day. That's 500,000,000 × 15 = 7.5 billion feed-fetch requests/day. Read QPS ≈ 7,500,000,000 / 86,400 ≈ 86,800/sec average, peak (roughly 4x) ≈ 350,000/sec — in this estimate, about 75 reads for every upload.</p>
+  <p>Storage per post: assume 4 derived resolutions per photo (thumbnail ~20KB, feed-size ~150KB, full-res ~800KB, original ~2MB), roughly 3MB blended per photo. 100,000,000 × 3MB ≈ 300TB/day of media — this is why media lives in blob storage (an object store built for large binary files, like S3), not inside a relational database. Post metadata (id, user_id, caption, counters, media pointers) is small, maybe 500 bytes per post: 100,000,000 × 500 bytes = 50GB/day.</p>
+  <p>At 300TB/day, a year of media storage is well over 100 petabytes (300TB × 365 ≈ 109.5PB) — the reason old or rarely-viewed media eventually moves to cheaper, colder storage tiers instead of staying on the fastest disks forever.</p>
+
+  <h4>API design</h4>
+  <pre><code>POST /v1/media/upload-url          -> {upload_url, media_id}
+     (client uploads bytes directly to blob storage via a pre-signed URL,
+      not through the app servers)
+POST /v1/posts                     {media_ids[], caption} -> {post_id}
+GET  /v1/feed/home?cursor=         -> {posts[], next_cursor}
+GET  /v1/users/{id}/posts?cursor=
+POST /v1/posts/{id}/like
+POST /v1/posts/{id}/comments       {text}</code></pre>
+
+  <h4>High-level design</h4>
+  <p>Uploads flow through an async encode-and-moderate pipeline into blob storage behind a CDN; the feed is fanned out to a candidate cache and re-ranked at read time.</p>
+  <div class="diagram" data-diagram='{
+    "title": "Instagram upload, encode, and feed pipeline",
+    "nodes": [
+      {"id":"client","x":30,"y":270,"w":150,"h":60,"kind":"external","label":"Client apps"},
+      {"id":"gw","x":220,"y":270,"w":150,"h":60,"kind":"compute","label":"API / LB","sub":"authn, rate limit"},
+      {"id":"postsvc","x":420,"y":100,"w":170,"h":60,"kind":"compute","label":"Post Service","sub":"write path"},
+      {"id":"feedsvc","x":420,"y":270,"w":170,"h":60,"kind":"compute","label":"Feed Service","sub":"read + re-rank"},
+      {"id":"encq","x":650,"y":100,"w":160,"h":60,"kind":"queue","label":"Encode Queue"},
+      {"id":"encwk","x":850,"y":100,"w":130,"h":60,"kind":"compute","label":"Encode Workers","sub":"resize, moderate"},
+      {"id":"postdb","x":650,"y":270,"w":160,"h":60,"kind":"storage","label":"Post Metadata DB","sub":"sharded by user_id"},
+      {"id":"feedcache","x":850,"y":270,"w":130,"h":60,"kind":"storage","label":"Feed Cache"},
+      {"id":"blobstore","x":650,"y":440,"w":160,"h":60,"kind":"storage","label":"Blob Storage","sub":"raw + resized media"},
+      {"id":"cdn","x":850,"y":440,"w":130,"h":60,"kind":"external","label":"CDN"}
+    ],
+    "edges": [
+      {"from":"client","to":"gw","label":"upload / fetch feed"},
+      {"from":"gw","to":"postsvc","label":"create post"},
+      {"from":"gw","to":"feedsvc","label":"GET home feed"},
+      {"from":"postsvc","to":"postdb","label":"write post row"},
+      {"from":"postsvc","to":"blobstore","label":"media reference"},
+      {"from":"postsvc","to":"encq","label":"enqueue encode job"},
+      {"from":"encq","to":"encwk"},
+      {"from":"encwk","to":"blobstore","label":"write resolutions"},
+      {"from":"feedsvc","to":"feedcache","label":"read candidates"},
+      {"from":"feedsvc","to":"postdb","label":"fan-in on cold cache"},
+      {"from":"feedsvc","to":"cdn","label":"media URLs"},
+      {"from":"blobstore","to":"cdn","label":"origin pull"}
+    ],
+    "groups": [
+      {"x":630,"y":80,"w":370,"h":210,"label":"Async encode pipeline"}
+    ]
+  }'></div>
+
+  <h4>Deep dive</h4>
+  <p><strong>1) The upload path is decoupled from the encoding pipeline.</strong> The client gets a pre-signed URL (a temporary, permission-scoped URL — see Ch.16 for the security model behind these) and uploads bytes straight to blob storage, skipping the app servers. Once the upload completes, a message goes on a queue; media workers generate the resolution ladder, run a moderation/abuse classifier, and only then mark the post visible. This is why an upload can feel instant even though real encoding work happens after the "success" screen appears.</p>
+  <p><strong>2) Feed generation is fan-out plus a ranking pass, not just a merge.</strong> Like Twitter/X, Instagram precomputes each user's candidate feed by fanning out when someone they follow posts. But unlike a pure chronological timeline, the feed service re-ranks that candidate list at read time — using signals like predicted like/watch probability, recency, and relationship strength — so the read path is "fetch candidates, then score and sort," not just "return the cached list." Instagram sits between Twitter's mostly-chronological model and the fully-ranked Facebook-style feed covered elsewhere in this chapter.</p>
+  <p><strong>3) Counters must not become a write bottleneck.</strong> A viral post can get thousands of likes per second. Writing one row per like and running a live count doesn't scale. The fix is an approximate, eventually-consistent counter: increment a value in a fast store (Redis) synchronously for the UI, and periodically reconcile the true count into durable storage asynchronously — the same write-behind idea from Ch.4, applied to a counter instead of a cached row.</p>
+
+  <h4>Trade-offs</h4>
+  <div class="callout tradeoff"><p>At 10x scale, the encoding fleet becomes the bottleneck before the database does — if upload volume triples but transcode throughput doesn't, the queue backs up and "processing" takes minutes instead of seconds. The trade-off is autoscaling encoding workers aggressively (real cost) versus letting users see a visibly delayed post.</p></div>
+
+  <h4>Say this</h4>
+  <div class="callout say-this"><p>"I'd decouple the upload acknowledgment from the encoding work — the client should get a fast 'upload received' response, with a background pipeline generating resolutions and running moderation asynchronously. Coupling them means a slow transcode blocks the whole request and makes uploads feel broken under load."</p></div>
+
+  <h4>Final design</h4>
+  <p>One upload path (pre-signed URL straight to blob storage, then an async encode-and-moderate pipeline) and one read path (a fan-out-populated candidate cache, re-ranked at read time, with a CDN in front of every media byte so origin storage barely sees read traffic).</p>
+
+  <h4>EM-level follow-up</h4>
+  <div class="callout em-angle"><p>On build-vs-buy: image resizing and CDN delivery are commodity work — use a managed image pipeline and a CDN vendor rather than building either in year one. On org impact: the ranking model is usually owned by a separate ML team from the feed-serving team, so the feed service needs a stable feature/scoring contract between them, or every model change turns into a feed-service deploy.</p></div>
+</article>
+
+<article class="problem">
+  <h3>Design a TikTok-Style Short-Video Feed (For You Ranking)</h3>
+
+  <h4>Problem framing</h4>
+  <p>The For You feed is a stream of short videos chosen for you, not from people you follow — this is a recommendation problem at massive scale, not a social-graph fan-out problem. Unlike Twitter/X or Instagram, almost any video from any creator is a valid candidate for almost any viewer; there's no "who do I follow" filter narrowing things down first.</p>
+
+  <h4>Clarifying questions</h4>
+  <ul>
+    <li><strong>Is the feed purely algorithmic, or do we also need a Following tab?</strong> — a Following tab is a simpler fan-out problem like Twitter/X; the interesting design work is the algorithmic ranking.</li>
+    <li><strong>What behavioral signals do we have?</strong> — watch time, completion rate, re-watches, likes, shares, and skip speed are different-strength signals and shape what the ranking model needs as input.</li>
+    <li><strong>Should new videos and new creators get a fair chance of being shown (the cold-start problem)?</strong> — decides whether we need a dedicated exploration mechanism.</li>
+    <li><strong>How stale can "trending right now" be?</strong> — decides how real-time the signal pipeline needs to be.</li>
+    <li><strong>Do uploads need chunked/resumable transfer, or are clips short enough for a single-shot upload?</strong> — changes the complexity of the upload path.</li>
+  </ul>
+
+  <h4>Requirements</h4>
+  <p><strong>Functional requirements:</strong></p>
+  <ul>
+    <li>Upload a short video (bounded length, for example up to 3 minutes).</li>
+    <li>Serve an infinite-scroll For You feed, one video at a time.</li>
+    <li>Record engagement signals: watch time, like, share, comment, skip.</li>
+    <li>Follow creators (a secondary, simpler feed).</li>
+  </ul>
+  <p><strong>Non-functional requirements:</strong></p>
+  <ul>
+    <li>The next video should start playing almost instantly — target under 100-200ms to first frame, which means prefetching before the user finishes swiping.</li>
+    <li>Ranking must react to behavior within the same session, not just overnight — interest and trends shift in minutes.</li>
+    <li>New or unproven content must get some exposure (cold start) without dominating the feed.</li>
+    <li>High availability for the feed matters more than a perfectly fresh ranking — an empty feed is a worse failure than a slightly stale one.</li>
+  </ul>
+
+  <h4>Capacity estimate</h4>
+  <p>Assume 800 million DAU, each watching roughly 100 short videos a day — a defining trait of this product is very high volume per session.</p>
+  <p>View events/day = 800,000,000 × 100 = 80 billion. View QPS ≈ 80,000,000,000 / 86,400 ≈ 926,000/sec average. This is dominated by CDN-served video bytes rather than application logic, but the engagement-event write path still sees this order of magnitude. Peak (roughly 2.5x) ≈ 2.3 million/sec at global scale — a load that leans entirely on caching and edge delivery rather than an origin database ever answering directly.</p>
+  <p>Uploads: assume 1% of DAU upload a video a day, giving 8 million uploads/day. Upload QPS ≈ 8,000,000 / 86,400 ≈ 93/sec average, peak (roughly 5x) ≈ 500/sec — small next to reads, but each upload triggers a much heavier async job (transcoding).</p>
+  <p>Storage: assume each uploaded clip is transcoded into about 4 renditions (different resolution/bitrate combinations for adaptive streaming) totaling roughly 40MB per video. 8,000,000 × 40MB ≈ 320TB/day added to storage. Engagement events (user_id, video_id, watch_ms, timestamp) are tiny individually, maybe 40 bytes, but at 80 billion/day that's roughly 3.2TB/day of raw event data before any aggregation — a streaming-pipeline problem (see Ch.14), not something written row-by-row into an OLTP (online transaction processing) database.</p>
+
+  <h4>API design</h4>
+  <pre><code>POST /v1/videos/upload-url             -> {upload_url, video_id}
+POST /v1/videos/{id}/publish           {caption, ...}
+GET  /v1/feed/foryou?session_id=&amp;cursor= -> {videos[]}
+     (returns a short batch, typically 1-5 videos, to keep the
+      client's playback buffer full without over-fetching)
+POST /v1/events/engagement             {video_id, watch_ms, action}
+     (fire-and-forget, batched client-side)
+POST /v1/videos/{id}/like</code></pre>
+
+  <h4>High-level design</h4>
+  <p>Every feed request runs through a multi-stage recommendation funnel, fed by both a real-time feature store and an offline training pipeline.</p>
+  <div class="diagram" data-diagram='{
+    "title": "TikTok For You recommendation funnel",
+    "nodes": [
+      {"id":"client","x":30,"y":270,"w":150,"h":60,"kind":"external","label":"Client (app)"},
+      {"id":"gw","x":220,"y":270,"w":150,"h":60,"kind":"compute","label":"API / LB"},
+      {"id":"feedorch","x":420,"y":270,"w":170,"h":60,"kind":"compute","label":"Feed Orchestrator","sub":"runs the funnel"},
+      {"id":"candgen","x":420,"y":100,"w":170,"h":60,"kind":"compute","label":"Candidate Generation","sub":"ANN + trending + fresh pools"},
+      {"id":"ranker","x":420,"y":440,"w":170,"h":60,"kind":"compute","label":"Ranking Service","sub":"lightweight then heavy model"},
+      {"id":"annidx","x":650,"y":100,"w":150,"h":60,"kind":"storage","label":"Embedding Index","sub":"in-memory ANN"},
+      {"id":"featstore","x":650,"y":440,"w":150,"h":60,"kind":"storage","label":"Feature Store","sub":"near real-time"},
+      {"id":"events","x":650,"y":270,"w":150,"h":60,"kind":"queue","label":"Engagement Event Stream"},
+      {"id":"cdn","x":850,"y":270,"w":130,"h":60,"kind":"external","label":"Video CDN"}
+    ],
+    "edges": [
+      {"from":"client","to":"gw","label":"swipe / next video"},
+      {"from":"gw","to":"feedorch","label":"GET /feed/foryou"},
+      {"from":"feedorch","to":"candgen","label":"get candidates"},
+      {"from":"candgen","to":"annidx","label":"nearest-neighbor lookup"},
+      {"from":"feedorch","to":"ranker","label":"score candidates"},
+      {"from":"ranker","to":"featstore","label":"read real-time features"},
+      {"from":"feedorch","to":"cdn","label":"video URLs"},
+      {"from":"gw","to":"events","label":"engagement events"},
+      {"from":"events","to":"featstore","label":"update features"}
+    ],
+    "groups": [
+      {"x":400,"y":80,"w":420,"h":440,"label":"Recommendation funnel"}
+    ]
+  }'></div>
+
+  <h4>Deep dive</h4>
+  <p><strong>1) Multi-stage candidate generation and ranking (the funnel).</strong> You cannot score every video in the catalog against every user on every request. The standard approach is a funnel: candidate generation pulls a few thousand candidates cheaply from multiple sources (an approximate-nearest-neighbor, or ANN, lookup on user/video embeddings, plus trending and fresh-content pools reserved for exploration); a lightweight scoring pass narrows thousands down to a few hundred using cheap features; a heavier model does the final rank on that smaller set, predicting things like watch-through rate and like probability. Each stage trades some accuracy for speed so the expensive model only ever runs on candidates that survived cheaper filters.</p>
+  <p><strong>2) Freshness of the signal pipeline.</strong> A user skipping three videos in a row should change what the fourth video looks like within the same session, not tomorrow. That needs a near-real-time path — a stream processor (Ch.14) updating a fast feature store — in addition to the batch pipeline that periodically retrains the ranking model from historical data (Ch.10 covers the offline lakehouse side). Two different freshness requirements feed the same model.</p>
+  <p><strong>3) Cold start and exploration.</strong> A system that only ranks by predicted engagement starves new videos and new creators of views, since the model has no signal about them yet and they'll always lose to proven content. The fix is deliberately reserving a slice of each feed — an exploration bucket — for unproven or new content, sized so the system keeps learning without materially hurting the average session. This is the same exploration-vs-exploitation shape as a multi-armed-bandit problem, applied to content ranking instead of ad selection.</p>
+
+  <h4>Trade-offs</h4>
+  <div class="callout tradeoff"><p>At 10x scale, the candidate-generation stage's in-memory ANN index tends to become the bottleneck before the final ranking model does — it needs to stay fast, and 10x more videos means either 10x more memory or a lossier, more approximate index. The trade-off is index freshness and accuracy versus infrastructure cost; most systems accept a somewhat stale or approximate index rather than rebuild it on every write.</p></div>
+
+  <h4>Say this</h4>
+  <div class="callout say-this"><p>"I'd split this into a cheap candidate-generation stage and an expensive final-ranking stage, because scoring the entire catalog per request doesn't scale — the funnel lets the heaviest compute run only on the few hundred candidates that made it past cheaper filters."</p></div>
+
+  <h4>Final design</h4>
+  <p>Uploads go through an async transcode pipeline into CDN-backed storage. Every feed request runs a three-stage funnel — cheap candidate generation from multiple pools including an exploration pool, lightweight scoring, then heavy final ranking. Engagement events flow both into a real-time feature store for the current session and into an offline pipeline that retrains the ranking model.</p>
+
+  <h4>EM-level follow-up</h4>
+  <div class="callout em-angle"><p>On build-vs-buy: the ANN index and ranking infrastructure are usually worth building in-house at this scale, because they're the actual product differentiator — not a place to reach for an off-the-shelf recommendation service. On org impact: the exploration-bucket size is a policy decision that affects creator growth and needs sign-off from whoever owns creator-side metrics, not just the ranking team — it's a product trade-off wearing an engineering-parameter costume.</p></div>
+</article>
+
+<article class="problem">
+  <h3>Design Reddit (Communities, Voting, and Comments)</h3>
+
+  <h4>Problem framing</h4>
+  <p>Reddit is communities ("subreddits") full of posts, where posts and comments get voted on and the vote-adjusted score decides what surfaces as "hot." The core problem is less about media and more about a voting system and a deeply nested comment tree, both of which need to stay fast when a single post goes viral.</p>
+
+  <h4>Clarifying questions</h4>
+  <ul>
+    <li><strong>Is a vote a simple up/down, and can a user change their vote?</strong> — this means we need to store per-user vote state, not just blindly increment or decrement a counter.</li>
+    <li><strong>How deep can comment nesting go, and does a client need the whole tree at once or a paginated view?</strong> — a thread with thousands of comments cannot be sent in one response.</li>
+    <li><strong>Is community membership required to post or view, or are communities open by default?</strong> — affects whether reads need a per-community authorization check.</li>
+    <li><strong>Is the "hot" ranking based on raw vote count, or a time-decayed score?</strong> — Reddit's real ranking is a function of score and post age, which matters directly for the ranking deep dive.</li>
+    <li><strong>Is moderation tooling (removals, bans) in scope?</strong> — usually not for a core HLD answer; note that it exists, don't design it.</li>
+  </ul>
+
+  <h4>Requirements</h4>
+  <p><strong>Functional requirements:</strong></p>
+  <ul>
+    <li>Create and join a community.</li>
+    <li>Submit a post (text, link, or media) to a community.</li>
+    <li>Upvote or downvote a post or comment.</li>
+    <li>Comment on a post, or reply to a comment (nested).</li>
+    <li>View a community's posts sorted by hot, new, or top.</li>
+    <li>View a post's comment tree.</li>
+  </ul>
+  <p><strong>Non-functional requirements:</strong></p>
+  <ul>
+    <li>Vote counts should visibly update within roughly a second; the exact number can be eventually consistent, but the direction (up versus down) must never be wrong.</li>
+    <li>One extremely popular post must not degrade the rest of the site.</li>
+    <li>Comment trees can be arbitrarily deep and must page rather than load in full.</li>
+    <li>Vote manipulation — one user voting many times on the same target — must be prevented.</li>
+  </ul>
+
+  <h4>Capacity estimate</h4>
+  <p>Assume 50 million DAU. Assume 2% of DAU submit a post a day, giving 1 million posts/day. Post write QPS ≈ 1,000,000 / 86,400 ≈ 11.6/sec average — posts themselves are a tiny write load.</p>
+  <p>Assume each DAU leaves an average of 2 comments a day, giving 100 million comments/day. Comment QPS ≈ 100,000,000 / 86,400 ≈ 1,160/sec average, peak (roughly 5x) ≈ 5,800/sec.</p>
+  <p>Votes are the real hot path: assume each DAU casts 20 votes a day while browsing, giving 1 billion votes/day. Vote QPS ≈ 1,000,000,000 / 86,400 ≈ 11,600/sec average, peak (roughly 5x) ≈ 58,000/sec — an order of magnitude above comment writes, and concentrated on whatever is currently on the front page.</p>
+  <p>Reads: assume each DAU loads 10 community/post pages a day, giving 500 million page loads/day. Read QPS ≈ 500,000,000 / 86,400 ≈ 5,800/sec average, peak (roughly 4x) ≈ 23,000/sec.</p>
+  <p>Storage: a vote record (user_id, target_id, direction) is tiny, roughly 24 bytes, but at 1 billion/day that's about 24GB/day if every vote is stored individually — which is needed to prevent double-voting and to let a user change their vote. Over a year that's around 8.8TB just for the vote ledger, separate from the much smaller aggregate scores actually shown to users.</p>
+
+  <h4>API design</h4>
+  <pre><code>POST /v1/communities                       {name, description}
+POST /v1/communities/{name}/posts          {title, body|link|media_id}
+GET  /v1/communities/{name}/posts?sort=hot&amp;cursor=
+POST /v1/posts/{id}/vote                   {direction: up|down|none}
+POST /v1/posts/{id}/comments               {parent_comment_id?, body}
+GET  /v1/posts/{id}/comments?sort=top&amp;cursor=
+     (returns one page of the tree; deep branches collapse
+      behind a "load more" pointer)
+POST /v1/comments/{id}/vote                {direction}</code></pre>
+
+  <h4>High-level design</h4>
+  <p>Votes and content take different paths: a strongly consistent per-user vote ledger, a fast aggregate-score counter, and a ranking service that reads both.</p>
+  <div class="diagram" data-diagram='{
+    "title": "Reddit vote and ranking pipeline",
+    "nodes": [
+      {"id":"client","x":30,"y":270,"w":150,"h":60,"kind":"external","label":"Client apps"},
+      {"id":"gw","x":220,"y":270,"w":150,"h":60,"kind":"compute","label":"API / LB"},
+      {"id":"postsvc","x":420,"y":100,"w":170,"h":60,"kind":"compute","label":"Post/Comment Service"},
+      {"id":"votesvc","x":420,"y":440,"w":170,"h":60,"kind":"compute","label":"Vote Service"},
+      {"id":"contentdb","x":650,"y":100,"w":160,"h":60,"kind":"storage","label":"Posts/Comments DB","sub":"materialized path"},
+      {"id":"voteledger","x":650,"y":270,"w":160,"h":60,"kind":"storage","label":"Vote Ledger","sub":"per-user vote records"},
+      {"id":"scorecache","x":650,"y":440,"w":160,"h":60,"kind":"storage","label":"Score Cache","sub":"Redis counters"},
+      {"id":"rankersvc","x":870,"y":270,"w":110,"h":60,"kind":"compute","label":"Hot Ranker"}
+    ],
+    "edges": [
+      {"from":"client","to":"gw","label":"browse / vote / comment"},
+      {"from":"gw","to":"postsvc","label":"browse / comment"},
+      {"from":"gw","to":"votesvc","label":"cast vote"},
+      {"from":"postsvc","to":"contentdb","label":"read/write"},
+      {"from":"postsvc","to":"rankersvc","label":"hot-sorted listing"},
+      {"from":"votesvc","to":"voteledger","label":"write per-user vote"},
+      {"from":"votesvc","to":"scorecache","label":"update aggregate score"},
+      {"from":"rankersvc","to":"scorecache","label":"read live scores"},
+      {"from":"rankersvc","to":"contentdb","label":"read post age"}
+    ]
+  }'></div>
+
+  <h4>Deep dive</h4>
+  <p><strong>1) Vote counting without a write-per-vote bottleneck.</strong> Every vote needs two things: a durable per-user vote record (so the system knows if this user already voted and can flip it) and an up-to-date aggregate score. Writing a row and re-running an aggregate on every vote does not scale at 58,000 votes/sec concentrated on a handful of hot posts. The fix: write the per-user vote record synchronously and strongly consistent — double-voting is a correctness bug, not a stale-read issue — but maintain the aggregate score as a counter in a fast store (Redis increment/decrement), read by the ranking and display path, with periodic reconciliation against the durable ledger to catch drift. This is the same write-behind counter pattern as Instagram's likes, but with a strict correctness requirement on the underlying vote record that likes usually don't need.</p>
+  <p><strong>2) The "hot" ranking is time-decayed, not just vote count.</strong> A naive "sort by score" ranking means a year-old post with 50,000 upvotes always beats a new post with 500 — nothing new could ever surface. Reddit's real approach scores by a function of net votes and post age, so a fresh post with fewer votes can outrank an older post with more. This means "hot" can't be a sort order computed once and cached forever; either recompute the decayed score at read time for the candidate set, or periodically re-sort a cached front-page list every few minutes.</p>
+  <p><strong>3) Nested comment trees at arbitrary depth.</strong> Storing comments as an adjacency list — each comment stores its parent_comment_id — is cheap to write but expensive to read a whole thread from, since fetching a deep branch means walking the tree one query at a time. A common fix is a materialized path (storing each comment's full ancestor chain) plus a denormalized "top N replies per parent" cache, so a client can fetch "top-level comments by score" and "next page of replies to comment X" without walking the whole tree per request. This cheap-write-versus-cheap-read trade-off for hierarchical data is covered generally in Ch.7.</p>
+
+  <h4>Trade-offs</h4>
+  <div class="callout tradeoff"><p>At 10x scale, a single viral post concentrates nearly all vote and comment traffic onto one hot key — the shared aggregate counter and comment-tree cache for that one post_id become the bottleneck well before the rest of the database does. The trade-off is sharding the hot counter itself, splitting one counter into several that get summed on read, versus accepting extra latency on that one post.</p></div>
+
+  <h4>Say this</h4>
+  <div class="callout say-this"><p>"I'd keep the per-user vote record strongly consistent, since double-voting or losing someone's vote is a correctness bug, but let the aggregate score shown to users be an eventually-consistent counter in a fast store — those two pieces of vote data genuinely have different consistency requirements, so I wouldn't force them into the same model."</p></div>
+
+  <h4>Final design</h4>
+  <p>Posts and comments live in a primary store with the vote ledger as its own append-heavy table. A fast counter store holds live aggregate scores for ranking and display, periodically reconciled against the ledger. The comment tree is served page by page from a materialized-path structure, not walked live. A hot-post detector can shift one trending post_id's counters onto a dedicated shard.</p>
+
+  <h4>EM-level follow-up</h4>
+  <div class="callout em-angle"><p>On rollout: splitting a counter for one specific viral post is usually a break-glass operational procedure, not something built generically upfront — flag it as a known gap and describe the runbook rather than over-engineering for a rare case on day one. On build-vs-buy: the vote/counter store is a good managed-Redis use case rather than something to run yourself, at least until the bill outweighs the ops savings.</p></div>
+</article>
+
+<article class="problem">
+  <h3>Design a YouTube/Netflix-Style Video Streaming Platform</h3>
+
+  <h4>Problem framing</h4>
+  <p>This is a video-on-demand (VOD) platform: users upload video (YouTube-style) or a fixed catalog is pre-loaded (Netflix-style), and viewers stream it in a way that starts fast and adapts to their network. The core problem is a two-sided pipeline: encode once, then deliver the same bytes to enormous numbers of viewers cheaply.</p>
+
+  <h4>Clarifying questions</h4>
+  <ul>
+    <li><strong>Is this open uploads (YouTube-style), a fixed licensed catalog with no uploads (Netflix-style), or both?</strong> — a fixed catalog allows proactive pre-positioning of content; open uploads need an always-on transcoding pipeline sized for unpredictable volume.</li>
+    <li><strong>What device and network diversity must we support?</strong> — decides how large the adaptive-bitrate ladder (the set of resolution/bitrate variants) needs to be.</li>
+    <li><strong>Is live streaming in scope, or video-on-demand only?</strong> — live is a materially different problem, covered separately elsewhere in this chapter for live comments/voting and Twitch-style live streaming; assume VOD only here.</li>
+    <li><strong>What's an acceptable time from "upload finishes" to "watchable"?</strong> — decides whether we wait for the full encoding ladder or mark lower resolutions ready first.</li>
+    <li><strong>Do we need low start-up latency globally, or is one region acceptable?</strong> — decides how much to invest in CDN edge presence versus a single origin.</li>
+  </ul>
+
+  <h4>Requirements</h4>
+  <p><strong>Functional requirements:</strong></p>
+  <ul>
+    <li>Upload a video, with chunked/resumable transfer for large files.</li>
+    <li>Transcode into multiple resolutions and bitrates.</li>
+    <li>Play a video with adaptive bitrate switching as network conditions change.</li>
+    <li>Browse and search a catalog.</li>
+    <li>Track watch progress and view counts.</li>
+  </ul>
+  <p><strong>Non-functional requirements:</strong></p>
+  <ul>
+    <li>Video should start playing within roughly 1-2 seconds of pressing play.</li>
+    <li>Playback should adapt smoothly to bandwidth changes without a full stop.</li>
+    <li>The system must survive a single region or CDN edge failure without an outage.</li>
+    <li>Storage cost matters enormously at this scale, so cold or rarely-watched content should move to cheaper storage tiers.</li>
+    <li>The pipeline must handle uploads that are many gigabytes in size.</li>
+  </ul>
+
+  <h4>Capacity estimate</h4>
+  <p>Assume 500 million DAU, each watching an average of 40 minutes a day split across roughly 8 videos of about 5 minutes each, giving 4 billion video plays/day.</p>
+  <p>Play-start QPS ≈ 4,000,000,000 / 86,400 ≈ 46,300/sec average, peak (roughly 3x) ≈ 140,000/sec. Note that almost all of the actual video bytes are served from CDN edge caches, not the origin; origin traffic is a small fraction of this number.</p>
+  <p>Uploads: assume creators upload roughly 400 hours of raw footage per minute platform-wide — this is our own order-of-magnitude assumption for a UGC-scale (user-generated-content) platform; real published figures for large platforms are on this order of magnitude but vary and change over time. That's 400 × 1,440 minutes/day = 576,000 hours/day of raw video ingested.</p>
+  <p>Storage math: at an assumed average raw bitrate of 50Mbps, that's 6.25MB/sec, or 22.5GB/hour. 576,000 hours/day × 22.5GB ≈ 13 petabytes/day of raw footage before transcoding. Transcoding into an adaptive-bitrate ladder (say 5 renditions — 240p, 480p, 720p, 1080p, 4K — plus audio) roughly doubles to triples the stored footprint once every rendition is kept, so total stored output added per day reaches tens of petabytes. This is why platforms at this scale rely on deduplication, cold storage tiers for old or rarely-watched video, and pruning low-demand renditions rather than keeping everything forever at every quality.</p>
+  <p>Cache hit rate matters more than any single number here: if 95% or more of play requests hit an edge cache, origin storage read load drops by roughly 20x compared with serving every play directly.</p>
+
+  <h4>API design</h4>
+  <pre><code>POST /v1/videos/upload-init          -> {upload_id, chunk_urls[]}
+     (resumable multi-part upload directly to blob storage)
+POST /v1/videos/upload-complete      {upload_id} -> {video_id, status: processing}
+GET  /v1/videos/{id}/manifest        -> HLS/DASH manifest
+     (a playlist listing available bitrate variants and their
+      segment URLs, so the player can switch quality mid-stream)
+GET  /v1/videos/{id}/status          -> {status: processing|ready|failed}
+POST /v1/videos/{id}/watch-progress  {position_seconds}
+GET  /v1/search?q=</code></pre>
+
+  <h4>High-level design</h4>
+  <p>Uploads go through a DAG (a chain of dependent steps) of async encode jobs into segment-based storage behind a CDN; playback fetches a manifest and adapts bitrate segment by segment.</p>
+  <div class="diagram" data-diagram='{
+    "title": "YouTube/Netflix upload, encode, and delivery pipeline",
+    "nodes": [
+      {"id":"client","x":30,"y":270,"w":150,"h":60,"kind":"external","label":"Client / Player"},
+      {"id":"gw","x":220,"y":270,"w":150,"h":60,"kind":"compute","label":"API / LB"},
+      {"id":"uploadsvc","x":420,"y":100,"w":170,"h":60,"kind":"compute","label":"Upload Service","sub":"chunked, resumable"},
+      {"id":"catalogsvc","x":420,"y":270,"w":170,"h":60,"kind":"compute","label":"Catalog/Manifest Service"},
+      {"id":"encq","x":650,"y":30,"w":160,"h":60,"kind":"queue","label":"Encode Job Queue"},
+      {"id":"encwk","x":870,"y":30,"w":110,"h":60,"kind":"compute","label":"Encode Workers"},
+      {"id":"segstore","x":650,"y":170,"w":160,"h":60,"kind":"storage","label":"Segment Storage","sub":"raw + encoded"},
+      {"id":"metadb","x":650,"y":310,"w":160,"h":60,"kind":"storage","label":"Video Metadata DB"},
+      {"id":"cdn","x":420,"y":460,"w":170,"h":60,"kind":"external","label":"CDN Edge Cache"}
+    ],
+    "edges": [
+      {"from":"client","to":"gw","label":"upload / play request"},
+      {"from":"gw","to":"uploadsvc","label":"initiate upload"},
+      {"from":"gw","to":"catalogsvc","label":"GET manifest"},
+      {"from":"uploadsvc","to":"segstore","label":"write raw chunks"},
+      {"from":"uploadsvc","to":"encq","label":"enqueue encode job"},
+      {"from":"encq","to":"encwk"},
+      {"from":"encwk","to":"segstore","label":"write encoded renditions"},
+      {"from":"encwk","to":"metadb","label":"mark ready"},
+      {"from":"catalogsvc","to":"metadb","label":"read video metadata"},
+      {"from":"catalogsvc","to":"segstore","label":"manifest segment URLs"},
+      {"from":"client","to":"cdn","label":"fetch video segments"},
+      {"from":"cdn","to":"segstore","label":"origin pull on cache miss"}
+    ],
+    "groups": [
+      {"x":630,"y":10,"w":370,"h":250,"label":"Async encode pipeline"}
+    ]
+  }'></div>
+
+  <h4>Deep dive</h4>
+  <p><strong>1) The encode pipeline is a DAG of async jobs, not one big transcode step.</strong> An uploaded file goes through validation, splitting into chunks for parallel transcoding, encoding each chunk into every target resolution/bitrate, re-stitching, thumbnail generation, content-moderation checks, then publishing the manifest. Each stage is its own worker pool behind a queue (Ch.14), because a single 4K upload can take far longer to encode than a phone-shot clip, and a slow upload shouldn't block the pipeline for everyone else. Many platforms mark lower resolutions "ready" as soon as they finish, so a viewer can start watching in a lower quality within seconds while 4K keeps encoding in the background.</p>
+  <p><strong>2) Adaptive bitrate delivery through manifest-based streaming.</strong> The player doesn't fetch one giant file — it fetches a manifest (HLS or DASH format) listing short segments, a few seconds each, at multiple bitrates, and picks segments on the fly based on measured throughput, switching quality mid-playback without a restart. This is why the "video" served to a client is really dozens of small immutable segment files plus a manifest, and why CDN caching works so well: segments are small, never change once encoded, and identical for every viewer of that video.</p>
+  <p><strong>3) Cache and CDN strategy depends on catalog shape.</strong> A Netflix-style fixed catalog can predict demand and proactively pre-position popular content at edge servers before it's even requested — Netflix's own Open Connect appliances placed inside ISP networks are a well-known real example. A YouTube-style open-upload platform has a much longer unpredictable tail, so it leans more on reactive caching (cache what gets requested, evict what doesn't) plus regional origin shields so every edge cache miss doesn't hit the same central origin at once.</p>
+
+  <h4>Trade-offs</h4>
+  <div class="callout tradeoff"><p>At 10x scale, the transcoding fleet's total compute capacity tends to become the bottleneck before storage or CDN bandwidth does — uploads queue up and "processing" takes hours instead of minutes. The trade-off is over-provisioning expensive transcode workers for a burst you might only see during a viral moment or a big live event, versus accepting longer processing at peak and communicating that delay to uploaders.</p></div>
+
+  <h4>Say this</h4>
+  <div class="callout say-this"><p>"I'd stream adaptive-bitrate segments through a manifest rather than serve one fixed-quality file, because network conditions change mid-playback for real users — a fixed file means either always encoding for the worst case or breaking playback whenever bandwidth drops."</p></div>
+
+  <h4>Final design</h4>
+  <p>Uploads flow through a DAG of async encode, moderate, and thumbnail jobs into segment-based storage behind a CDN. Playback fetches a manifest and adapts bitrate segment by segment. Popular, predictable content gets pre-positioned at the edge, long-tail content is served reactively, and cold content moves to cheaper storage tiers over time.</p>
+
+  <h4>EM-level follow-up</h4>
+  <div class="callout em-angle"><p>On build-vs-buy: encoding infrastructure and CDN delivery are both viable to buy from a vendor well past the point most companies assume — building your own only pays off at truly massive, predictable scale, which is why even large platforms run a meaningful share of traffic through commercial CDNs. On rollout: switching CDN vendors, or adding a second one for redundancy, is a multi-month migration touching DNS, manifest URLs, and cache-warming — it needs its own project plan, not a quick config flip.</p></div>
+</article>
+<article class="problem">
+  <h3>Design Live Comments/Voting For A Live Event</h3>
+
+  <h4>Problem framing</h4>
+  <p>A system that lets a huge number of people watch the same live event (a sports final, an award show, a keynote) and, at the same time, post short comments and cast votes in a live poll — with everyone seeing new comments and an updating vote tally within a second or two. The hard part is not storing the data. It is pushing updates to millions of open connections at once, in short, extreme bursts tied to moments in the event.</p>
+
+  <h4>Clarifying questions</h4>
+  <ul>
+    <li><strong>How many concurrent viewers, at peak, for the biggest event this has to support?</strong> — the gap between 10,000 and 10 million concurrent viewers changes the whole architecture. Below a few hundred thousand, a single pub/sub layer might do. Above that, you need a layered fan-out tree, which is the hard part of this problem.</li>
+    <li><strong>Does every viewer see every comment, or a curated subset?</strong> — showing millions of comments/second to everyone is unreadable and impossible to render. Almost every real system samples or ranks a subset for the "live wall" and lets users pull the full stream on demand.</li>
+    <li><strong>Does the vote need to be exactly-once per user, and does the tally need to be exact or approximate?</strong> — exact, tamper-resistant counting needs a dedup step per vote; an approximate tally lets you use cheaper counting tricks at extreme scale.</li>
+    <li><strong>Is comment moderation required before a comment is shown to anyone?</strong> — a synchronous profanity/spam filter adds latency to the write path; if moderation can be "publish first, remove later," the write path gets simpler but you accept a short exposure window.</li>
+    <li><strong>Is this one global room, or many rooms (e.g., per country, per broadcast feed)?</strong> — multiple smaller rooms are much easier to fan out than one giant global room, at the cost of viewers in different rooms not seeing each other's comments.</li>
+  </ul>
+
+  <h4>Requirements</h4>
+  <p><strong>Functional:</strong> a viewer can post a short text comment tied to the live event; a curated stream of comments is pushed to all connected viewers in near real time; a viewer can cast one vote per poll during a live voting window; a running vote tally is pushed to all viewers; abusive comments can be filtered before or shortly after they appear.</p>
+  <p><strong>Non-functional:</strong> comment-to-screen latency under roughly 1-2 seconds at the p99 (the 99th percentile — 99 requests out of 100 are at least this fast); the system must survive extreme, short bursts (10x the average rate right after a goal or a big reveal) without falling over; availability beats consistency for comments — losing one viewer's view of one comment for a few seconds is a non-event; votes need at-least-once ingestion with no double-counting per user, even though the displayed tally itself can lag the true count by a couple of seconds.</p>
+
+  <h4>Capacity estimate</h4>
+  <p>Take a major global broadcast: 10 million peak concurrent viewers on the digital platform, over a 3-hour event.</p>
+  <p><strong>Comments.</strong> Assume 5% of concurrent viewers are actively commenting during the peak minute (500,000 people), each posting roughly once every 2 minutes. That is 500,000 / 120s ≈ 4,200 comments/sec on average during peak, with short bursts (a goal, a big reveal) pushing 5-10x higher — call it roughly 30,000-40,000 comments/sec at the burst peak. There is no way to render 40,000 comments/second to a human, which is exactly why the "clarifying questions" point about curation matters: the system samples or ranks a small displayed subset (tens per second) while the full stream stays queryable.</p>
+  <p><strong>Votes.</strong> Assume a 5-minute voting window with 20% of the 10 million viewers voting: 2,000,000 votes / 300s ≈ 6,700 votes/sec average, bursting to roughly 20,000/sec near the window's close. Each vote is tiny (user ID + option ID + event ID, roughly 50 bytes), so 20,000/sec × 50 bytes ≈ 1MB/s of raw vote data — trivial in bytes, but the QPS (queries per second) and the need to dedupe every single one is the real load.</p>
+  <p><strong>Fan-out bandwidth — the number that actually drives the design.</strong> Pushing one tally update (say an 8-option poll, ~200 bytes of JSON) once per second to 10 million open connections is 10,000,000 × 200 bytes ≈ 2GB of egress <em>per update</em>, once every second, from wherever that update originates. No single origin server, or even a small cluster, pushes 2GB/s to 10 million individual sockets — this is why the design needs a layered fan-out tree instead of one broadcast hop.</p>
+  <p><strong>Connections.</strong> A commodity WebSocket-serving box comfortably holds on the order of 10,000-20,000 concurrent long-lived connections. Ten million concurrent viewers therefore need roughly 500-1,000 edge servers just to hold the sockets, before any fan-out compute is added.</p>
+  <p><strong>Storage.</strong> Even at 40,000 comments/sec sustained for a burst minute, total comments over a 3-hour show land around 5-10 million, at roughly 300 bytes each (text + metadata) — a few gigabytes for the whole event. Storage size is a non-problem here; throughput and fan-out are the whole problem.</p>
+
+  <h4>API design</h4>
+  <pre><code>POST /events/{eventId}/comments        {text}               -> 201 {commentId}
+GET  /events/{eventId}/comments/stream (WebSocket/SSE)       -> live curated comment stream
+POST /events/{eventId}/polls/{pollId}/votes  {optionId}       -> 202 Accepted (idempotent per user+poll)
+GET  /events/{eventId}/polls/{pollId}/tally (WebSocket/SSE)  -> pushed tally updates, ~1/sec
+
+// Push frame shapes, sent over the same socket:
+{"type":"comment","id":"...","user":"...","text":"...","ts":...}
+{"type":"tally","pollId":"...","counts":{"A":812345,"B":611200},"ts":...}</code></pre>
+
+  <h4>High-level design</h4>
+  <div class="diagram" data-diagram='{
+    "title": "Layered fan-out for live comments and votes",
+    "nodes": [
+      {"id":"client","x":30,"y":260,"w":150,"h":60,"kind":"external","label":"Viewer Clients","sub":"up to 10M concurrent"},
+      {"id":"edge_gw","x":230,"y":260,"w":170,"h":60,"kind":"compute","label":"Edge WS Gateways","sub":"~500-1000 nodes"},
+      {"id":"comment_ingest","x":230,"y":60,"w":170,"h":60,"kind":"compute","label":"Comment Ingest Service"},
+      {"id":"moderation","x":450,"y":60,"w":160,"h":60,"kind":"compute","label":"Moderation Filter"},
+      {"id":"kafka","x":660,"y":60,"w":170,"h":60,"kind":"queue","label":"Kafka: event-comments"},
+      {"id":"broadcast","x":450,"y":260,"w":170,"h":60,"kind":"compute","label":"Broadcast / Fan-out Service","sub":"layered relay tree"},
+      {"id":"vote_ingest","x":230,"y":460,"w":170,"h":60,"kind":"compute","label":"Vote Ingest Service"},
+      {"id":"dedup","x":450,"y":460,"w":160,"h":60,"kind":"storage","label":"Dedup Cache (Redis)","sub":"userId+pollId, TTL=window"},
+      {"id":"counters","x":660,"y":460,"w":170,"h":60,"kind":"storage","label":"Sharded Vote Counters"}
+    ],
+    "edges": [
+      {"from":"client","to":"comment_ingest","label":"POST comment"},
+      {"from":"client","to":"vote_ingest","label":"POST vote"},
+      {"from":"comment_ingest","to":"moderation"},
+      {"from":"moderation","to":"kafka","label":"approved comments"},
+      {"from":"kafka","to":"broadcast"},
+      {"from":"counters","to":"broadcast","label":"tally every ~1s"},
+      {"from":"broadcast","to":"edge_gw","label":"push comment/tally"},
+      {"from":"edge_gw","to":"client","label":"live stream"},
+      {"from":"vote_ingest","to":"dedup","label":"check/set idempotency key"},
+      {"from":"dedup","to":"counters","label":"increment if new"}
+    ]
+  }'></div>
+
+  <h4>Deep dive</h4>
+  <p><strong>1. Fan-out at millions of connections.</strong> A single origin cannot hold 10 million sockets, and it cannot push 2GB/s of tally updates from one place. The fix is a fan-out tree: the origin publishes once to a handful of regional relay nodes (tens of them), each relay re-publishes to the edge WebSocket gateways in its region (hundreds to low thousands), and each edge gateway pushes to the 10,000-20,000 clients it personally holds. This is the same broadcast idea as the pub/sub pattern from Ch.14, but stretched into multiple hops specifically because no single hop can carry the full fan-out factor alone — it is closer in spirit to how a CDN (Ch.3) pushes one origin response out through many edge nodes than to a flat single-topic pub/sub.</p>
+  <p><strong>2. Exactly-once vote counting under massive concurrent writes.</strong> Every vote needs a check of "has this user already voted in this poll?" before it counts. At 20,000 votes/sec, that check has to be a single fast atomic operation, not a read-then-write (two round trips invite a race where two votes from the same user both see "not yet voted"). A Redis <code>SETNX</code> (set-if-not-exists) on a key like <code>vote:{userId}:{pollId}</code>, with a TTL matching the poll window, gives that atomicity in one round trip. The counts themselves are kept in sharded counters (one counter per option, possibly split further across multiple keys under extreme write pressure and summed on read) rather than a single row, because a single hot counter row would serialize every one of those 20,000 writes/sec against each other.</p>
+  <p><strong>3. Deciding what to show, not just what to store.</strong> With comments arriving faster than any human can read, the ingest path has to include a selection step: rank incoming comments by a cheap signal (recency plus early engagement) and only forward a display-sized slice (tens per second) into the broadcast path, while the full stream stays available for anyone who explicitly scrolls or searches it. This selection step doubles as your load-shedding mechanism — if a burst spikes past what the broadcast layer can carry, you drop or delay the excess at the selection stage, never by blocking the ingest write itself.</p>
+
+  <h4>Trade-offs</h4>
+  <div class="callout tradeoff"><p>At 10x the concurrency (100 million viewers), one global comment room and one global tally broadcast both break — the fan-out fan-out ratio at the origin becomes unmanageable even with relays. The fix is sharding the room itself: regional or per-feed rooms that only broadcast within their own region, with cross-region sync limited to a small set of top-ranked comments. You trade a single shared experience for one that scales, and that is a product decision as much as an engineering one.</p></div>
+
+  <h4>Say this</h4>
+  <div class="callout say-this"><p>"I would not try to give every viewer an exact, real-time vote count at this scale. I would dedupe votes exactly-once so no one is counted twice, but let the displayed tally lag the true count by a second or two and refresh on a fixed interval — trying to push a perfectly live number to ten million sockets costs far more than the product value of shaving off that last second of staleness."</p></div>
+
+  <h4>Final design</h4>
+  <p>One picture: clients open a socket to one of hundreds of edge gateways; comments flow ingest → moderation → Kafka → a layered broadcast tree → back down through the gateways; votes flow ingest → Redis dedup → sharded counters, with an aggregator sampling the counters roughly once a second and pushing the tally through that same broadcast tree.</p>
+
+  <h4>EM-level follow-up</h4>
+  <div class="callout em-angle"><p>Rollout: never debut this system's biggest concurrency number cold — run it on progressively larger real events (a mid-size match before a World Cup final) so the edge-gateway fleet size and relay tree depth are proven under real, not simulated, burst traffic. Build vs. buy: for infrequent mega-events, a managed real-time messaging platform (for example a hosted pub/sub or IoT-style fan-out service) is very likely cheaper than staffing and running a custom relay tree year-round for a handful of big nights. Cross-team: the edge/CDN team needs advance notice and capacity booking ahead of any scheduled mega-event — this is a coordination problem, not just a code problem, because spinning up 1,000 edge gateway instances five minutes before kickoff does not work.</p></div>
+</article>
+
+<article class="problem">
+  <h3>Design A Facebook-Style News Feed (Ranked, Not Chronological)</h3>
+
+  <h4>Problem framing</h4>
+  <p>A personalized feed of posts from friends, groups, and pages, ordered by a predicted-relevance score instead of by post time. The core difference from a Twitter/X-style timeline (covered elsewhere in this chapter) is the sort key: Twitter's timeline is mostly "newest first," lightly re-ranked; here, an older, more-relevant post can and should outrank a newer, less-relevant one. That single difference reshapes almost every layer of the system.</p>
+
+  <h4>Clarifying questions</h4>
+  <ul>
+    <li><strong>What signals feed the ranking — affinity to the poster, post type, recency, predicted engagement?</strong> — a handful of heuristics can be computed cheaply at request time; a real relevance model needs an offline feature pipeline and a model-serving layer, which is a much bigger system.</li>
+    <li><strong>Fan-out on write (push) or fan-out on read (pull) for building each user's candidate pool?</strong> — this is the classic feed trade-off from Ch.2, but ranking here adds a twist: whichever fan-out strategy supplies the candidates, ranking has to run on top of it, so the two concerns should be designed as separable layers.</li>
+    <li><strong>Is there a celebrity/high-fan-out problem — pages or people with tens of millions of followers?</strong> — if yes, pure push fan-out on every post is a non-starter, forcing a hybrid push/pull design.</li>
+    <li><strong>How fresh does a new post need to be in the feed — seconds, or minutes?</strong> — this decides whether ranking can be precomputed on a schedule or must run close to request time.</li>
+    <li><strong>Does the feed interleave ads or sponsored content?</strong> — if yes, there is a separate ad-insertion and pacing step layered on top of the organic ranking, with its own latency and business-logic budget.</li>
+  </ul>
+
+  <h4>Requirements</h4>
+  <p><strong>Functional:</strong> a user sees a feed of posts from friends, followed pages, and groups, ordered by predicted relevance, not strictly recency; likes, comments, and shares are captured and feed back into future ranking; the feed supports infinite scroll with stable pagination (scrolling further does not repeat or skip posts already seen).</p>
+  <p><strong>Non-functional:</strong> feed-load latency under roughly 200-300ms at the p99; the read:write ratio is extremely high — users check the feed far more often than they post; a new post should be eligible to rank into feeds within seconds to a couple of minutes of being created; the system must score billions of (user, candidate post) pairs per day without that scoring becoming the bottleneck.</p>
+
+  <h4>Capacity estimate</h4>
+  <p>Assume, for round numbers, 500 million daily active users (DAU), each opening the feed 10 times/day.</p>
+  <p><strong>Reads.</strong> 500M × 10 = 5 billion feed requests/day = 5×10⁹ / 86,400s ≈ 58,000 req/sec average, with a roughly 3x peak-to-average ratio (evenings, big news moments) → roughly 175,000 req/sec at peak. Each request scores, say, 500 candidate posts before narrowing to the ~20 shown — that is 58,000 × 500 ≈ 29 million scoring operations/sec on average. That single number is why ranking needs a fast, cheap-per-call model at serving time, with any heavy model work pushed offline.</p>
+  <p><strong>Writes.</strong> If 10% of DAU post once a day, that is 50 million posts/day ≈ 580 posts/sec average, spiking to a few thousand/sec around peak hours. With an average of roughly 300 friends per user and a hybrid push/pull fan-out (push for ordinary users, pull for celebrity accounts), the push side alone generates 580 × 300 ≈ 174,000 fan-out writes/sec on average.</p>
+  <p><strong>Storage.</strong> Post metadata (not media, which lives in its own store — see the Instagram problem elsewhere in this bank) at roughly 200 bytes/post × 50 million posts/day ≈ 10GB/day, trivial. The expensive resource is the per-user feed cache: keeping a precomputed list of, say, 500 candidate post IDs (8 bytes each) warm for 200 million daily-active users is 200M × 500 × 8 bytes ≈ 800GB — sizable, and the reason that cache gets sharded across a large key-value cluster rather than one instance.</p>
+
+  <h4>API design</h4>
+  <pre><code>GET  /feed?userId={id}&cursor={c}&limit=20   -> ranked post summaries + next cursor
+POST /posts               {text, media?, visibility}   -> 201 {postId}
+POST /posts/{id}/like
+POST /posts/{id}/comments  {text}
+
+// Internal service call, feed service -> ranking service:
+POST /internal/ranking/score  {userId, candidatePostIds[]}  -> sorted, scored list</code></pre>
+
+  <h4>High-level design</h4>
+  <div class="diagram" data-diagram='{
+    "title": "Feed assembly: candidate generation decoupled from ranking",
+    "nodes": [
+      {"id":"client","x":30,"y":260,"w":150,"h":60,"kind":"external","label":"Client App"},
+      {"id":"feed_svc","x":230,"y":260,"w":170,"h":60,"kind":"compute","label":"Feed Service"},
+      {"id":"feed_cache","x":230,"y":420,"w":170,"h":60,"kind":"storage","label":"Per-user Feed Cache"},
+      {"id":"candidate_gen","x":450,"y":260,"w":180,"h":60,"kind":"compute","label":"Candidate Generation"},
+      {"id":"fanout_store","x":450,"y":420,"w":180,"h":60,"kind":"storage","label":"Fan-out Store","sub":"push lists per follower"},
+      {"id":"ranking_svc","x":450,"y":100,"w":180,"h":60,"kind":"compute","label":"Ranking Service","sub":"feature store + ML model"},
+      {"id":"post_svc","x":690,"y":420,"w":160,"h":60,"kind":"compute","label":"Post Service"},
+      {"id":"post_db","x":690,"y":260,"w":160,"h":60,"kind":"storage","label":"Post DB"},
+      {"id":"fanout_worker","x":690,"y":100,"w":170,"h":60,"kind":"compute","label":"Fan-out Worker","sub":"Kafka consumer"}
+    ],
+    "edges": [
+      {"from":"client","to":"feed_svc","label":"GET /feed"},
+      {"from":"client","to":"post_svc","label":"POST /posts"},
+      {"from":"feed_svc","to":"feed_cache"},
+      {"from":"feed_svc","to":"candidate_gen"},
+      {"from":"candidate_gen","to":"fanout_store","label":"pull push-lists"},
+      {"from":"candidate_gen","to":"ranking_svc","label":"score candidates"},
+      {"from":"ranking_svc","to":"feed_svc","label":"ranked list"},
+      {"from":"post_svc","to":"post_db"},
+      {"from":"post_db","to":"fanout_worker","label":"new-post event"},
+      {"from":"fanout_worker","to":"fanout_store","label":"push to followers"}
+    ]
+  }'></div>
+
+  <h4>Deep dive</h4>
+  <p><strong>1. Hybrid fan-out, then ranking on top of either path.</strong> Ch.2 covers fan-out-on-write versus fan-out-on-read as a single trade-off; here the specific twist is that ranking is a separate layer sitting above whichever fan-out strategy filled the candidate pool. An ordinary user's posts get pushed into followers' fan-out stores at write time; a celebrity account's posts stay in a pull list that candidate generation queries on demand at read time. Either way, candidate generation hands ranking the same shape of input — a pool of candidate post IDs — so ranking logic never needs to know or care which fan-out path produced them.</p>
+  <p><strong>2. A multi-stage ranking funnel, not one model call.</strong> Retrieval pulls a cheap, broad candidate set (roughly 500); a lightweight model scores those down to roughly 100 using affinity, recency, and predicted-engagement features; a final, heavier pass applies re-ranking rules (diversity — don't show five posts from the same friend in a row — plus ad insertion) to pick the ~20 actually shown. This retrieve-then-rerank shape is the same idea search engines use (see Ch.11), applied to a feed instead of a query.</p>
+  <p><strong>3. Feature freshness has two very different speeds.</strong> The affinity score between two users (how much user A engages with user B's posts) is expensive to compute per request, so it is built nearline or offline — a streaming or batch aggregation refreshed hourly to daily — and just read from a cache at serving time. Recency and "engagement velocity in the last 10 minutes," on the other hand, must be close to real time, pulled from a fast counter store, because a post that is suddenly getting a burst of likes right now needs to be able to rank up immediately, not on tomorrow's batch refresh.</p>
+
+  <h4>Trade-offs</h4>
+  <div class="callout tradeoff"><p>At 10x the user base, keeping a fully materialized, precomputed feed cache warm for every user stops being affordable — the fix is tiering: keep the full materialized cache only for genuinely daily-active users, and fall back to on-demand candidate generation plus ranking for everyone else. That trades a slower first feed load for the less-active majority against a large cut in steady-state storage cost.</p></div>
+
+  <h4>Say this</h4>
+  <div class="callout say-this"><p>"I'd deliberately decouple candidate generation from ranking, because unlike Twitter/X's mostly-chronological timeline, relevance — not recency — is the sort key here. That means the fan-out layer's only job is producing a candidate pool cheaply; nearly all the interesting complexity, and the interview complexity, belongs in the ranking service, not in the fan-out mechanism."</p></div>
+
+  <h4>Final design</h4>
+  <p>One picture: posts land in a Post DB and fan out (push for normal accounts, pull-on-read for celebrity accounts) into per-follower candidate pools; on read, candidate generation assembles a pool from whichever source applies, a multi-stage ranking service scores and reorders it, and the feed service merges, paginates, and caches the result per user.</p>
+
+  <h4>EM-level follow-up</h4>
+  <div class="callout em-angle"><p>Rollout: ranking model changes are risky in a way schema changes are not — a bad model can tank engagement or trigger real user backlash ("why don't I see my friend's post?"), so ship behind a small percentage holdout A/B test before any full rollout, with an easy kill switch back to a simpler heuristic ranking. Build vs. buy: the ranking model and its feature store are core product IP and get built in-house, but the serving infrastructure underneath (a feature store, a model-serving layer) can lean on established open systems rather than fully custom ones. Cross-team: ranking model quality is very likely owned by a separate ML team behind a strict latency SLA on their scoring API — the feed team's job becomes negotiating and enforcing that SLA (for example, must return within 50ms) rather than owning the model itself.</p></div>
+</article>
+
+<article class="problem">
+  <h3>Design A Pinterest-Style Visual Discovery Board</h3>
+
+  <h4>Problem framing</h4>
+  <p>A product built around collecting and browsing images by visual and topical similarity, not around a social graph of people you follow. Users "pin" images (uploaded or re-shared from the web) onto themed boards, and the core experience — the home feed, "more like this," search — runs on finding images that look or feel similar, which is a very different engine from a friends-and-followers feed.</p>
+
+  <h4>Clarifying questions</h4>
+  <ul>
+    <li><strong>Are pins mostly user-uploaded, or re-pins of images sourced from external websites?</strong> — sourcing from the open web needs a crawling/ingestion pipeline and raises dead-link and attribution concerns that pure uploads don't.</li>
+    <li><strong>Can one pin belong to many boards, or exactly one?</strong> — a many-to-many relationship needs a junction table and changes how a viral pin's "repin count" gets computed.</li>
+    <li><strong>How central is visual similarity search ("pins that look like this") to the product?</strong> — if it is core, the system needs an image-embedding pipeline and a nearest-neighbor search index, not just tags and text search.</li>
+    <li><strong>Does the home feed need to be fresh within seconds, or is periodic, batch-refreshed discovery acceptable?</strong> — Pinterest-style discovery tolerates far more staleness than a chat or feed-of-friends product.</li>
+    <li><strong>Can a single pin be re-pinned into millions of boards?</strong> — a viral pin creates a fan-out problem structurally similar to a celebrity account's followers, and needs the same kind of hybrid handling.</li>
+  </ul>
+
+  <h4>Requirements</h4>
+  <p><strong>Functional:</strong> users create boards and pin images (own upload or from the web) to them; users browse a personalized home feed of recommended pins; users search by text and by visual similarity; users can re-pin someone else's pin onto their own board.</p>
+  <p><strong>Non-functional:</strong> extremely read-heavy — browsing vastly outweighs pinning; image serving must be fast globally, which means CDN-backed; visual similarity search must return in the low hundreds of milliseconds; eventual consistency is fine everywhere — a repin counter lagging by a few seconds is a non-issue.</p>
+
+  <h4>Capacity estimate</h4>
+  <p>Assume 400 million monthly active users, 100 million daily active users (DAU).</p>
+  <p><strong>Writes.</strong> Roughly 2 pin-actions (new pins + repins) per active user per day → 200 million/day = 200×10⁶ / 86,400s ≈ 2,300 writes/sec average, peaking around 7,000/sec.</p>
+  <p><strong>Reads.</strong> 100M DAU × roughly 15 feed page-loads/day (a scrolling session), each returning ~25 pins, is 1.5 billion feed requests/day ≈ 17,400 req/sec average, peaking around 52,000/sec.</p>
+  <p><strong>Image storage — the dominant cost.</strong> Assume an average original image of 400KB, plus generated derivatives (a 20KB thumbnail, an 80KB medium, a 250KB large) — roughly 750KB of total image assets per genuinely new image. Most "pin-actions" are repins of an already-stored image; assume only 10% of the 200 million/day pin-actions are truly new images: 20 million/day × 750KB ≈ 15TB/day, or roughly 5.5PB/year. This is the same shape of storage problem as Instagram's (covered elsewhere in this bank), but with an extra multiplier here — Pinterest also needs an embedding per image for similarity search, on top of the usual resolution derivatives.</p>
+  <p><strong>Vector storage for similarity search.</strong> A 256-dimension float32 embedding per image is roughly 1KB. At 20 million new images/day, that is 20GB/day of new vectors — trivial to store. The real cost is the active index: across, say, 5 billion pins ever created, the raw vectors alone total roughly 5TB, and a nearest-neighbor index built for fast queries (like HNSW, a graph-based approximate index) typically costs several times the raw vector size in RAM to stay fast, which is why this index gets sharded across many machines rather than held on one.</p>
+
+  <h4>API design</h4>
+  <pre><code>POST /boards                          {name, description}                    -> 201 {boardId}
+POST /boards/{boardId}/pins           {imageUrl | imageUpload, sourceUrl, note} -> 201 {pinId}
+POST /pins/{pinId}/repin              {targetBoardId}                        -> 201
+GET  /feed?userId={id}&cursor={c}                                            -> ranked pins
+GET  /pins/{pinId}/similar                                                   -> visually similar pins
+GET  /search?q={text}&mode=text|visual</code></pre>
+
+  <h4>High-level design</h4>
+  <div class="diagram" data-diagram='{
+    "title": "Pin write path and similarity-search read path",
+    "nodes": [
+      {"id":"client","x":30,"y":260,"w":150,"h":60,"kind":"external","label":"Client App"},
+      {"id":"pin_svc","x":230,"y":260,"w":170,"h":60,"kind":"compute","label":"Pin Service","sub":"writes metadata, enqueues job"},
+      {"id":"metadata_db","x":230,"y":100,"w":170,"h":60,"kind":"storage","label":"Pin/Board Metadata DB"},
+      {"id":"image_queue","x":450,"y":260,"w":170,"h":60,"kind":"queue","label":"Image Processing Queue"},
+      {"id":"image_worker","x":450,"y":420,"w":190,"h":60,"kind":"compute","label":"Image Processing Worker","sub":"resize, dedup hash, embed"},
+      {"id":"object_store","x":680,"y":420,"w":170,"h":60,"kind":"storage","label":"Object Store + CDN"},
+      {"id":"vector_index","x":680,"y":260,"w":170,"h":60,"kind":"storage","label":"Vector Index (ANN)","sub":"sharded by cluster"},
+      {"id":"feed_search_svc","x":450,"y":100,"w":190,"h":60,"kind":"compute","label":"Feed / Search Service"}
+    ],
+    "edges": [
+      {"from":"client","to":"pin_svc","label":"create/repin pin"},
+      {"from":"pin_svc","to":"metadata_db"},
+      {"from":"pin_svc","to":"image_queue","label":"new image job"},
+      {"from":"image_queue","to":"image_worker"},
+      {"from":"image_worker","to":"object_store","label":"store derivatives"},
+      {"from":"image_worker","to":"vector_index","label":"write embedding"},
+      {"from":"client","to":"feed_search_svc","label":"browse / search"},
+      {"from":"feed_search_svc","to":"metadata_db","label":"board/pin relations"},
+      {"from":"feed_search_svc","to":"vector_index","label":"similarity query"}
+    ]
+  }'></div>
+
+  <h4>Deep dive</h4>
+  <p><strong>1. Approximate, sharded nearest-neighbor search at billions of images.</strong> Exact nearest-neighbor search over billions of 256-dimension vectors, per query, is computationally infeasible at the request rates above. Production systems use an approximate nearest-neighbor (ANN) index — such as HNSW, a graph that lets you find "close enough" neighbors fast without checking every vector — and shard that index by coarse clusters (for example, k-means buckets over the vector space), so a similarity query only searches the shard holding nearby buckets instead of the whole corpus.</p>
+  <p><strong>2. Viral-pin fan-out, structurally the same problem as a celebrity account.</strong> A single pin re-pinned into millions of boards is the same shape of problem as the celebrity fan-out issue in the news-feed problem elsewhere in this bank. The same fix applies: don't maintain a reverse fan-out list of every board a viral pin belongs to; store the pin's board memberships as a queryable list and resolve it at read time for popular pins, instead of trying to push updates to every one of those millions of boards.</p>
+  <p><strong>3. Deduplicating re-uploads before the expensive step.</strong> The same image gets uploaded or scraped from the web many times over. Running a perceptual hash first — a hash designed so visually similar images (even after resize or recompression) land on the same or a very close hash value — catches most duplicates cheaply, so the expensive step (running the vision model to compute an embedding) only runs once per genuinely new image, not once per pin action.</p>
+
+  <h4>Trade-offs</h4>
+  <div class="callout tradeoff"><p>At 10x the corpus size, the vector index — kept mostly in RAM for query speed — stops fitting on any single machine. The fix is sharding the index across many nodes with a fan-out-and-merge query pattern, which trades a bit of extra per-query latency (several network hops instead of one local lookup) for the ability to keep scaling the corpus horizontally.</p></div>
+
+  <h4>Say this</h4>
+  <div class="callout say-this"><p>"I'd run a cheap perceptual hash before anything else, to catch exact or near-duplicate re-uploads, and only run the expensive vision-model embedding on images that are genuinely new. At billions of images, skipping redundant embedding computation is a real infrastructure cost lever here, not just a nice-to-have optimization."</p></div>
+
+  <h4>Final design</h4>
+  <p>One picture: pin creation writes metadata synchronously and hands the image off to an async pipeline (dedup hash → resize into derivatives → store in an object store behind a CDN → compute and index an embedding); browsing and search read from the metadata store and the sharded ANN vector index, with images served straight from the CDN.</p>
+
+  <h4>EM-level follow-up</h4>
+  <div class="callout em-angle"><p>Rollout: shipping a new or improved embedding model means re-embedding the entire historical corpus — a multi-week phased backfill, with the old and new vector indexes served side by side until the migration completes, not a flip-a-flag change. Build vs. buy: early on, use a managed vector database rather than operating a custom ANN cluster; only bring the index in-house once corpus size and query volume clearly justify the operational cost. Cross-team: the vision/ML team owns the embedding model and ships new versions on its own cadence, which forces the search/infra team to support two vector-index versions running concurrently during any model migration — that dependency needs an explicit compatibility contract, not an implicit assumption.</p></div>
+</article>
+
+<article class="problem">
+  <h3>Design A Quora-Style Q&amp;A Platform With Expert Routing</h3>
+
+  <h4>Problem framing</h4>
+  <p>A question-and-answer platform where a newly posted question is not just left to be discovered — it is actively routed to the people best positioned to answer it well. Two things make this different from a plain feed: duplicate questions need to be caught before they fragment the answers to the same question, and new questions need a deliberate push toward a small set of good candidate experts, not a broadcast to everyone.</p>
+
+  <h4>Clarifying questions</h4>
+  <ul>
+    <li><strong>What defines an "expert" for routing — self-declared topics, past answer history and upvotes in a topic, or an explicit credential system?</strong> — a simple topic-tag match is cheap; a learned relevance model over past answer quality is a much bigger system to build and maintain.</li>
+    <li><strong>Is routing a push (notify candidate experts directly) or a pull (surface unanswered questions in an expert's own personalized feed)?</strong> — push needs a notification/fan-out system with its own delivery guarantees; pull just needs to influence ranking of an existing feed.</li>
+    <li><strong>Does the system need to detect and merge likely-duplicate questions on creation?</strong> — this is a very Quora-specific feature and needs a similarity search step in the write path itself, not just an offline job.</li>
+    <li><strong>Is answer ranking pure vote count, or a more nuanced model?</strong> — a nuanced model needs the same kind of ranking pipeline as the news-feed problem elsewhere in this bank; pure vote count is a much simpler sort.</li>
+    <li><strong>Are anonymous answers supported?</strong> — this changes the data model: identity has to be hidden from other users while still being knowable internally for moderation and abuse handling.</li>
+  </ul>
+
+  <h4>Requirements</h4>
+  <p><strong>Functional:</strong> users post questions with topic tags; users post answers; users upvote or downvote answers, which changes their rank; the system detects likely-duplicate questions at creation time and offers a merge; the system routes new questions to a ranked set of candidate experts, via notification and/or a personalized "questions you could answer" feed; users can follow topics and other users.</p>
+  <p><strong>Non-functional:</strong> question posting and duplicate detection should feel instant, under roughly 1 second; expert routing does not need to be instant — a delay of a few minutes to pick good candidates is fine; answer ranking must let a great new answer to a years-old question climb near the top, not just sort by vote count and post age.</p>
+
+  <h4>Capacity estimate</h4>
+  <p>Assume 300 million monthly active users, 30 million DAU.</p>
+  <p><strong>Writes are low-QPS, unlike a social feed.</strong> Roughly 1 million new questions/day = 10⁶ / 86,400s ≈ 12 questions/sec average. Answers, at roughly 5 per question including answers to older questions, land around 5 million/day ≈ 58/sec average. Votes are heavier: assume 50 million votes/day (about 1.6 per DAU) ≈ 580/sec average, peaking around 1,700/sec — still a modest write load compared to a consumer feed.</p>
+  <p><strong>Reads dominate.</strong> 30M DAU × 10 question/answer page views/day = 300 million reads/day ≈ 3,500 req/sec average, peaking around 10,000/sec.</p>
+  <p><strong>Duplicate detection — low QPS, but against a huge corpus.</strong> Every one of those ~12 new questions/sec triggers a similarity check against the full historical question corpus, assumed at roughly 300 million questions ever asked. That is a similarity search over a large corpus, but at very low request volume — a sharp contrast with Pinterest's billions-of-images visual search running at tens of thousands of queries/sec. Here, spending more compute per query is affordable precisely because there are so few queries.</p>
+  <p><strong>Expert routing dominates the compute budget despite tiny question volume.</strong> Assume each topic has roughly 5,000 plausible candidate experts, and every new question is scored against all of them: 12 questions/sec × 5,000 candidates ≈ 58,000 scoring operations/sec. Question volume is tiny, but routing is a one-to-many fan-out per question, and that fan-out factor is what actually drives the load.</p>
+  <p><strong>Storage.</strong> 300 million questions at roughly 500 bytes of metadata plus 1.5 billion answers (5 per question historically) at roughly 2KB average (longer text) is about 150GB of questions and 3TB of answers — a few terabytes total, trivial by modern storage standards, with no heavy default media load (occasional images in answers are handled like any other media storage problem).</p>
+
+  <h4>API design</h4>
+  <pre><code>POST /questions               {title, body, topicTags[]} -> 201 {questionId, possibleDuplicates:[...]}
+POST /questions/{id}/answers  {body}                     -> 201
+POST /answers/{id}/vote       {direction}
+GET  /questions/{id}                                     -> question + ranked answers
+GET  /feed/answer-suggestions?userId={id}                -> "questions you could answer"
+
+// Internal, consumed by the notification worker:
+POST /internal/routing/score  {questionId}  -> ranked candidate expert list</code></pre>
+
+  <h4>High-level design</h4>
+  <div class="diagram" data-diagram='{
+    "title": "Synchronous duplicate check, async expert routing",
+    "nodes": [
+      {"id":"client","x":30,"y":260,"w":150,"h":60,"kind":"external","label":"Client App"},
+      {"id":"question_svc","x":230,"y":100,"w":180,"h":60,"kind":"compute","label":"Question Service"},
+      {"id":"dedup_svc","x":460,"y":100,"w":180,"h":60,"kind":"compute","label":"Dedup Service","sub":"lexical filter + embedding"},
+      {"id":"question_index","x":690,"y":100,"w":170,"h":60,"kind":"storage","label":"Question Similarity Index"},
+      {"id":"kafka","x":230,"y":260,"w":180,"h":60,"kind":"queue","label":"Kafka: QuestionCreated"},
+      {"id":"routing_worker","x":460,"y":260,"w":190,"h":60,"kind":"compute","label":"Expert Routing Worker"},
+      {"id":"expert_store","x":690,"y":260,"w":170,"h":60,"kind":"storage","label":"Expert Profile Store"},
+      {"id":"notif_svc","x":460,"y":420,"w":190,"h":60,"kind":"compute","label":"Notification Service"},
+      {"id":"answer_svc","x":230,"y":420,"w":180,"h":60,"kind":"compute","label":"Answer Service + Ranking"}
+    ],
+    "edges": [
+      {"from":"client","to":"question_svc","label":"POST /questions"},
+      {"from":"question_svc","to":"dedup_svc","label":"check duplicates (sync)"},
+      {"from":"dedup_svc","to":"question_index"},
+      {"from":"question_svc","to":"kafka","label":"QuestionCreated event"},
+      {"from":"kafka","to":"routing_worker"},
+      {"from":"routing_worker","to":"expert_store","label":"score candidates by topic"},
+      {"from":"routing_worker","to":"notif_svc","label":"notify top-N experts"},
+      {"from":"client","to":"answer_svc","label":"POST/GET answers"}
+    ]
+  }'></div>
+
+  <h4>Deep dive</h4>
+  <p><strong>1. Expert routing as a small, per-write fan-out — not a feed fan-out.</strong> The news-feed problem elsewhere in this bank needs a push/pull hybrid because its fan-out targets can number in the millions (a celebrity's followers). Here, the fan-out target set (plausible candidate experts for a topic) is small — thousands, not millions — and the trigger is a write (a new question), not a read. That combination means routing can afford to run fully, synchronously-enough in a background worker per question, without needing the push/pull split a much larger fan-out would require.</p>
+  <p><strong>2. Catching duplicates needs both lexical and semantic matching.</strong> Pure keyword matching (say, via a search engine like the one covered in Ch.11) misses paraphrased duplicates — "How do I lose weight fast" versus "What's the quickest way to shed pounds" share no useful keywords but ask the same thing. Pure embedding similarity, on the other hand, can over-merge questions that are topically close but genuinely distinct. Production systems combine both: a lexical filter narrows the candidate set cheaply, an embedding-similarity re-rank scores what's left, and only high-confidence matches get auto-suggested to the user — borderline matches go to a human reviewer, never an automatic merge.</p>
+  <p><strong>3. Answer ranking needs a freshness boost, not just a vote-count sort.</strong> A brilliant new answer to an old, low-traffic question has almost no chance to accumulate votes at the same pace as an answer posted the day the question went viral. A pure vote-count-and-recency sort buries it. The fix is a decay function that gives a new answer a temporary ranking boost based on early vote <em>velocity relative to the question's current view rate</em>, letting it prove itself quickly before settling into a steady-state, vote-based order.</p>
+
+  <h4>Trade-offs</h4>
+  <div class="callout tradeoff"><p>At 10x scale, scoring every candidate expert against every new question — the roughly 58,000 scoring ops/sec estimate — stops being affordable if either topic pools or question volume grow. The fix is a cheap pre-filter before the expensive scoring pass (for example, only consider experts active in the last 30 days, or cap the candidate pool size per topic), trading some routing recall — a good but currently inactive expert might get missed — for a bounded, predictable compute cost.</p></div>
+
+  <h4>Say this</h4>
+  <div class="callout say-this"><p>"Duplicate detection has to run synchronously, before I confirm the question was even posted, even though it's a similarity search over hundreds of millions of historical questions — the whole point is catching the duplicate before a second copy exists. I can afford that heavier per-query search here because question-creation is only around a dozen requests a second, nowhere near the volume a system like Pinterest's image search has to handle."</p></div>
+
+  <h4>Final design</h4>
+  <p>One picture: a new question runs a synchronous duplicate check against a similarity index, then fires an event that an async worker uses to score and rank candidate experts from a topic-scoped profile store and push notifications to the top few — completely decoupled from the answer-ranking pipeline that serves the question page itself.</p>
+
+  <h4>EM-level follow-up</h4>
+  <div class="callout em-angle"><p>Rollout: a new routing or ranking model should A/B test on a subset of topics first — routing a real expert to irrelevant questions repeatedly costs their trust and goodwill in a way that is harder to win back than a slightly off feed ordering is. Build vs. buy: given the low QPS on duplicate detection, a managed search service (such as a hosted Elasticsearch/OpenSearch cluster) is a reasonable place to run that search rather than a custom-built index. Cross-team: the "expert" reputation score is almost certainly a shared identity/reputation service used elsewhere in the product (profile display, for instance), so schema or scoring changes need coordination with whoever owns that shared service, not a unilateral change from the Q&amp;A team.</p></div>
+</article>
+
+<article class="problem">
+  <h3>Design A LinkedIn-Style Professional Feed And Connection Graph</h3>
+
+  <h4>Problem framing</h4>
+  <p>A professional network built on two coupled pieces: a bounded, mutual-consent connection graph — unlike Twitter/X's one-way follow, covered elsewhere in this chapter, a LinkedIn connection needs both sides to agree, and gates things like messaging permission — plus a ranked feed of posts from that connection graph and followed pages.</p>
+
+  <h4>Clarifying questions</h4>
+  <ul>
+    <li><strong>Are connections mutual (both sides must accept), or one-way follows?</strong> — this is the defining difference from a Twitter/X-style graph and changes the write path: a connection request needs a pending state and an explicit accept step, not a single one-sided action.</li>
+    <li><strong>Is there a hard cap on connections per user (LinkedIn caps around 30,000)?</strong> — a cap bounds the fan-out problem by design; without one, this system inherits the same celebrity-fan-out problem as an unbounded follower graph.</li>
+    <li><strong>Does the feed rank by a full ML relevance model, or a simpler heuristic?</strong> — a full model can reuse the ranking pipeline from the news-feed problem elsewhere in this bank; a simpler heuristic is a much smaller build.</li>
+    <li><strong>Does "people you may know" need to be fresh within minutes, or is a daily batch refresh acceptable?</strong> — this is fundamentally a graph-traversal problem, and traversal cost is the reason batch freshness is usually the right answer.</li>
+    <li><strong>Are there separate, event-driven notifications (profile views, a connection's new job) layered on top?</strong> — these are read-time or event-driven features on top of the core graph and feed, not part of the core write path.</li>
+  </ul>
+
+  <h4>Requirements</h4>
+  <p><strong>Functional:</strong> users send, accept, or reject connection requests (mutual, capped at roughly 30,000 per user); users see a ranked feed of posts from connections, followed pages, and groups; users can see mutual-connection counts and "people you may know" suggestions; users can post updates or articles that reach their connection graph.</p>
+  <p><strong>Non-functional:</strong> connection-graph reads (checking mutual connections, degree of separation) must return in under roughly 100ms, since they gate features like messaging permission; feed ranking has a similar latency budget to the news-feed problem, roughly 200-300ms at the p99; "people you may know" can tolerate hours of staleness — it is fine as a batch job; the connection accept/reject transition needs strong consistency (both users must agree on the current state) even though the rest of the product, like the feed, tolerates eventual consistency.</p>
+
+  <h4>Capacity estimate</h4>
+  <p>Assume 300 million monthly active users, 60 million DAU (professional networks see lower daily engagement than consumer social apps).</p>
+  <p><strong>Writes are low relative to reads.</strong> Roughly 5 million connection requests sent/day ≈ 58/sec average. Posts run lower than a consumer feed too — assume 2 million/day ≈ 23/sec average, reflecting that professional content is posted far less often than casual social content.</p>
+  <p><strong>Feed reads, notably lower than a consumer feed's.</strong> 60M DAU × roughly 3 feed opens/day ≈ 180 million feed requests/day ≈ 2,100 req/sec average, peaking around 6,300/sec — worth contrasting directly with the news-feed problem's consumer-scale numbers elsewhere in this bank, which run roughly 30x higher, driven by both a bigger user base and much more frequent checking.</p>
+  <p><strong>Connection graph size.</strong> Assume roughly 400 connections per user on average (well under the 30,000 cap): 300 million users × 400 ≈ 120 billion logical edges. Stored denormalized both ways for fast lookup from either side, that is roughly 240 billion rows, at roughly 24 bytes/row (two 8-byte user IDs plus metadata) ≈ 5.7TB just for the edge list. This is the same shape of problem as any large social graph (see the graph database coverage in Ch.9), but bounded higher by the connection cap — unlike an unbounded follower graph, this number cannot grow without limit per user.</p>
+  <p><strong>"People you may know" as a traversal cost problem.</strong> Traversing to 2nd-degree connections (friends of connections) at an average fan-out of 400 means up to 400 × 400 = 160,000 candidate 2nd-degree nodes per user before removing duplicates. Running that live, per request, for 300 million users is infeasible — which is exactly why this is computed as an offline batch graph job on a schedule, not on demand.</p>
+
+  <h4>API design</h4>
+  <pre><code>POST /connections/requests            {targetUserId}     -> 201 {requestId, status:"pending"}
+POST /connections/requests/{id}/accept
+POST /connections/requests/{id}/reject
+GET  /connections?userId={id}                             -> paginated connection list
+GET  /connections/degree?userA={a}&userB={b}              -> 1st/2nd/3rd/none
+GET  /feed?userId={id}&cursor={c}                          -> ranked posts
+POST /posts                            {text, media?}     -> 201
+GET  /suggestions/people-you-may-know?userId={id}          -> served from precomputed cache</code></pre>
+
+  <h4>High-level design</h4>
+  <div class="diagram" data-diagram='{
+    "title": "Strongly consistent connection graph, feed pipeline reused from news feed",
+    "nodes": [
+      {"id":"client","x":30,"y":260,"w":150,"h":60,"kind":"external","label":"Client App"},
+      {"id":"connection_svc","x":230,"y":80,"w":190,"h":60,"kind":"compute","label":"Connection Service","sub":"mutual accept, transactional"},
+      {"id":"graph_store","x":480,"y":80,"w":180,"h":60,"kind":"storage","label":"Graph Store","sub":"sharded by user_id, capped edges"},
+      {"id":"feed_svc","x":230,"y":260,"w":170,"h":60,"kind":"compute","label":"Feed Service"},
+      {"id":"feed_store","x":480,"y":260,"w":170,"h":60,"kind":"storage","label":"Feed Store","sub":"same pattern as news feed"},
+      {"id":"post_svc","x":730,"y":260,"w":160,"h":60,"kind":"compute","label":"Post Service"},
+      {"id":"post_db","x":730,"y":80,"w":160,"h":60,"kind":"storage","label":"Post DB"},
+      {"id":"batch_job","x":230,"y":420,"w":190,"h":60,"kind":"compute","label":"Nightly Graph Batch Job"},
+      {"id":"suggestions_cache","x":480,"y":420,"w":190,"h":60,"kind":"storage","label":"Suggestions Cache","sub":"people you may know"}
+    ],
+    "edges": [
+      {"from":"client","to":"connection_svc","label":"send/accept/reject"},
+      {"from":"connection_svc","to":"graph_store","label":"atomic edge update"},
+      {"from":"client","to":"feed_svc","label":"GET /feed"},
+      {"from":"feed_svc","to":"feed_store"},
+      {"from":"client","to":"post_svc","label":"POST /posts"},
+      {"from":"post_svc","to":"post_db"},
+      {"from":"post_db","to":"feed_store","label":"fan-out (async)"},
+      {"from":"graph_store","to":"batch_job","label":"nightly traversal"},
+      {"from":"batch_job","to":"suggestions_cache"},
+      {"from":"client","to":"suggestions_cache","label":"GET people-you-may-know"}
+    ]
+  }'></div>
+
+  <h4>Deep dive</h4>
+  <p><strong>1. A deliberate island of strong consistency inside an otherwise eventually consistent system.</strong> The connection request/accept flow needs both users' edge rows to change together, or neither — exactly the kind of small, focused transaction relational databases handle well (see Ch.7 and Ch.12 on ACID guarantees and consistency). This piece is a deliberate carve-out: a single ACID transaction across both users' rows where possible, or a two-phase update with a compensating rollback when the two users' data happens to land on different shards, inside a system that is eventually consistent almost everywhere else, including the feed.</p>
+  <p><strong>2. "People you may know" is a graph algorithm, not a ranking model.</strong> Unlike the news-feed or Pinterest ranking problems elsewhere in this bank, which score candidates with learned relevance signals, this is fundamentally a bounded graph traversal — 2 hops out, then rank candidates by mutual-connection count and shared attributes like company or school. That makes it cheaper to run as a scheduled batch graph job (using a system suited to bulk traversal, see Ch.9) than to try to serve live, and it is a large part of why this feature tolerates hours of staleness without hurting the product.</p>
+  <p><strong>3. Sub-100ms degree checks against a multi-terabyte edge store.</strong> Gating a feature like messaging on "are these two users within some degree of connection" needs a fast answer against a 5.7TB edge store. The practical answer is to restrict live checks to 1st-degree only (a single indexed lookup, genuinely fast), and treat "is this a 2nd or 3rd degree connection" as a best-effort, slightly-stale answer served from the same batch job that produces "people you may know" — a live, full breadth-first search per request simply does not fit the latency budget.</p>
+
+  <h4>Trade-offs</h4>
+  <div class="callout tradeoff"><p>At 10x the user base, the connection cap that kept the graph store manageable at 300 million users stops being enough on its own. Sharding the edge store by user_id keeps single-user lookups fast, but any cross-shard traversal for "people you may know" — a 2nd-degree friend is very likely on a different shard — gets more expensive as shard count grows, trading a longer batch-job runtime for continued storage scalability.</p></div>
+
+  <h4>Say this</h4>
+  <div class="callout say-this"><p>"Almost everything in this system — the feed, the suggestion cache — is eventually consistent, but the connection accept/reject transition is the one place I'd insist on a real transaction. Showing two users a different answer to 'are we connected,' even for a few seconds, breaks a permission check, not just a cosmetic feed ordering."</p></div>
+
+  <h4>Final design</h4>
+  <p>One picture: a strongly consistent connection service and graph store handle the request/accept state machine on their own transactional island; a feed service, feed store, and fan-out worker reuse the exact push/pull ranking pattern from the news-feed problem, just sourced from a mutual-connection graph instead of a one-way follow graph; a nightly batch job walks the graph for "people you may know" and writes results to a cache the read API serves directly.</p>
+
+  <h4>EM-level follow-up</h4>
+  <div class="callout em-angle"><p>Rollout: raising the connection cap (say, from 30,000 to a higher number) is a capacity-planning decision for the graph-store team, not a simple product toggle — shards need to be sized for the new worst case before the product change ships. Build vs. buy: the nightly "people you may know" graph job is a good fit for a managed big-data platform (for example, a managed Spark cluster, see Ch.10's coverage of lakehouses) rather than a hand-rolled traversal service, since it is scheduled batch work, not a latency-sensitive one. Cross-team: connection-graph data is very likely a dependency for other teams (recruiting products, ads targeting), so any schema change needs an explicit compatibility contract with those consumers, not a silent migration.</p></div>
+</article>
+<article class="problem">
+  <h3>Design A Twitch-Style Live Streaming Platform With Live Chat</h3>
+
+  <h4>Problem framing</h4>
+  <p>A system where one person broadcasts live video from a camera or screen, and anywhere from a handful to millions of people watch it within a few seconds of it happening, while also posting real-time text chat next to the video. This is really two hard problems bolted together: getting live video from one encoder out to a huge, wildly uneven audience with low delay, and running a real-time chat room per broadcast at the same time. They scale differently and usually run on separate infrastructure.</p>
+
+  <h4>Clarifying questions</h4>
+  <ul>
+    <li><strong>How much end-to-end delay ("glass-to-glass," camera lens to viewer screen) is acceptable?</strong> — a delay of 15-30 seconds is fine for a "watch and chat casually" experience and lets you use plain, cheap HLS; getting under 2-5 seconds for real back-and-forth interaction (a streamer reacting live to chat) needs low-latency HLS or WebRTC, which cost more in both engineering effort and CDN request volume.</li>
+    <li><strong>Is viewership skewed toward a small number of very large channels, or fairly even?</strong> — real platforms are extremely skewed: a handful of channels can each pull hundreds of thousands of concurrent viewers while the median channel has a few dozen. That skew, not the average, drives the CDN and cache design.</li>
+    <li><strong>Does every broadcast need to be recorded and replayable as video-on-demand (VOD) afterward?</strong> — if yes, the packaging step needs to produce durable, seekable segments, not just short-lived live ones, which changes retention and storage cost.</li>
+    <li><strong>What moderation tools does chat need (slow mode, banned words, timeouts, mod roles)?</strong> — chat here carries far more spam and abuse risk per message than a curated live-comments wall, because anyone can type anything instantly; this affects how much filtering has to happen inline versus after the fact.</li>
+    <li><strong>Do viewers need two-way interaction with the streamer (e.g., voice), or is it one-way video out and text chat only?</strong> — one-way video plus text chat is a much simpler, cheaper design than anything needing two-way low-latency media, which starts to look like the live-audio-room problem later in this chapter.</li>
+  </ul>
+
+  <h4>Requirements</h4>
+  <p><strong>Functional:</strong> a streamer starts a broadcast from an encoder and it becomes watchable within seconds; viewers watch at a bitrate their connection can sustain (adaptive bitrate, or ABR); viewers post chat messages tied to the stream and see everyone else's messages live; moderators can mute/timeout/ban within a channel's chat; a finished broadcast is optionally saved as VOD.</p>
+  <p><strong>Non-functional:</strong> glass-to-glass latency in the single-digit seconds for the interactive case (we will assume that bar, since it is the harder one); the system must handle extreme per-channel skew — one channel might need 100,000x the capacity of a typical one — without every channel paying that cost; chat delivery should land within roughly 1-2 seconds, similar to the live-comments/voting bar in this chapter, and can drop a message under extreme load rather than block the video path; video delivery availability matters more than chat availability — losing chat for a few seconds is annoying, losing video is the product failing.</p>
+
+  <h4>Capacity estimate</h4>
+  <p>Assume a platform with 10,000 concurrent broadcasters at peak and 8 million concurrent viewers at peak, spread very unevenly across those broadcasters.</p>
+  <p><strong>Ingest bandwidth.</strong> A broadcaster streaming 1080p60 encodes at roughly 6 Mbps. 10,000 concurrent broadcasters × 6 Mbps ≈ 60,000 Mbps = 60 Gbps of inbound (ingest) bandwidth the platform has to absorb, geographically spread across wherever streamers are, which is why ingest needs regional points of presence close to the streamer, not one central location.</p>
+  <p><strong>Transcoding compute.</strong> Each incoming stream is transcoded into an adaptive-bitrate (ABR) ladder — typically 4-5 renditions (for example 1080p, 720p, 480p, 360p) so viewers on different connections and devices get a bitrate that actually plays smoothly. 10,000 concurrent streams × 4 renditions ≈ 40,000 concurrent transcode jobs running at all times — this is a large, continuously-running compute fleet, not a batch job.</p>
+  <p><strong>Egress bandwidth — the number that actually drives cost.</strong> Assume viewers land on an average effective bitrate of roughly 3 Mbps (a mix across the ABR ladder, weighted toward the lower-middle renditions most connections settle on). 8,000,000 viewers × 3 Mbps ≈ 24,000,000 Mbps = 24 Tbps of egress at peak. No origin server farm serves 24 Tbps directly — this is only survivable because a CDN (Ch.3) caches each rendition's segments at edge locations near viewers, so the origin only ever serves one copy of each segment per edge location, not one copy per viewer.</p>
+  <p><strong>Chat.</strong> Assume 5% of the 8 million concurrent viewers are actively chatting, each sending roughly one message every 30 seconds: 400,000 / 30s ≈ 13,300 messages/sec platform-wide on average, concentrated heavily into the large channels' chat rooms (a top channel's chat room alone can be thousands of messages/sec during a hype moment). Each message is tiny (under 200 bytes with metadata), so the bandwidth is trivial — the hard part is fan-out latency per room, covered in the deep dive.</p>
+  <p><strong>Storage (VOD).</strong> If every broadcast is recorded: at roughly 0.75GB/hour per rendition × 5 renditions ≈ 3.75GB per stream-hour of storage across the whole ABR ladder. 10,000 concurrent streams running continuously across a day is roughly 240,000 stream-hours/day; 240,000 × 3.75GB ≈ 0.9PB/day, and with streamer turnover and peak variance this lands in the roughly 1-2 petabytes/day range platform-wide — cheap per byte in object storage, but large enough that most platforms apply a retention window (VOD expires after some weeks) rather than keeping everything forever.</p>
+
+  <h4>API design</h4>
+  <pre><code>POST /streams/start          {streamKey}                  -> ingest endpoint (RTMP URL) + streamId
+GET  /channels/{id}/manifest.m3u8 (or .mpd)                -> ABR manifest (HLS/DASH), CDN-served
+GET  /channels/{id}                                        -> channel + current viewer count
+POST /channels/{id}/chat/messages   {text}                 -> 202 Accepted (async moderation)
+GET  /channels/{id}/chat/stream (WebSocket)                -> live chat push
+POST /channels/{id}/mods/{userId}/timeout  {seconds}        -> mod action, 204
+
+// Chat push frame:
+{"type":"chat","user":"...","text":"...","ts":...}</code></pre>
+
+  <h4>High-level design</h4>
+  <div class="diagram" data-diagram='{
+    "title": "Video pipeline (CDN pull) plus a separate chat fan-out pipeline",
+    "nodes": [
+      {"id":"streamer","x":30,"y":30,"w":160,"h":60,"kind":"external","label":"Streamer Client","sub":"RTMP encoder"},
+      {"id":"ingest","x":220,"y":30,"w":160,"h":60,"kind":"compute","label":"Regional RTMP Ingest"},
+      {"id":"transcoder","x":410,"y":30,"w":160,"h":60,"kind":"compute","label":"Transcode Farm","sub":"ABR ladder"},
+      {"id":"packager","x":600,"y":30,"w":160,"h":60,"kind":"compute","label":"Packager","sub":"HLS/LL-HLS segments"},
+      {"id":"origin","x":600,"y":140,"w":160,"h":60,"kind":"storage","label":"Origin + Object Storage"},
+      {"id":"cdn_edge","x":790,"y":140,"w":160,"h":60,"kind":"external","label":"CDN Edge PoPs"},
+      {"id":"viewer","x":420,"y":270,"w":160,"h":60,"kind":"external","label":"Viewer Clients"},
+      {"id":"chat_ingest","x":220,"y":420,"w":160,"h":60,"kind":"compute","label":"Chat Ingest Service"},
+      {"id":"moderation","x":410,"y":420,"w":160,"h":60,"kind":"compute","label":"Chat Moderation Filter"},
+      {"id":"chat_fanout","x":600,"y":420,"w":160,"h":60,"kind":"compute","label":"Chat Fan-out Relay"},
+      {"id":"edge_ws","x":790,"y":420,"w":160,"h":60,"kind":"compute","label":"Edge WS Gateways"}
+    ],
+    "edges": [
+      {"from":"streamer","to":"ingest","label":"RTMP push"},
+      {"from":"ingest","to":"transcoder"},
+      {"from":"transcoder","to":"packager"},
+      {"from":"packager","to":"origin","label":"write segments"},
+      {"from":"origin","to":"cdn_edge","label":"pull segments"},
+      {"from":"cdn_edge","to":"viewer","label":"ABR pull"},
+      {"from":"viewer","to":"chat_ingest","label":"POST message"},
+      {"from":"chat_ingest","to":"moderation"},
+      {"from":"moderation","to":"chat_fanout","label":"approved"},
+      {"from":"chat_fanout","to":"edge_ws","label":"push"},
+      {"from":"edge_ws","to":"viewer","label":"live chat"}
+    ],
+    "groups": [
+      {"x":10,"y":10,"w":960,"h":210,"label":"Video pipeline: encode, transcode, package, CDN pull"},
+      {"x":10,"y":400,"w":960,"h":140,"label":"Chat pipeline: WebSocket fan-out"}
+    ]
+  }'></div>
+
+  <h4>Deep dive</h4>
+  <p><strong>1. Serving extreme per-channel viewer skew without over-provisioning every channel.</strong> A CDN cache naturally absorbs skew, because a popular channel's segments simply get requested more often from the same cached copy at each edge node — the origin still only serves one copy per edge location regardless of whether that channel has 100 or 500,000 viewers. The design risk is the small channel, not the large one: a channel with only a few viewers still needs its segments cached somewhere close to those viewers, so most platforms accept a short cold-start delay (the first viewer's request has a cache miss that pulls from origin) rather than pre-warming every possible channel's cache everywhere.</p>
+  <p><strong>2. Chunk size is a latency-versus-cost dial, not a fixed constant.</strong> Standard HLS segments are 6-10 seconds long, so a viewer is always at least one full segment behind — glass-to-glass delay of 15-30 seconds is normal. Low-latency HLS (LL-HLS) cuts segments into much smaller parts (roughly 200ms-1s each) and lets the player start playing a part before the whole segment finishes, pushing delay down to a few seconds — but this multiplies the number of HTTP requests hitting the CDN by 5-10x for the same stream, which is a direct cost increase, not a free win. This is the single biggest trade-off decision in this problem, and it should be scoped to the channels that actually need real interactivity rather than applied platform-wide.</p>
+  <p><strong>3. Chat fan-out reuses the pattern from this chapter's Live Comments/Voting problem, with one added wrinkle.</strong> A hot channel's chat room needs the same layered relay tree (origin → regional relays → edge WebSocket gateways → clients) described there, because a single chat room can independently spike to thousands of messages/sec regardless of how the video side is doing. The wrinkle is per-room ordering: viewers expect chat messages in one channel to appear in a consistent order relative to each other (unlike a global live-comments wall, where strict ordering matters less), so the fan-out path partitions by channel ID and preserves order within a partition — the same partition-key idea used for ordering guarantees in Kafka (Ch.14).</p>
+
+  <h4>Trade-offs</h4>
+  <div class="callout tradeoff"><p>At 10x the concurrent viewers (80 million), CDN egress cost becomes the dominant line item in the whole system's budget, and a handful of mega-channels start to look like their own dedicated live-broadcast problem. The common fix is a tiered CDN strategy: cheaper, less redundant caching for the long tail of small channels, and a premium, more heavily replicated caching tier reserved for channels that cross a concurrent-viewer threshold — trading a uniform architecture for one that treats "the top 0.1% of channels" as a special case worth engineering for separately.</p></div>
+
+  <h4>Say this</h4>
+  <div class="callout say-this"><p>"I would not put every channel on low-latency HLS by default. I would ship standard HLS with 6-10 second segments as the default, because it is dramatically cheaper on CDN request volume, and reserve low-latency mode for channels or moments where the product explicitly needs real interactivity — the cost of shaving 20 seconds of delay off a channel nobody is actively talking back to is money spent on nothing."</p></div>
+
+  <h4>Final design</h4>
+  <p>One picture: a streamer's encoder pushes RTMP into a regional ingest point; the stream is transcoded into an ABR ladder, packaged into HLS/LL-HLS segments, and written to origin storage that a CDN pulls from and caches at the edge; viewers pull whichever rendition fits their bandwidth. Chat runs on a completely separate path: viewer messages go through ingest and a moderation filter, then out through a layered relay tree to edge WebSocket gateways, partitioned per channel to keep ordering sane.</p>
+
+  <h4>EM-level follow-up</h4>
+  <div class="callout em-angle"><p>Rollout: never flip a whole platform to low-latency mode in one release — roll it out channel by channel or region by region, watching CDN request-rate and cost dashboards, since the request-volume multiplier is easy to underestimate on paper. Build vs. buy: for most companies below Twitch's own scale, a managed live-video platform (ingest, transcode, CDN packaging bundled together, such as a cloud provider's live-streaming media service) is very likely cheaper than building and operating a custom transcode farm and packager for the first few years. Cross-team: chat abuse and moderation tooling is a trust-and-safety problem as much as an engineering one — the chat pipeline's filter rules need a standing relationship with that team, not a one-time integration.</p></div>
+</article>
+
+<article class="problem">
+  <h3>Design A Spotify-Style Music Streaming and Discovery Platform</h3>
+
+  <h4>Problem framing</h4>
+  <p>An on-demand audio catalog: users search for and stream songs instantly, build and share playlists, and get a personalized set of recommendations refreshed regularly. Unlike the YouTube/Netflix streaming problem elsewhere in this bank, the bottleneck here is not delivery bandwidth — an audio file is roughly 20-30x smaller than a video stream at similar quality — it is catalog scale, licensing-grade play-count accuracy, and running personalization for hundreds of millions of users economically.</p>
+
+  <h4>Clarifying questions</h4>
+  <ul>
+    <li><strong>Does playback need to survive switching devices mid-song (resume on phone what started on laptop)?</strong> — cross-device playback state is a small but real piece of state that needs to be written and read fast, and consistently, across sessions.</li>
+    <li><strong>Is the flagship discovery feature (something like a weekly personalized playlist) refreshed on a fixed schedule or continuously?</strong> — a fixed weekly refresh lets recommendations run as an offline batch job; continuous personalization needs a much more expensive real-time serving path, closer to the TikTok For You problem elsewhere in this chapter.</li>
+    <li><strong>Does a play count need to be exact for royalty payouts to artists and labels, or is it acceptable if it is approximate?</strong> — this single answer decides whether play-count ingestion needs financial-grade correctness (dedup, durable ledger, audit trail) or can reuse the same loose analytics pipeline as, say, a "likes" counter.</li>
+    <li><strong>Is offline download/playback (no network) required?</strong> — offline support adds a whole client-side sync and DRM-adjacent licensing dimension that a pure streaming-only product does not need.</li>
+    <li><strong>Are collaborative playlists (multiple users editing the same playlist) in scope?</strong> — concurrent edits to one playlist need a conflict-resolution strategy, however simple, or two users will silently overwrite each other's changes.</li>
+  </ul>
+
+  <h4>Requirements</h4>
+  <p><strong>Functional:</strong> search the catalog; stream a track with a bitrate suited to the connection; create, edit, and share playlists, including collaborative ones; receive personalized recommendations (a home feed and a scheduled "discovery" playlist); resume playback across devices; optionally download for offline playback.</p>
+  <p><strong>Non-functional:</strong> perceived-instant playback start (roughly 200-300ms from tap to first audio); playback path availability of 99.95%+, since a broken play button is the whole product failing; play-count ingestion must be at-least-once with per-play deduplication, because it feeds real royalty payments, not just an internal metric; catalog metadata needs to scale to tens of millions of tracks with fast search and lookup.</p>
+
+  <h4>Capacity estimate</h4>
+  <p>Assume 100 million daily active listeners, averaging 1 hour of listening per day, and a catalog of 100 million tracks.</p>
+  <p><strong>Play throughput.</strong> An average track is roughly 3.5 minutes. 100,000,000 users × 60 minutes ÷ 3.5 minutes/track ≈ 1.7 billion track-plays/day. Spread over 86,400 seconds/day, that is roughly 20,000 play-starts/sec average, with evening peaks pushing 2-3x higher — call it roughly 50,000-60,000 play-starts/sec at peak.</p>
+  <p><strong>Egress bandwidth.</strong> Audio streams at roughly 96-320 kbps depending on quality tier; call the blended average 160 kbps ≈ 20 KB/s per active stream. At a peak of, say, 20 million concurrent listeners: 20,000,000 × 160 kbps ≈ 3.2 Tbps of egress. That is roughly 7-8x less than the 24 Tbps figure worked out for a comparable concurrent audience in the Twitch-style problem in this chapter — the direct, arithmetic consequence of audio being a fraction of video's bitrate — and it is the main reason a music platform's CDN bill, at similar audience size, is a much smaller line item than a video platform's.</p>
+  <p><strong>Catalog storage.</strong> Each track is stored in a few renditions (say 3: roughly 96, 160, and 320 kbps). For a 4-minute (240s) track: 96kbps × 240s ÷ 8 ≈ 2.88MB, 160kbps × 240s ÷ 8 ≈ 4.8MB, and 320kbps × 240s ÷ 8 ≈ 9.6MB; summing all three renditions lands around 17MB per track. 100,000,000 tracks × ~17MB ≈ 1.7 petabytes for the whole catalog (before replication) — large, but a bounded, roughly-fixed number, unlike the ever-growing play-event stream.</p>
+  <p><strong>Play-event volume.</strong> 1.7 billion play events/day, each a small record (user ID, track ID, timestamp, session ID, roughly 100-200 bytes) ≈ up to ~340GB/day of raw event data — this stream feeds both the royalty ledger and the recommendation pipeline, and its retention (how long raw events are kept before aggregation) is a real storage-cost decision, separate from the catalog's.</p>
+
+  <h4>API design</h4>
+  <pre><code>GET  /search?q=...                              -> tracks/artists/albums/playlists
+GET  /tracks/{id}/stream                         -> signed, short-TTL CDN URL + manifest
+POST /playlists                       {name}     -> 201 {playlistId}
+PATCH /playlists/{id}/tracks          {op,trackId} -> add/remove/reorder
+GET  /me/discover-weekly                         -> precomputed personalized playlist
+GET  /me/home                                    -> personalized home feed
+POST /playback/events   {trackId,eventType,ts,sessionId} -> 202 Accepted (idempotent per sessionId+ts)</code></pre>
+
+  <h4>High-level design</h4>
+  <div class="diagram" data-diagram='{
+    "title": "Low-latency serving path plus an offline event and recommendation pipeline",
+    "nodes": [
+      {"id":"client","x":30,"y":30,"w":160,"h":60,"kind":"external","label":"Listener Client"},
+      {"id":"api_gw","x":230,"y":30,"w":160,"h":60,"kind":"compute","label":"API Gateway"},
+      {"id":"catalog","x":430,"y":30,"w":170,"h":60,"kind":"compute","label":"Catalog/Metadata Service"},
+      {"id":"playback","x":630,"y":30,"w":170,"h":60,"kind":"compute","label":"Playback Service","sub":"issues signed URL"},
+      {"id":"cdn","x":830,"y":30,"w":150,"h":60,"kind":"external","label":"CDN"},
+      {"id":"playlist_svc","x":230,"y":140,"w":160,"h":60,"kind":"compute","label":"Playlist Service"},
+      {"id":"search","x":430,"y":140,"w":170,"h":60,"kind":"storage","label":"Search Index"},
+      {"id":"object_storage","x":630,"y":140,"w":170,"h":60,"kind":"storage","label":"Object Storage (audio files)"},
+      {"id":"playlist_db","x":230,"y":250,"w":170,"h":60,"kind":"storage","label":"Playlist DB"},
+      {"id":"discover","x":830,"y":250,"w":150,"h":60,"kind":"compute","label":"Discovery Service"},
+      {"id":"playback_events","x":30,"y":360,"w":170,"h":60,"kind":"queue","label":"Kafka: playback-events"},
+      {"id":"royalty","x":230,"y":360,"w":170,"h":60,"kind":"compute","label":"Royalty Aggregator"},
+      {"id":"royalty_store","x":430,"y":360,"w":170,"h":60,"kind":"storage","label":"Play-Count Ledger"},
+      {"id":"rec_batch","x":630,"y":360,"w":170,"h":60,"kind":"compute","label":"Batch Rec Pipeline (weekly)"},
+      {"id":"rec_store","x":830,"y":360,"w":150,"h":60,"kind":"storage","label":"Recommendation Store (KV)"}
+    ],
+    "edges": [
+      {"from":"client","to":"api_gw","label":"search / play / browse"},
+      {"from":"api_gw","to":"catalog"},
+      {"from":"api_gw","to":"playlist_svc"},
+      {"from":"api_gw","to":"playback","label":"request stream"},
+      {"from":"playback","to":"object_storage","label":"signed URL"},
+      {"from":"playback","to":"cdn"},
+      {"from":"cdn","to":"client","label":"audio segments"},
+      {"from":"playlist_svc","to":"playlist_db"},
+      {"from":"catalog","to":"search","label":"index"},
+      {"from":"api_gw","to":"playback_events","label":"playback events"},
+      {"from":"playback_events","to":"royalty"},
+      {"from":"royalty","to":"royalty_store","label":"increment, idempotent"},
+      {"from":"playback_events","to":"rec_batch","label":"feature signal"},
+      {"from":"rec_batch","to":"rec_store","label":"write weekly recs"},
+      {"from":"rec_store","to":"discover"},
+      {"from":"discover","to":"client","label":"Discover Weekly"}
+    ],
+    "groups": [
+      {"x":10,"y":10,"w":980,"h":310,"label":"Serving path: catalog, playback, playlists (low-latency)"},
+      {"x":10,"y":340,"w":980,"h":140,"label":"Event + batch pipeline: royalty accounting and weekly recs (offline)"}
+    ]
+  }'></div>
+
+  <h4>Deep dive</h4>
+  <p><strong>1. Personalization as a scheduled batch job, not a live ranking model.</strong> The flagship discovery feature here can be computed offline, once a week, for every user (a large but bounded, predictable batch — collaborative filtering or embedding-based similarity run over the whole play-event history, see the batch-pipeline ideas in Ch.10) and written into a fast key-value store (Ch.8) for O(1) lookup at request time. This is a deliberately different design from the TikTok-style For You feed elsewhere in this chapter, which re-ranks on every scroll: music-listening taste shifts slowly compared to short-video engagement, so paying for real-time inference on every request would buy almost no extra relevance for a lot more compute cost.</p>
+  <p><strong>2. Play-count correctness is a money problem, not an analytics problem.</strong> A "likes" counter being off by a handful is invisible to users; a play count feeds real royalty payments to labels and artists, so the ingestion path needs at-least-once delivery (Kafka, Ch.14) plus deduplication on a stable key (session ID + timestamp) before a play counts toward payout — the same idempotency discipline covered in Ch.13 for exactly-once-effect processing. Most systems keep this royalty ledger as a separate, durable, auditable store from the looser real-time counters used to drive UI numbers like "X million plays," because the two have very different correctness bars.</p>
+  <p><strong>3. Sub-300ms playback start against a 1.5-petabyte catalog.</strong> Three things make this fast in practice: the client prefetches the next track in the current playlist or queue while the current one is still playing, so the "next" request often has zero perceived latency; playback URLs are short-lived, pre-signed CDN links generated on request rather than looked up through a slow permission check each time; and the client picks its own rendition from a small, fixed bitrate ladder based on recently measured throughput, avoiding a round trip to the server just to decide quality.</p>
+
+  <h4>Trade-offs</h4>
+  <div class="callout tradeoff"><p>At 10x the user base (1 billion+), a single weekly full-catalog batch recommendation run starts to compete for a compute window that no longer comfortably fits between one week's end and the next week's delivery deadline. The usual fix is splitting the pipeline: incremental, streaming feature updates keep each user's profile fresh continuously, while a full model retrain still happens on a longer, less frequent cycle — trading the simplicity of "one clean weekly batch job" for a more complex, always-partially-running pipeline.</p></div>
+
+  <h4>Say this</h4>
+  <div class="callout say-this"><p>"I would treat the play-count that feeds artist royalties as a completely different reliability problem from the play-count shown in the UI. The royalty number needs exactly-once-effect processing with a durable, auditable ledger, because it is a financial record, not a vanity metric — and I would not let the two pipelines share infrastructure just because they start from the same event.</p></div>
+
+  <h4>Final design</h4>
+  <p>One picture: a client hits an API gateway that fans out to a catalog service, a playlist service, and a playback service that hands back a signed CDN URL for the actual audio bytes. Every play emits an event onto Kafka, which two separate consumers read: a royalty aggregator writing to a durable, deduplicated ledger, and a weekly batch job writing precomputed recommendations into a fast key-value store that a discovery service serves directly.</p>
+
+  <h4>EM-level follow-up</h4>
+  <div class="callout em-angle"><p>Rollout: ship a new recommendation model to a small cohort first and measure skip-rate and session length before a full rollout — a worse model is easy to miss without a real engagement metric, not just an offline accuracy score. Build vs. buy: audio CDN delivery is a reasonable buy from day one, but the catalog metadata and recommendation pipeline are core product IP worth building in-house. Cross-team: any change to how play counts are computed or deduplicated needs sign-off from legal/finance, since it directly changes what artists and labels get paid.</p></div>
+</article>
+
+<article class="problem">
+  <h3>Design A Medium-Style Publishing Platform</h3>
+
+  <h4>Problem framing</h4>
+  <p>A platform where writers publish long-form articles with rich formatting and images, readers browse a personalized feed and follow authors, and some content sits behind a metered paywall (a fixed number of free reads per month, then a subscription). Unlike Reddit or Quora elsewhere in this bank, the unit of content here is a large, edited document, not a short post — which shapes both the write path (drafts, revisions, rich content) and the read path (the content is expensive to render once and then extremely cacheable).</p>
+
+  <h4>Clarifying questions</h4>
+  <ul>
+    <li><strong>Does the paywall meter reads for anonymous (not-logged-in) visitors too, or only logged-in free users?</strong> — metering anonymous visitors needs an identity proxy (a cookie or device fingerprint) that is far less reliable than a real account, which changes how strictly the free-read limit can actually be enforced.</li>
+    <li><strong>Can two people edit the same draft at once, or is a draft single-author?</strong> — real-time collaborative editing is a materially harder problem (see the Google-Docs-style collaborative editing problem in a later chapter) than single-author drafting with simple save/versioning.</li>
+    <li><strong>Is the personalized feed based purely on who a reader follows, or does it also recommend content from people they do not follow?</strong> — pure-follow feeds are a straightforward chronological or lightly-ranked query; adding discovery beyond the follow graph needs a ranking/recommendation layer similar to the Facebook-style News Feed problem elsewhere in this chapter.</li>
+    <li><strong>How fast does a correction/edit to a published article need to propagate to readers already viewing a cached copy?</strong> — this decides how aggressive the CDN cache TTL can be, since content is otherwise close to immutable once published.</li>
+    <li><strong>Do embedded rich media (images, embedded tweets, code blocks) need to render identically across web and mobile clients?</strong> — this pushes toward storing content as structured, sanitized data rather than raw HTML, so every client renders from the same source of truth.</li>
+  </ul>
+
+  <h4>Requirements</h4>
+  <p><strong>Functional:</strong> an author drafts, edits, and publishes a rich-text article with images; a reader browses a personalized feed and a following feed, reads articles, claps/reacts, and comments; a reader hits a metered paywall after a fixed number of free articles per period; authors and publications can be followed.</p>
+  <p><strong>Non-functional:</strong> publish-to-visible latency of a few seconds is fine — this is not a real-time system; the read path needs to be fast (well under 200ms server response time before network) because a single article can go viral and take a huge, sudden share of read traffic; the paywall metering decision must be enforced correctly per identity even though the article body itself is heavily cached; draft content must never be silently lost to a race between two open editor tabs.</p>
+
+  <h4>Capacity estimate</h4>
+  <p>Assume 200,000 new articles published per day and 100 million monthly active readers, each reading roughly 3 articles/day on days they are active.</p>
+  <p><strong>Write throughput.</strong> 200,000 articles/day ÷ 86,400s ≈ 2.3 publishes/sec average — publishing is a low-throughput write path; the effort here goes into correctness (sanitization, indexing, fan-out) per publish, not raw QPS.</p>
+  <p><strong>Read throughput.</strong> Assume 40 million daily active readers × 3 reads/day ≈ 120 million reads/day ÷ 86,400s ≈ 1,400 reads/sec average. A single viral article hitting a platform's front page can pull a large share of that — say 10-20% of instantaneous traffic onto one article — meaning one cached record can see request rates in the thousands/sec for a few hours, which is exactly the kind of hot-key read pattern CDN and application caching (Ch.4) exist to absorb.</p>
+  <p><strong>Storage.</strong> An article's structured content (sanitized rich-text JSON, not raw HTML) runs roughly 20-50KB; call it 50,000 bytes. 200,000 articles/day × 50KB ≈ 10GB/day of article body data. Images are the bigger cost: assume an average of 5 images per article at 200KB each ≈ 1MB of images/article; 200,000 × 1MB ≈ 200GB/day of image data, stored in object storage and served through a CDN. Over a year, that is roughly 3.6TB/year of article text and 73TB/year of images — modest overall, and dominated by image assets rather than text.</p>
+
+  <h4>API design</h4>
+  <pre><code>POST  /articles                    {}                -> 201 {articleId} (empty draft)
+PATCH /articles/{id}                {content}         -> save revision (autosave)
+POST  /articles/{id}/publish        {}                -> renders, indexes, fans out to followers
+GET   /articles/{id}                                  -> rendered article (CDN-cacheable)
+POST  /articles/{id}/claps          {}                -> 202 Accepted
+POST  /articles/{id}/comments       {text}            -> 201 {commentId}
+GET   /me/feed                                        -> personalized feed
+GET   /me/read-quota                                  -> {remaining, resetsAt} (never cached)</code></pre>
+
+  <h4>High-level design</h4>
+  <div class="diagram" data-diagram='{
+    "title": "Write and publish path plus a cache-heavy read and paywall path",
+    "nodes": [
+      {"id":"author","x":30,"y":30,"w":160,"h":60,"kind":"external","label":"Author Client"},
+      {"id":"editor_svc","x":230,"y":30,"w":170,"h":60,"kind":"compute","label":"Draft/Editor Service"},
+      {"id":"publish_pipeline","x":430,"y":30,"w":170,"h":60,"kind":"compute","label":"Publish Pipeline","sub":"sanitize, render, index"},
+      {"id":"image_store","x":630,"y":30,"w":170,"h":60,"kind":"storage","label":"Object Storage (images)"},
+      {"id":"cdn","x":830,"y":30,"w":150,"h":60,"kind":"external","label":"CDN"},
+      {"id":"article_db","x":230,"y":140,"w":170,"h":60,"kind":"storage","label":"Article DB (drafts + revisions)"},
+      {"id":"search","x":430,"y":140,"w":170,"h":60,"kind":"storage","label":"Search Index"},
+      {"id":"notify","x":630,"y":140,"w":170,"h":60,"kind":"compute","label":"Follower Notify Service"},
+      {"id":"reader","x":30,"y":270,"w":160,"h":60,"kind":"external","label":"Reader Client"},
+      {"id":"article_svc","x":230,"y":270,"w":170,"h":60,"kind":"compute","label":"Article Read Service","sub":"cache-aside"},
+      {"id":"article_cache","x":430,"y":270,"w":170,"h":60,"kind":"storage","label":"Article Cache"},
+      {"id":"feed_svc","x":630,"y":270,"w":170,"h":60,"kind":"compute","label":"Feed Service"},
+      {"id":"meter_svc","x":230,"y":380,"w":170,"h":60,"kind":"compute","label":"Paywall Metering Service"},
+      {"id":"meter_store","x":430,"y":380,"w":170,"h":60,"kind":"storage","label":"Read-Count Store"},
+      {"id":"comments_svc","x":630,"y":380,"w":170,"h":60,"kind":"compute","label":"Comments/Claps Service"}
+    ],
+    "edges": [
+      {"from":"author","to":"editor_svc","label":"write/edit draft"},
+      {"from":"editor_svc","to":"article_db","label":"save revision"},
+      {"from":"editor_svc","to":"publish_pipeline","label":"publish"},
+      {"from":"publish_pipeline","to":"article_db","label":"mark published"},
+      {"from":"publish_pipeline","to":"image_store"},
+      {"from":"publish_pipeline","to":"search","label":"index"},
+      {"from":"publish_pipeline","to":"notify","label":"fan-out to followers"},
+      {"from":"image_store","to":"cdn"},
+      {"from":"reader","to":"article_svc","label":"GET article"},
+      {"from":"article_svc","to":"article_cache","label":"cache-aside"},
+      {"from":"article_cache","to":"article_db","label":"miss -> load"},
+      {"from":"reader","to":"meter_svc","label":"check quota, uncached"},
+      {"from":"meter_svc","to":"meter_store"},
+      {"from":"reader","to":"feed_svc","label":"GET feed"},
+      {"from":"reader","to":"comments_svc","label":"clap / comment"},
+      {"from":"cdn","to":"reader","label":"images"}
+    ],
+    "groups": [
+      {"x":10,"y":10,"w":980,"h":210,"label":"Write and publish path"},
+      {"x":10,"y":250,"w":980,"h":190,"label":"Read path (cacheable, paywall-gated)"}
+    ]
+  }'></div>
+
+  <h4>Deep dive</h4>
+  <p><strong>1. Caching a page whose content is public but whose access decision is personal.</strong> The article body is identical for every reader and safely cacheable at the CDN edge with a long time-to-live (Ch.4). The "has this reader already used up their free reads this month" check is the opposite: personal, and it must never be answered from a shared cache. The clean split is to serve the article shell from the CDN unconditionally and make the quota check a separate, small, always-uncached API call the client fires alongside it — mixing the two into one cached response either breaks the paywall or breaks the caching, not both at once.</p>
+  <p><strong>2. A hot article behaves like the celebrity fan-out problem, but for reads instead of writes.</strong> A single article going viral is a hot-key read, not a hot-key write — the fix leans entirely on the cache-aside pattern (Ch.4) plus CDN edge caching, since content is close to immutable once published and short edit-propagation delay is acceptable. This is the mirror image of the Twitter/X celebrity-fan-out problem in this chapter, which is about write-side fan-out to millions of followers; here the fan-out that matters is read-side, and it is a much easier problem because the content does not change per reader.</p>
+  <p><strong>3. Storing sanitized structured content, not raw HTML.</strong> Storing an author's article as raw HTML and rendering it directly opens the door to injected script content (a cross-site-scripting, or XSS, risk — see the input-sanitization guidance in Ch.16). Storing it instead as sanitized, structured data (a constrained JSON tree of allowed block types) that every client renders itself avoids that class of bug entirely and keeps web and mobile rendering consistent. Drafts are kept as an append-only revision log rather than overwritten in place, so two browser tabs open on the same draft cannot silently clobber each other's last save.</p>
+
+  <h4>Trade-offs</h4>
+  <div class="callout tradeoff"><p>At 10x the platform's scale, an author with millions of followers hits the exact same fan-out-on-publish problem as a celebrity account in the Twitter/X problem in this chapter: writing a "new article" event into millions of individual feed rows at publish time is too slow and too expensive. The fix is the same hybrid split covered there — fan out to followers on write for ordinary authors, and switch to fan-out-on-read (merge at request time) for accounts past a follower-count threshold.</p></div>
+
+  <h4>Say this</h4>
+  <div class="callout say-this"><p>"I would cache the article content aggressively at the CDN edge, since it is public and close to immutable, but I would keep the paywall quota check as a small, separate, always-live API call. Trying to bake a personal access decision into a shared cached response is how you either leak paid content for free or paywall people who should not be paywalled.</p></div>
+
+  <h4>Final design</h4>
+  <p>One picture: authors write into a draft service backed by an append-only revision log; publishing runs a pipeline that sanitizes and renders the content, indexes it for search, and fans out a notification to followers; readers hit a heavily CDN-cached article read path, with a small, separate, never-cached metering call deciding paywall access alongside it.</p>
+
+  <h4>EM-level follow-up</h4>
+  <div class="callout em-angle"><p>Rollout: changes to the paywall metering logic go out behind a flag to a small cohort first and get watched against subscription-conversion metrics, because a metering bug either leaks revenue or blocks paying readers — both are costly and easy to miss in a code review alone. Build vs. buy: a third-party rich-text editor component and a managed search service (rather than self-hosting search infrastructure) are reasonable buys; the paywall metering and recommendation logic are core product differentiators worth building in-house. Cross-team: any change to how a "read" is counted toward the free-article limit needs sign-off from finance/legal, since it is directly billing-adjacent.</p></div>
+</article>
+
+<article class="problem">
+  <h3>Design A Snapchat-Style Ephemeral Stories Platform</h3>
+
+  <h4>Problem framing</h4>
+  <p>A platform where photos and videos are visible for a limited time — a 24-hour "story" for a wider audience, or a single view for a direct message — and then are actually supposed to disappear. This is as much a storage-lifecycle and deletion-guarantee problem as it is a feed problem: the design has to make content truly gone, not just hidden from a list query, which is a stronger and different requirement than almost anything else in this chapter.</p>
+
+  <h4>Clarifying questions</h4>
+  <ul>
+    <li><strong>Is expiry always a fixed 24-hour window, or does a direct message expire on first view (view-once) instead?</strong> — a fixed time window is a straightforward time-to-live problem; view-once needs an atomic "mark viewed, then delete" step that has to survive a user opening the message on two devices at once.</li>
+    <li><strong>Does deleted content need to be provably gone (for privacy/compliance reasons), or is hiding it from app queries enough?</strong> — provable deletion means the underlying media bytes in object storage must actually be removed on a bounded timeline, not just the database row that points at them, which changes the design meaningfully.</li>
+    <li><strong>Do "close friends" or custom audience lists change who a story fans out to?</strong> — a story visible to a curated subset of a user's audience is a small filtering detail on top of the same fan-out logic, not a different architecture.</li>
+    <li><strong>Should the system try to detect or discourage screenshots of ephemeral content?</strong> — this is mostly a client-side, platform-API concern (detecting a screenshot event on the device) rather than a backend architecture decision, and it cannot be fully guaranteed against on every platform.</li>
+    <li><strong>How many "friends" does a typical user's audience have, versus a public creator account?</strong> — this decides whether the story-viewing fan-out can be a cheap, small fan-out-on-read, or needs the same celebrity-scale handling as a general social feed.</li>
+  </ul>
+
+  <h4>Requirements</h4>
+  <p><strong>Functional:</strong> a user posts a photo/video to their story, visible to their audience for 24 hours and then gone; a user sends a direct snap that disappears after being viewed once (or after a short timer); view receipts are recorded; users can reply to a story.</p>
+  <p><strong>Non-functional:</strong> expiry has to be enforced reliably — a very small tolerated rate of content still visible past its stated expiry, ideally near zero; expired media must actually be deleted from storage within a bounded, auditable time window, not just hidden; the upload path must handle very high write throughput at predictable daily peaks (evenings); the story-tray read path (a user's friends' active stories) needs to be fast, since it is opened constantly.</p>
+
+  <h4>Capacity estimate</h4>
+  <p>Assume 400 million daily active users, each posting to their story roughly once a day with an average of 4 snaps per story session.</p>
+  <p><strong>Upload throughput.</strong> 400,000,000 users × 4 snaps ≈ 1.6 billion snaps posted/day ÷ 86,400s ≈ 18,500 uploads/sec average, with a strong evening peak pushing 3-5x higher — roughly 60,000-90,000 uploads/sec at peak.</p>
+  <p><strong>Media size and bandwidth.</strong> Assume 70% photos at roughly 2MB and 30% short (around 10-second) videos at roughly 8MB; a weighted average of (0.7 × 2MB) + (0.3 × 8MB) ≈ 3.8MB per snap. 1.6 billion snaps/day × 3.8MB ≈ 6 petabytes/day of new media ingested.</p>
+  <p><strong>The number that actually matters here: steady-state storage is bounded, not cumulative.</strong> Because every one of those bytes is deleted within roughly 24-48 hours (story duration plus a short buffer), steady-state storage sits around ingest-rate × retention-window ≈ 6PB/day × 2 days ≈ 12 petabytes at any given moment, not petabytes that keep growing forever. This is the sharpest contrast with the Instagram-style photo-sharing problem in this chapter, which keeps essentially everything a user posts indefinitely — ephemeral content turns "how big does storage get" from an ever-growing number into a fixed, predictable one.</p>
+  <p><strong>View/read traffic.</strong> Assume each active user opens their story tray and views an average of 15 friends' stories/day: 400,000,000 × 15 ≈ 6 billion story views/day ÷ 86,400s ≈ 69,000 views/sec average, each a small metadata read plus a media fetch typically served from a CDN edge cache close to the viewer.</p>
+
+  <h4>API design</h4>
+  <pre><code>POST   /stories                {media, ttlHours=24}      -> 201 {storyId, expiresAt}
+GET    /stories/feed                                      -> tray of friends' non-expired stories
+GET    /stories/{id}/view                                 -> marks viewed, returns media URL
+POST   /snaps/direct            {to, media, viewOnce=true} -> 201 {snapId}
+GET    /snaps/{id}/view                                   -> conditional: returns media once, then marks consumed
+// No client-facing DELETE endpoint — expiry is system-enforced, not client-triggered.</code></pre>
+
+  <h4>High-level design</h4>
+  <div class="diagram" data-diagram='{
+    "title": "Upload path with a TTL, and a separate expiry-enforcement path",
+    "nodes": [
+      {"id":"sender","x":30,"y":30,"w":160,"h":60,"kind":"external","label":"Sender Client"},
+      {"id":"upload_svc","x":230,"y":30,"w":170,"h":60,"kind":"compute","label":"Media Upload Service"},
+      {"id":"object_store","x":430,"y":30,"w":170,"h":60,"kind":"storage","label":"Object Storage","sub":"lifecycle delete rule"},
+      {"id":"metadata_db","x":630,"y":30,"w":170,"h":60,"kind":"storage","label":"Story Metadata DB","sub":"TTL index, expiresAt"},
+      {"id":"cdn","x":830,"y":30,"w":150,"h":60,"kind":"external","label":"CDN"},
+      {"id":"viewer","x":30,"y":270,"w":160,"h":60,"kind":"external","label":"Viewer Client"},
+      {"id":"feed_svc","x":230,"y":270,"w":170,"h":60,"kind":"compute","label":"Story Feed Service","sub":"filters expired at read"},
+      {"id":"view_svc","x":430,"y":270,"w":170,"h":60,"kind":"compute","label":"View/Receipt Service","sub":"conditional write for view-once"},
+      {"id":"expiry_worker","x":630,"y":270,"w":170,"h":60,"kind":"compute","label":"Expiry Sweeper","sub":"jittered to avoid storms"},
+      {"id":"audit","x":830,"y":270,"w":150,"h":60,"kind":"storage","label":"Deletion Audit Log"}
+    ],
+    "edges": [
+      {"from":"sender","to":"upload_svc","label":"POST story/snap"},
+      {"from":"upload_svc","to":"object_store","label":"store bytes, set TTL"},
+      {"from":"upload_svc","to":"metadata_db","label":"write record, expiresAt"},
+      {"from":"object_store","to":"cdn","label":"serve via signed URL"},
+      {"from":"viewer","to":"feed_svc","label":"GET story tray"},
+      {"from":"feed_svc","to":"metadata_db","label":"query non-expired"},
+      {"from":"feed_svc","to":"cdn","label":"fetch media"},
+      {"from":"viewer","to":"view_svc","label":"mark viewed"},
+      {"from":"view_svc","to":"metadata_db","label":"conditional write"},
+      {"from":"metadata_db","to":"expiry_worker","label":"TTL fires"},
+      {"from":"expiry_worker","to":"object_store","label":"hard delete blob"},
+      {"from":"expiry_worker","to":"audit","label":"log deletion"}
+    ],
+    "groups": [
+      {"x":10,"y":10,"w":970,"h":100,"label":"Upload path"},
+      {"x":10,"y":250,"w":970,"h":100,"label":"Read + expiry-enforcement path"}
+    ]
+  }'></div>
+
+  <h4>Deep dive</h4>
+  <p><strong>1. Deletion is two separate guarantees, and a design that only satisfies one has a real privacy bug.</strong> The first guarantee is app-level invisibility: the metadata record's <code>expiresAt</code> is checked on every read, so a story instantly stops appearing in the tray the moment it expires, without waiting on any background job — this can be backed by a native TTL index (Ch.8's MongoDB TTL indexes, or Cassandra's per-column TTL from Ch.9) that also eventually removes the row itself. The second guarantee is the actual media bytes in object storage, which need their own independent lifecycle deletion rule. These are two different systems, and a design that only wires up the first one leaves the original media technically retrievable by anyone who still has the direct URL — a real bug class, not a hypothetical one, and worth naming explicitly in an interview.</p>
+  <p><strong>2. The story tray is fan-out-on-read from a small, bounded list, which is a much easier problem than a general social feed.</strong> Most users have a few hundred friends, so "fetch all non-expired stories for these friend IDs, ordered by recency" is a cheap, bounded query — nothing like the millions-of-followers fan-out problem in Twitter/X or Medium elsewhere in this chapter. The actual scale problem runs the other direction: a small number of public or creator stories can have huge audiences, and those need the same fan-out-on-write versus fan-out-on-read hybrid split by audience size used in those other problems.</p>
+  <p><strong>3. View-once needs an atomic check-and-set, or a snap can be viewed twice or never marked consumed.</strong> If "check whether viewed" and "mark as viewed" are two separate steps, two devices opening the same snap at nearly the same moment can both see "not yet viewed" and both display it — breaking the view-once guarantee. A single conditional write (an atomic compare-and-set on the view state, the same idea used for exactly-once vote counting in the live-comments/voting problem in this chapter) closes that race in one round trip instead of two.</p>
+
+  <h4>Trade-offs</h4>
+  <div class="callout tradeoff"><p>At 10x the write volume, a naive TTL-expiry mechanism where a huge share of content posted in the same few-hour evening window all expires 24 hours later in that same narrow window creates an "expiry storm" — a spike of delete I/O concentrated into a short daily period. The usual fix is jittering each record's actual TTL by a few minutes and staggering the sweep, trading a perfectly exact 24-hour expiry for "24 hours, give or take a few minutes," which is invisible to users but smooths the delete load.</p></div>
+
+  <h4>Say this</h4>
+  <div class="callout say-this"><p>"I would treat the metadata TTL and the object-storage lifecycle rule as two separate guarantees that both have to hold, not one guarantee implemented twice. Hiding an expired story from the feed query is a UX feature; actually deleting the bytes is a privacy commitment, and conflating the two is exactly how a platform ends up with technically-undeleted photos still reachable by direct URL.</p></div>
+
+  <h4>Final design</h4>
+  <p>One picture: uploads write media to object storage with a lifecycle delete rule and a metadata record carrying an <code>expiresAt</code>; reads always filter by that field so expired content is invisible the instant it expires, regardless of background jobs; a jittered expiry sweeper independently hard-deletes the underlying blobs and logs each deletion for audit, closing the gap between "hidden" and "actually gone."</p>
+
+  <h4>EM-level follow-up</h4>
+  <div class="callout em-angle"><p>Rollout: any change to the expiry pipeline ships behind a flag with an automated audit job that verifies deletion actually happened within the promised window, rather than trusting the code change on faith — "did we delete it" is a trust and compliance question, not just a functional one. Build vs. buy: native object-storage lifecycle rules (time-based auto-deletion built into most cloud object stores) are almost always the right choice over a hand-rolled deletion worker fleet. Cross-team: legal/privacy needs to sign off on the deletion SLA (how many hours after expiry "deleted" is allowed to take), since regulators care about the actual timeline, not just the intent.</p></div>
+</article>
+
+<article class="problem">
+  <h3>Design A Clubhouse-Style Live Audio Rooms Platform</h3>
+
+  <h4>Problem framing</h4>
+  <p>Many small "rooms" running at once, each with a handful of speakers having a real live conversation and a larger audience listening in, plus lightweight controls like raising a hand to ask to speak. The hard part is that a live conversation among speakers needs genuinely real-time, two-way audio (well under half a second of round-trip delay, or it stops feeling like a conversation), while the much larger listener audience only needs one-way audio that can tolerate a bit more buffering — and those two needs call for different transport mechanics entirely.</p>
+
+  <h4>Clarifying questions</h4>
+  <ul>
+    <li><strong>What is the practical cap on simultaneous speakers per room?</strong> — real products cap this in the single digits to low tens; the design gets much harder if a room needs, say, hundreds of simultaneous two-way audio speakers, since every additional speaker multiplies the cross-forwarding between speakers.</li>
+    <li><strong>Does a room need to be recorded for later replay?</strong> — recording adds a tap on the media stream and a durable storage path, and raises consent questions the product has to answer, not just the backend.</li>
+    <li><strong>Is there a text-chat channel alongside the audio, or audio only plus reactions?</strong> — a full text chat reuses the same fan-out-tree ideas as the live-comments/voting problem elsewhere in this chapter; audio-only-plus-emoji-reactions is a much lighter signaling load.</li>
+    <li><strong>How does a listener become a speaker — does raising a hand need to show up to the moderator in real time?</strong> — yes almost always, and that means the raise-hand/promote flow needs a low-latency signaling channel of its own, separate from the audio media path.</li>
+    <li><strong>Are speakers and listeners in a single room often spread across multiple regions/continents?</strong> — cross-region real-time audio has a hard physical latency floor from speed-of-light network delay, which affects how rooms should be routed to media servers.</li>
+  </ul>
+
+  <h4>Requirements</h4>
+  <p><strong>Functional:</strong> create and join a room; up to a small fixed number of speakers with live two-way audio; a much larger number of listeners with one-way audio; raise-hand and promote-to-speaker flow; moderator mute/remove controls; a directory of currently live rooms.</p>
+  <p><strong>Non-functional:</strong> speaker-to-speaker audio round-trip latency needs to stay in the low hundreds of milliseconds (roughly 150-300ms) for a conversation to feel natural — a materially stricter bar than the 1-2 second "near real time" target acceptable for live comments or chat; listener-side audio can tolerate a bit more buffering since it is one-way; a room must scale from a handful of listeners to tens of thousands without changing the speakers' experience at all.</p>
+
+  <h4>Capacity estimate</h4>
+  <p>Assume 10 million daily active users, with 500,000 rooms live simultaneously at peak, averaging 3 speakers and 40 listeners per room.</p>
+  <p><strong>Concurrent participants.</strong> 500,000 rooms × 43 participants/room ≈ 21.5 million concurrent audio participants at peak.</p>
+  <p><strong>Per-room bandwidth.</strong> Voice-optimized audio codecs (like Opus) run at roughly 24-32 kbps per stream. In one room: 3 speakers uploading ≈ 3 × 32 kbps ≈ 96 kbps of ingest; each speaker also needs to hear the other speakers, adding modest cross-forwarding; listeners typically receive one server-mixed or forwarded stream rather than a separate copy per speaker, so 40 listeners × ~32 kbps ≈ 1.28 Mbps of egress for that room. All in, a single room runs at roughly 1.3-1.5 Mbps of total media bandwidth.</p>
+  <p><strong>Platform-wide egress.</strong> 500,000 concurrent rooms × ~1.4 Mbps ≈ 700 Gbps aggregate at peak. That is a real, sizeable number, but roughly 30x smaller than the 24 Tbps egress worked out for a comparably concurrent audience in the Twitch-style problem in this chapter — the direct consequence of voice-only audio running at a tiny fraction of even audio-streaming bitrates, let alone video.</p>
+  <p><strong>Signaling load.</strong> Assume 5% of the 21.5 million concurrent participants interact with room controls (raise hand, mute toggle, reactions) once per minute: roughly 1 million events/minute ≈ 18,000 events/sec platform-wide. Each event is tiny (well under 500 bytes), so this is negligible in bandwidth but needs a genuinely low-latency delivery path per room, since a moderator needs to see a raised hand promptly.</p>
+
+  <h4>API design</h4>
+  <pre><code>POST /rooms                    {topic}                -> 201 {roomId}
+POST /rooms/{id}/join          {}                     -> media connection info/token (SFU endpoint)
+POST /rooms/{id}/raise-hand    {}                     -> 202 Accepted
+POST /rooms/{id}/speakers/{userId}/promote  {}        -> 204 (moderator only)
+POST /rooms/{id}/speakers/{userId}/mute     {}        -> 204 (moderator only)
+WS   /rooms/{id}/signaling                            -> room state events (joins, hand-raises, mutes)
+// Media itself is not REST: it flows over WebRTC to/from an SFU after join.</code></pre>
+
+  <h4>High-level design</h4>
+  <div class="diagram" data-diagram='{
+    "title": "Real-time media path (SFU) kept separate from the control/signaling path",
+    "nodes": [
+      {"id":"speaker","x":30,"y":30,"w":160,"h":60,"kind":"external","label":"Speaker Client"},
+      {"id":"sfu","x":230,"y":30,"w":170,"h":60,"kind":"compute","label":"SFU Cluster","sub":"WebRTC, per-region"},
+      {"id":"turn","x":430,"y":30,"w":170,"h":60,"kind":"compute","label":"TURN/STUN Servers","sub":"NAT traversal"},
+      {"id":"recorder","x":630,"y":30,"w":170,"h":60,"kind":"compute","label":"Recording Service"},
+      {"id":"recording_store","x":830,"y":30,"w":150,"h":60,"kind":"storage","label":"Recording Storage"},
+      {"id":"signaling","x":230,"y":140,"w":170,"h":60,"kind":"compute","label":"Signaling Service","sub":"join/leave, raise-hand"},
+      {"id":"room_svc","x":430,"y":140,"w":170,"h":60,"kind":"compute","label":"Room/Session Service"},
+      {"id":"room_meta","x":630,"y":140,"w":170,"h":60,"kind":"storage","label":"Room State Store"},
+      {"id":"listener","x":30,"y":270,"w":160,"h":60,"kind":"external","label":"Listener Client"},
+      {"id":"relay","x":630,"y":270,"w":170,"h":60,"kind":"compute","label":"Broadcast Relay Layer","sub":"for large audiences"}
+    ],
+    "edges": [
+      {"from":"speaker","to":"sfu","label":"publish audio"},
+      {"from":"sfu","to":"turn","label":"NAT traversal as needed"},
+      {"from":"sfu","to":"speaker","label":"subscribe: other speakers"},
+      {"from":"sfu","to":"relay","label":"forward stream"},
+      {"from":"relay","to":"listener","label":"subscribe audio"},
+      {"from":"listener","to":"signaling","label":"raise hand"},
+      {"from":"speaker","to":"signaling","label":"mute/promote controls"},
+      {"from":"signaling","to":"room_svc","label":"state change"},
+      {"from":"room_svc","to":"room_meta"},
+      {"from":"room_svc","to":"sfu","label":"authorize publish on promote"},
+      {"from":"sfu","to":"recorder","label":"tap stream, optional"},
+      {"from":"recorder","to":"recording_store"}
+    ],
+    "groups": [
+      {"x":210,"y":10,"w":780,"h":100,"label":"Media path: SFU + TURN (real-time, sub-300ms)"},
+      {"x":210,"y":120,"w":780,"h":100,"label":"Control path: signaling + room state (tolerates more delay)"}
+    ]
+  }'></div>
+
+  <h4>Deep dive</h4>
+  <p><strong>1. Why this needs a real-time media transport (WebRTC/SFU), not a message fan-out tree.</strong> The live-comments/voting and Twitch-chat problems elsewhere in this chapter move small discrete events where a one-to-two-second delay is completely fine, so a store-and-relay pub/sub pipeline works well. A live conversation cannot tolerate that: audio needs sub-300ms round trip or it stops feeling like a real exchange, which rules out that store-and-relay style entirely and requires WebRTC-style real-time transport over UDP. Within that, a selective forwarding unit (SFU) that just forwards each speaker's packets to subscribers with minimal processing is cheaper and lower-latency than a mixing server (an MCU, or multipoint control unit) that decodes, mixes, and re-encodes every stream — for the small number of simultaneous speakers this product needs, forwarding beats mixing.</p>
+  <p><strong>2. Scaling listeners without ever touching the speakers' latency path.</strong> The SFU only has to serve the room's speakers and a small, fixed number of downstream relay nodes — it never grows with listener count. A broadcast relay layer sits downstream of the SFU and does the actual fan-out to potentially tens of thousands of listeners, structurally the same layered fan-out-tree idea used for millions of viewers in the Twitch-style and live-comments/voting problems in this chapter. This separation is the whole point: a room growing from 40 to 40,000 listeners only adds relay capacity downstream and never changes what the speakers experience.</p>
+  <p><strong>3. Promoting a listener to speaker mid-conversation without a glitch.</strong> Raising a hand and getting promoted is a state transition the moderator needs to see in real time over the signaling channel (a WebSocket, separate from the media path), and it has to re-negotiate that user's media connection from receive-only to send-and-receive without an audible gap. The clean way to do this is to open a new publish connection to the SFU for the promoted user while their existing subscribe connection stays live, and only flip their client-side "you can talk now" state once that new publish connection is confirmed up — never tearing down and rebuilding the whole connection, which would cause an audible dropout.</p>
+
+  <h4>Trade-offs</h4>
+  <div class="callout tradeoff"><p>At 10x the concurrency, one specific room going viral (say, 500,000 listeners in a single room) pushes the downstream broadcast relay layer into exactly the same bottleneck the live-comments/voting problem in this chapter hits at extreme fan-out. The fix is the same layered, regional relay approach — and it has a real product consequence: past a certain size, listener-side interactivity (reactions, hand-raises) usually has to be throttled or sampled rather than delivered fully real-time, specifically to protect the speakers' latency budget, which is the one thing that cannot be compromised.</p></div>
+
+  <h4>Say this</h4>
+  <div class="callout say-this"><p>"For the handful of speakers per room, I would use an SFU that forwards packets rather than an MCU that mixes and re-encodes them — forwarding keeps both latency and server compute cost down, and with only a few speakers there is no real benefit to paying for a mixing server's extra CPU work.</p></div>
+
+  <h4>Final design</h4>
+  <p>One picture: speakers publish and subscribe to a per-region SFU cluster over WebRTC (with TURN/STUN handling NAT traversal), keeping their round-trip audio latency low; a broadcast relay layer sits downstream of the SFU and fans that same audio out to however many listeners the room has, without ever adding load back onto the speakers' path; a separate signaling service carries room state (joins, raised hands, mutes) and drives promote/demote decisions through the room service.</p>
+
+  <h4>EM-level follow-up</h4>
+  <div class="callout em-angle"><p>Rollout: test the SFU cluster's regional placement and TURN relay capacity against real cross-region calls before opening rooms to a global audience — NAT traversal and cross-region latency issues mostly only show up under real, diverse network conditions, not synthetic load tests. Build vs. buy: managed real-time media platforms (hosted WebRTC/SFU infrastructure) are a common buy for many companies rather than operating an in-house SFU fleet, at least until scale clearly justifies the operational investment. Cross-team: the mobile team owns background-audio behavior and interruption handling (incoming phone calls, other apps grabbing the microphone), which materially affects perceived reliability and is not something the backend design can fix alone.</p></div>
+</article>
+<div class="flashcards" data-cards='[
+  {"q":"Twitter/X: what is the one exception to fan-out-on-write?","a":"Accounts above a follower threshold (celebrities) skip fan-out entirely; their recent tweets are merged into a follower&#39;s timeline at read time instead, so one viral tweet cannot turn into millions of cache writes at once."},
+  {"q":"Instagram: why does an upload feel instant even though encoding takes real time?","a":"The client uploads straight to blob storage via a pre-signed URL and gets an immediate acknowledgment; a background pipeline does resizing and moderation after that, only marking the post visible once it finishes."},
+  {"q":"TikTok For You: why is ranking split into a funnel instead of one model call?","a":"You cannot score the entire video catalog per request. Cheap candidate generation (ANN lookup plus trending/fresh pools) narrows to a few thousand, a light pass narrows further, and only the survivors get the expensive final ranking model."},
+  {"q":"Reddit: why are the per-user vote record and the aggregate score handled differently?","a":"The per-user vote record must be strongly consistent (double-voting is a correctness bug), but the aggregate score shown to users can be a fast, eventually-consistent counter reconciled periodically against the durable ledger."},
+  {"q":"Reddit: why is a naive sort-by-vote-count wrong for the \"hot\" ranking?","a":"It would let old, high-vote posts permanently bury newer ones. The real ranking uses a function of net votes and post age (time-decayed), so a fresh post with fewer votes can still outrank an older one."},
+  {"q":"YouTube/Netflix: what does the player actually fetch, if not one video file?","a":"A manifest (HLS or DASH) listing short segments, a few seconds each, at multiple bitrates. The player switches segments on the fly based on measured throughput, which is why adaptive bitrate playback does not need a restart."},
+  {"q":"Live comments/voting: why can a single origin server not push tally updates to millions of viewers directly?","a":"Pushing one small update once a second to 10 million open sockets is on the order of gigabytes of egress per update from a single point — no origin or small cluster can sustain that, which is why a layered fan-out tree (origin to regional relays to edge gateways to clients) is required."},
+  {"q":"Live comments/voting: how is exactly-once vote counting done at extreme write rates?","a":"A single atomic check-and-set (e.g. Redis SETNX on a key like vote:{userId}:{pollId}) instead of a read-then-write, closing the race where two near-simultaneous votes from the same user could both see \"not yet voted.\""},
+  {"q":"Facebook-style news feed: what is the key structural difference from Twitter/X&#39;s timeline?","a":"The sort key is predicted relevance, not recency — so ranking is designed as a separate layer sitting on top of whichever fan-out strategy (push or pull) supplied the candidate pool, rather than being baked into the fan-out mechanism itself."},
+  {"q":"Pinterest: why run a perceptual hash before computing an image embedding?","a":"The same image gets uploaded or re-pinned many times. A cheap perceptual hash catches near-duplicates first, so the expensive vision-model embedding only runs once per genuinely new image, not once per pin action."},
+  {"q":"Pinterest: why is similarity search approximate rather than exact?","a":"Exact nearest-neighbor search over billions of high-dimensional vectors per query is computationally infeasible at real request rates, so production systems use a sharded approximate nearest-neighbor (ANN) index like HNSW instead."},
+  {"q":"Quora: why can duplicate-question detection run synchronously against hundreds of millions of historical questions?","a":"Because question creation is a very low-QPS write path (roughly a dozen/sec), unlike an image-search or feed read path — spending more compute per query is affordable precisely because there are so few queries."},
+  {"q":"LinkedIn: why does the connection accept/reject flow need real transactions when the rest of the system is eventually consistent?","a":"Both users&#39; edge rows must change together or not at all — showing two users a different answer to \"are we connected\" breaks a permission gate (e.g. messaging), not just a cosmetic ordering, so this one flow is a deliberate island of strong consistency."},
+  {"q":"Twitch-style streaming: what is the core latency-vs-cost trade-off in chunk size?","a":"Standard HLS segments (6-10s) give normal 15-30s glass-to-glass latency at low CDN request volume; low-latency HLS cuts segments to roughly 200ms-1s parts to get delay down to a few seconds, but multiplies CDN requests by 5-10x for the same stream."},
+  {"q":"Spotify: why is the flagship weekly recommendation feature run as an offline batch job instead of live re-ranking?","a":"Music-listening taste shifts slowly compared to short-video engagement, so a scheduled weekly batch run (written into a fast key-value store) delivers nearly the same relevance as real-time inference for a lot less compute cost."},
+  {"q":"Spotify: why does play-count ingestion need a different reliability bar than a \"likes\" counter?","a":"Play counts feed real royalty payments to artists and labels, so they need at-least-once delivery plus deduplication into a durable, auditable ledger — a financial-grade correctness bar, kept as a separate pipeline from the looser real-time counters used for UI display."},
+  {"q":"Medium: why can the article body and the paywall check never share one cached response?","a":"The article content is public and safely cached at the CDN edge with a long TTL, but the reader&#39;s remaining free-read quota is personal and must never be served from a shared cache — mixing the two either leaks paid content or wrongly blocks a reader."},
+  {"q":"Snapchat-style stories: what are the two separate guarantees expiry must satisfy?","a":"App-level invisibility (the metadata record&#39;s expiresAt is checked on every read, so expired content vanishes from queries instantly) AND actual deletion of the underlying media bytes in object storage on its own bounded lifecycle rule — satisfying only the first still leaves the original file retrievable by direct URL."},
+  {"q":"Snapchat-style stories: why does steady-state storage stay roughly constant instead of growing forever?","a":"Because nearly everything uploaded is deleted within roughly 24-48 hours, steady-state storage is bounded by ingest-rate times retention-window, not by cumulative uploads — the sharpest contrast with a platform like Instagram that keeps content indefinitely."},
+  {"q":"Clubhouse-style audio rooms: why use an SFU (selective forwarding unit) instead of an MCU (mixing server) for speakers?","a":"An SFU just forwards each speaker&#39;s packets to subscribers with minimal processing, which is lower-latency and cheaper than an MCU that decodes, mixes, and re-encodes every stream — and with only a handful of simultaneous speakers, mixing buys no real benefit."},
+  {"q":"Clubhouse-style audio rooms: how does a room scale from 40 to 40,000 listeners without hurting speaker latency?","a":"A broadcast relay layer sits downstream of the SFU and handles all listener fan-out; the SFU itself only ever serves the room&#39;s small, fixed number of speakers, so listener growth never touches the speakers&#39; real-time path."},
+  {"q":"Across this chapter, what single number most often decides the whole architecture?","a":"The fan-out factor — how many readers/listeners a single write or broadcast frame must reach — not the average request rate. It is why celebrity-threshold hybrids, layered relay trees, and CDN edge caching show up as the recurring fix across almost every problem."}
+]'></div>

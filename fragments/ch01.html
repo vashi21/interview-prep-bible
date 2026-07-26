@@ -1,0 +1,235 @@
+<p class="lede">A high-level-design (HLD) interview is not a test of how many system names you know. It is a test of how you think out loud under time pressure, with an incomplete problem, in front of someone scoring you against a checklist you can't see. This chapter shows you that checklist.</p>
+
+<h2><span class="idx">01</span>What Is Actually Being Scored</h2>
+<p>Most candidates think an HLD interview is about the final diagram: draw the right boxes, name the right database, and you pass. That's wrong. The interviewer already knows roughly what a working design for "design Twitter" or "design a URL shortener" looks like — they've seen it fifty times. What they don't know yet is how <em>you</em> think. That's what they're grading.</p>
+<p>Here is what shows up on most real interview scorecards, in some form:</p>
+<ul>
+<li><strong>Structured thinking.</strong> Do you attack the problem in a sane order — figure out what you're building before you estimate its size, estimate its size before you design its API, design the API before you draw boxes? Or do you jump straight to "we'll use Kafka and Cassandra" with no idea what the system even needs to do?</li>
+<li><strong>Trade-off articulation.</strong> Every real design decision costs something. Can you say, out loud, what you're giving up and why that's an acceptable price? "I'll cache this" is not a trade-off. "I'll cache this, which means a write can take up to 5 seconds to show up for other readers — that's fine for a comment count, it would not be fine for an account balance" is a trade-off.</li>
+<li><strong>Communication.</strong> Can the interviewer follow your reasoning without stopping to ask "wait, why did you just do that"? Do you narrate your own thought process, or do you make silent decisions and expect them to be read off a whiteboard?</li>
+<li><strong>Depth on request.</strong> When the interviewer pokes at one part of your design — "what happens if that database node dies mid-write?" — can you go three levels deeper on that one spot without your whole design falling apart? This is the single biggest differentiator between candidates who memorized a template and candidates who understand the system they drew.</li>
+<li><strong>EM-level signal.</strong> For senior loops, there's a fifth axis layered on top: do you also reason about cost, rollout risk, and the people and teams involved — not just the boxes and arrows? We come back to this in Section 06.</li>
+</ul>
+<div class="callout"><p>A useful reframe: the interviewer is not asking "can this candidate design Twitter." They are asking "if I put this candidate on a design review for a real system next month, will they ask the right questions, make defensible calls, and communicate clearly enough that the team trusts the decision?" Everything you do in the interview is evidence for that question.</p></div>
+
+<h2><span class="idx">02</span>A Repeatable Framework</h2>
+<p>You need a fixed order of operations you can run on any prompt, so you're never standing at the whiteboard wondering what to do next. Use this sequence every time:</p>
+<ol>
+<li><strong>Requirements</strong> — what must the system do (functional), and what quality bars must it meet (non-functional)? You get this by asking the interviewer, not by guessing.</li>
+<li><strong>Capacity estimate</strong> — turn the requirements into rough numbers: how many requests per second, how much data, how much network traffic. This is what makes every later decision concrete instead of vague.</li>
+<li><strong>API design</strong> — the handful of endpoints or method signatures a client would actually call. Writing these forces you to nail down exactly what data flows in and out, which exposes gaps in your requirements before you've wasted time drawing boxes for the wrong system.</li>
+<li><strong>High-level design</strong> — the boxes-and-arrows diagram: services, data stores, queues, and how a request flows through them end to end.</li>
+<li><strong>Deep dive</strong> — the interviewer (or you, proactively) picks the 1-2 hardest parts and you go deep: exact schema, exact algorithm, exact failure handling.</li>
+<li><strong>Trade-offs</strong> — you step back and name what you gave up, what breaks first at 10x the scale, and what you'd do differently with more time.</li>
+</ol>
+<p>This order matters. If you design the API before you know the requirements, you'll design the wrong API. If you draw the architecture before you've done a capacity estimate, you won't know whether you need one database server or a sharded fleet of twenty — and you'll either over-build a toy problem or under-build a system that falls over under the stated load.</p>
+<div class="callout em-angle"><p>Treat this framework as a checklist you carry into <strong>every</strong> problem in this book's problem bank (Chapters 17-22) — every one of those write-ups follows this exact order under headings you'll recognize.</p></div>
+
+<div class="diagram" data-diagram='{
+  "title": "The six-step HLD interview flow",
+  "nodes": [
+    {"id":"req","x":30,"y":250,"w":150,"h":70,"kind":"compute","label":"1. Requirements","sub":"ask, don&#39;t assume"},
+    {"id":"cap","x":230,"y":250,"w":150,"h":70,"kind":"compute","label":"2. Capacity Estimate","sub":"QPS, storage, bandwidth"},
+    {"id":"api","x":430,"y":250,"w":150,"h":70,"kind":"compute","label":"3. API Design","sub":"endpoints + contracts"},
+    {"id":"hld","x":630,"y":250,"w":150,"h":70,"kind":"compute","label":"4. High-Level Design","sub":"boxes and arrows"},
+    {"id":"deep","x":630,"y":420,"w":150,"h":70,"kind":"compute","label":"5. Deep Dive","sub":"hardest 1-2 parts"},
+    {"id":"trade","x":430,"y":420,"w":150,"h":70,"kind":"compute","label":"6. Trade-offs","sub":"what breaks at 10x"}
+  ],
+  "edges": [
+    {"from":"req","to":"cap","label":"defines scale"},
+    {"from":"cap","to":"api","label":"defines shape"},
+    {"from":"api","to":"hld","label":"defines contracts"},
+    {"from":"hld","to":"deep","label":"pick hardest part"},
+    {"from":"deep","to":"trade","label":"surface the cost"},
+    {"from":"trade","to":"req","label":"revisit if scope changes","dashed":true}
+  ]
+}'></div>
+
+<h2><span class="idx">03</span>Functional vs Non-Functional Requirements — And Why You Ask, Not Assume</h2>
+<p><strong>Functional requirements</strong> are the things the system must actually do — the features. For a URL shortener: "a user can submit a long URL and get a short one back," "visiting the short URL redirects to the original." <strong>Non-functional requirements</strong> are the quality bars the system must meet while doing those things — how fast, how reliable, how consistent, how big. For the same system: "redirects must happen in under 100 milliseconds," "the system must handle 10,000 redirects per second," "a short link must not break for at least 5 years."</p>
+<p>New candidates get this stage badly wrong in a specific way: they <strong>assume</strong> requirements instead of asking for them. They hear "design Instagram" and silently decide it needs to support 2 billion users with sub-second global feed loads, then spend 30 minutes building infrastructure for a scale the interviewer never asked for. That's wasted time, and worse, it's a communication failure — the interviewer is sitting right there, and you didn't talk to them.</p>
+<div class="callout say-this"><p>“Before I design anything, I want to nail down scope. Can you tell me: who are the users, what are the two or three core features you want me to focus on, roughly how many users and how much read/write traffic are we expecting, and are there any hard constraints — like strong consistency, or a specific latency target?”</p></div>
+<p>Asking does three things for you at once: it gets you the real answer instead of a guess, it shows the interviewer you default to clarifying instead of assuming (a real-job habit, not just an interview trick), and it buys you a minute to organize your thoughts before you have to produce anything.</p>
+<p>A good clarifying pass usually covers:</p>
+<ul>
+<li><strong>Core features (functional).</strong> Pick 2-3 to go deep on. Say out loud which features you're deliberately leaving out of scope — "I'll assume we don't need to design the ad system for this" — so the interviewer can correct you if they disagree.</li>
+<li><strong>Scale (non-functional).</strong> Total users, active users, read vs write ratio. You'll turn this into real numbers in the next section.</li>
+<li><strong>Consistency needs (non-functional).</strong> Does a write need to be visible to every reader immediately (strong consistency), or is a short delay acceptable (eventual consistency)? A bank balance needs the former; a "like" count usually doesn't.</li>
+<li><strong>Availability vs consistency priority (non-functional).</strong> If the network partitions, should the system stay up and risk stale data, or refuse requests to stay correct? This is the CAP theorem question in plain language — Chapter 12 covers CAP in full, but you'll be making this call informally from Chapter 1 onward.</li>
+<li><strong>Latency target (non-functional).</strong> "Sub-100ms" and "under 2 seconds is fine" lead to very different designs — the first probably needs a cache and a CDN, the second might not.</li>
+</ul>
+<div class="callout tradeoff"><p>You cannot elicit every possible requirement — there isn't time, and the interviewer often doesn't have a fully worked-out answer for everything either. The trade-off is between thoroughness and momentum: ask enough to anchor the big architectural decisions (consistency, scale, the 2-3 core features), then state your remaining assumptions out loud and move. An interview that's all clarifying questions and no design is its own kind of failure.</p></div>
+
+<h2><span class="idx">04</span>Back-of-Envelope Capacity Math</h2>
+<p>"Back-of-envelope" means rough math you could do on the back of an envelope — no calculator app, no exact figures, just powers of ten and reasonable assumptions, stated out loud. The goal isn't precision. The goal is turning a vague word like "popular app" into a number you can actually design against, like "12,000 reads per second."</p>
+<p>You'll usually estimate four things:</p>
+<ul>
+<li><strong>QPS (queries per second)</strong> — how many requests per second hit your system, split into reads and writes since they usually need different scaling strategies.</li>
+<li><strong>Storage</strong> — how much data accumulates, usually estimated per day and then projected out to a year or five years.</li>
+<li><strong>Bandwidth</strong> — how much data moves over the network per second, which tells you if you need a CDN (a Content Delivery Network — servers geographically close to users that cache and serve static content) or heavy compression.</li>
+<li><strong>Cache sizing</strong> — how much of your "hot" data (the small fraction that gets requested disproportionately often) needs to sit in fast memory versus slower disk-backed storage.</li>
+</ul>
+<p>A number that will save you constant re-deriving: <strong>one day has 86,400 seconds</strong>. Most candidates round this to <strong>~100,000 seconds/day</strong> for easy mental math. Because you divide by this number to get QPS, and 100,000 is bigger than the real 86,400, the rounding actually makes your QPS estimate come out about 14% <em>lower</em> than the true average — not a safety margin, just a small, harmless trade of precision for easier arithmetic. It's harmless because the 2-3x peak-traffic multiplier you apply right after (see the worked examples below) already adds far more headroom than the ~14% this rounding costs you. State the rounding out loud so the interviewer knows you did it on purpose.</p>
+
+<h3>Worked example 1: A URL shortener</h3>
+<p>Let's say the interviewer tells you: 100 million new short URLs created per month, and a 100:1 read-to-write ratio (way more people click short links than create them), and links should be kept for 5 years.</p>
+<p><strong>Write QPS (new URLs created per second):</strong></p>
+<pre><code>100,000,000 URLs/month
+÷ 30 days/month
+= ~3,330,000 URLs/day
+÷ 100,000 seconds/day (rounded)
+= ~33 writes/second average
+</code></pre>
+<p><strong>Read QPS (redirects served per second):</strong></p>
+<pre><code>33 writes/second × 100 (read:write ratio)
+= ~3,300 reads/second average
+</code></pre>
+<p><strong>Peak QPS:</strong> traffic isn't flat across the day — it clusters around peak hours. A common, defensible rule of thumb is to multiply the average by 2-3x for a peak estimate.</p>
+<pre><code>3,300 reads/second (average) × 3 (peak factor)
+= ~10,000 reads/second at peak
+</code></pre>
+<p><strong>Storage for 5 years:</strong> assume each record (short code, long URL, metadata like creation date and owner) is about 500 bytes.</p>
+<pre><code>100,000,000 URLs/month × 12 months/year × 5 years
+= 6,000,000,000 (6 billion) URLs total
+× 500 bytes/URL
+= 3,000,000,000,000 bytes
+= ~3 TB total storage over 5 years
+</code></pre>
+<p>Once you have these numbers, design decisions fall out naturally: 33 writes/second and ~3TB over 5 years is small enough for a single well-indexed relational database with a read replica or two — you do not need sharding yet. 10,000 reads/second at peak is exactly the kind of load a cache handles well, since redirects are a classic read-heavy, rarely-changing workload.</p>
+<div class="callout say-this"><p>“At roughly 10,000 peak reads per second against a small, rarely-changing dataset, this is a textbook cache-aside case — I'd put a Redis or Memcached layer in front of the database and expect a very high cache hit rate, because a small fraction of links get the majority of clicks.”</p></div>
+
+<h3>Worked example 2: A chat application's message storage and bandwidth</h3>
+<p>Say the interviewer tells you: 50 million daily active users (DAU), each sending an average of 40 messages a day, and each message averages 100 bytes of text.</p>
+<p><strong>Write QPS (messages sent per second):</strong></p>
+<pre><code>50,000,000 DAU × 40 messages/user/day
+= 2,000,000,000 messages/day (2 billion)
+÷ 100,000 seconds/day (rounded)
+= ~20,000 messages/second average
+</code></pre>
+<p><strong>Peak QPS</strong> (using the same 3x peak factor):</p>
+<pre><code>20,000 messages/second × 3
+= ~60,000 messages/second at peak
+</code></pre>
+<p><strong>Storage per day:</strong></p>
+<pre><code>2,000,000,000 messages/day × 100 bytes/message
+= 200,000,000,000 bytes/day
+= ~200 GB of raw text per day
+</code></pre>
+<p>Most systems also store metadata per message — sender ID, timestamp, delivery status flags — say another 50 bytes. That's 150 bytes/message, or ~300 GB/day, ~110 TB/year before replication. Replicating 3x for durability (the standard baseline covered in Chapter 6) takes that to ~330 TB/year raw disk.</p>
+<p><strong>Bandwidth (inbound write traffic):</strong></p>
+<pre><code>20,000 messages/second (average) × 150 bytes/message
+= 3,000,000 bytes/second
+= ~3 MB/second average inbound
+</code></pre>
+<p>At peak (60,000 messages/second), that's ~9 MB/second — genuinely small. This tells you something important: for a text chat app, storage growth (hundreds of terabytes a year) is a bigger long-term problem than network bandwidth is. That's a real trade-off insight you get for free from doing the math, and it's exactly the kind of thing that separates a candidate who computed numbers from one who just said them.</p>
+<div class="callout tradeoff"><p>Notice the number that actually drives the hard design decisions here is storage growth, not QPS. 20,000-60,000 messages/second is well within what a partitioned message store (like Cassandra, covered in Chapter 9) handles routinely — the real fight is a data-lifecycle one: do you keep all messages forever, cold-archive old ones to cheaper storage, or delete after a retention window? Say that out loud; it's a trade-off the interviewer wants to hear you notice, not just a number to report.</p></div>
+
+<div class="table-scroll">
+<table class="spec-table">
+<thead><tr><th>Quantity</th><th>Formula shape</th><th>Common gotcha</th></tr></thead>
+<tbody>
+<tr><td>Average QPS</td><td>total events per day ÷ seconds per day</td><td>forgetting to convert "per month" to "per day" first</td></tr>
+<tr><td>Peak QPS</td><td>average QPS × 2-3x</td><td>presenting only the average and never mentioning peak</td></tr>
+<tr><td>Storage over N years</td><td>records/day × bytes/record × 365 × N</td><td>forgetting replication factor (usually 3x) and index overhead</td></tr>
+<tr><td>Bandwidth</td><td>QPS × average payload size in bytes</td><td>mixing up bits and bytes (divide by 8 to go from bits to bytes)</td></tr>
+<tr><td>Cache size</td><td>(hot fraction of daily active data) × (record size)</td><td>trying to cache 100% of data instead of the ~20% that gets ~80% of traffic</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2><span class="idx">05</span>Common Failure Modes</h2>
+<p>These are the specific ways candidates lose points, over and over, independent of which system they were asked to design. If you only remember one section from this chapter, make it this one.</p>
+<ul>
+<li><strong>Jumping straight to the solution.</strong> Hearing "design Netflix" and immediately saying "we'll use a CDN and adaptive bitrate streaming" skips every step that would tell you <em>why</em> those are the right calls. The interviewer can't tell if you understood the problem or just pattern-matched the name to a memorized answer. Always walk through requirements and capacity first, even briefly.</li>
+<li><strong>Giving no numbers.</strong> A design with no capacity estimate is a design that could be for 100 users or 100 million — and those two designs look completely different. "We'll need a database" is not an engineering decision; "we'll need roughly 3TB over 5 years, which fits comfortably on a single instance with room to grow" is.</li>
+<li><strong>Going silent.</strong> Thinking hard with your mouth shut for 90 seconds feels productive to you and looks like a stall to the interviewer, who has no way to tell "carefully weighing two options" apart from "stuck." Narrate: "I'm weighing SQL versus a document store here — let me think through the access patterns out loud."</li>
+<li><strong>Waiting to be prompted instead of driving.</strong> A weak candidate answers only the exact question asked and waits for the next one. A strong candidate treats the interview like they're running the whiteboard session themselves: "Now that I've got the high-level design, I want to go deeper on how we handle a cache miss storm — is that a good use of our remaining time, or would you rather I dig into something else?" You're still checking in, but you're the one proposing what happens next.</li>
+<li><strong>Boiling the ocean.</strong> The opposite failure: trying to design every feature and every edge case with equal depth, running out of time before going deep on anything. Pick 2-3 features to focus on, say so out loud, and defend that choice if asked.</li>
+<li><strong>Silent assumptions.</strong> Deciding "I'll assume eventual consistency is fine" in your head and never saying it removes the interviewer's ability to redirect you if they disagree — and it also removes your credit for having made a deliberate consistency trade-off at all.</li>
+</ul>
+<div class="callout say-this"><p>“I want to flag that I'm making an assumption here: I'm treating this as read-heavy with tolerable staleness, so I'm going to design for eventual consistency. Let me know if that's wrong.”</p></div>
+
+<h2><span class="idx">06</span>EM-Level Signal vs IC-Level Signal</h2>
+<p>An IC (individual contributor) answer and an EM (engineering manager) answer can describe the exact same architecture and still score very differently, because the EM bar rewards a second layer of thinking on top of the technical design: how would this actually get built, shipped, and paid for, by a team of real people, inside a real organization? Four dimensions show up over and over in EM-level loops:</p>
+<div class="table-scroll">
+<table class="spec-table">
+<thead><tr><th>Dimension</th><th>IC-level answer</th><th>EM-level answer</th></tr></thead>
+<tbody>
+<tr><td>Prioritization under time pressure</td><td>Tries to design every component with equal depth, runs out of time before finishing anything.</td><td>States a priority order in the first two minutes — "I'll spend most of our time on the write path since that's where the hard trade-off lives" — and adjusts live if the interviewer redirects.</td></tr>
+<tr><td>Cost / build-vs-buy framing</td><td>Assumes you'll self-host every piece of infrastructure named in the design.</td><td>Asks whether a managed service is acceptable and reasons about it explicitly: "Running our own Kafka cluster costs us ongoing on-call and operational load — for the first year at this traffic, a managed queue like SQS is probably cheaper in total cost of ownership, even if it's a bit more expensive per-message."</td></tr>
+<tr><td>Rollout and migration thinking</td><td>Describes only the end-state architecture, as if it will appear fully formed.</td><td>Describes how you'd get there without an outage: dual-write during migration, a feature flag to cut over traffic gradually, a rollback plan if the new path misbehaves.</td></tr>
+<tr><td>Cross-team / org impact</td><td>Treats the system as if one engineer will build and own all of it forever.</td><td>Names who else is affected — "this new event stream means the analytics team's consumers need to handle at-least-once delivery, so I'd loop them in before we finalize the schema" — and flags the on-call and ownership implications of each new moving part.</td></tr>
+</tbody>
+</table>
+</div>
+<div class="callout em-angle"><p>A cheap way to inject EM-level signal into almost any answer, even late: after finishing the technical design, add one sentence like "if I were rolling this out for real, I'd ship it behind a flag to 1% of traffic first, watch error rates, then ramp — and I'd want the on-call team looped in before the ramp, since this changes what a 3am page looks like." That single sentence signals a level of thinking most candidates never volunteer.</p></div>
+<p>You don't need to force all four dimensions into every answer — that would eat your limited time and read as checklist theater rather than genuine judgment. Pick the one or two that are most relevant to the specific system you're designing, and go deep on those instead of touching all four shallowly.</p>
+
+<h2><span class="idx">07</span>Quick Reference</h2>
+<div class="specsheet">
+<details>
+<summary><span class="cat">Framework</span> The six-step interview flow</summary>
+<div class="specbody">
+<ul>
+<li><strong>1. Requirements</strong> — ask, don't assume; functional (features) + non-functional (quality bars).</li>
+<li><strong>2. Capacity estimate</strong> — QPS (avg + peak), storage, bandwidth, cache sizing.</li>
+<li><strong>3. API design</strong> — the concrete endpoints/contracts a client would call.</li>
+<li><strong>4. High-level design</strong> — the boxes-and-arrows diagram, end-to-end request flow.</li>
+<li><strong>5. Deep dive</strong> — 1-2 hardest parts, go three levels deep.</li>
+<li><strong>6. Trade-offs</strong> — what you gave up, what breaks first at 10x scale.</li>
+</ul>
+</div>
+</details>
+<details>
+<summary><span class="cat">Numbers</span> Constants worth memorizing</summary>
+<div class="specbody">
+<ul>
+<li>Seconds per day: 86,400 — round to <strong>~100,000</strong> for fast mental math (state the rounding out loud).</li>
+<li>Peak traffic multiplier: <strong>2-3x</strong> average, as a starting assumption.</li>
+<li>Replication factor: commonly <strong>3x</strong> for durability — always factor this into storage totals.</li>
+<li>Hot-data rule of thumb (Pareto-style): a small slice of records (often cited as ~20%) drives the large majority of read traffic — this is what makes caching effective.</li>
+</ul>
+</div>
+</details>
+<details>
+<summary><span class="cat">Failure modes</span> What loses points fastest</summary>
+<div class="specbody">
+<ul>
+<li>Jumping to the solution before establishing requirements.</li>
+<li>Giving zero numbers, or numbers with no shown arithmetic.</li>
+<li>Going silent instead of narrating your thinking.</li>
+<li>Waiting to be prompted instead of proposing what to tackle next.</li>
+<li>Trying to design everything with equal depth (boiling the ocean).</li>
+<li>Making assumptions silently instead of stating them out loud.</li>
+</ul>
+</div>
+</details>
+<details>
+<summary><span class="cat">EM signal</span> The four EM-level dimensions</summary>
+<div class="specbody">
+<ul>
+<li><strong>Prioritization</strong> — state a priority order early, adjust live under redirection.</li>
+<li><strong>Build vs buy</strong> — weigh managed services against self-hosting on cost and operational load, not just technical fit.</li>
+<li><strong>Rollout</strong> — describe the migration path, not just the end state: flags, gradual cutover, rollback plan.</li>
+<li><strong>Cross-team impact</strong> — name who else is affected and what changes for on-call/ownership.</li>
+</ul>
+</div>
+</details>
+</div>
+
+<div class="flashcards" data-cards='[
+{"q":"What are the five things a typical HLD interview scorecard grades, according to this chapter?","a":"Structured thinking, trade-off articulation, communication, depth on request, and (for senior loops) EM-level signal."},
+{"q":"What is the six-step repeatable framework for any HLD problem, in order?","a":"Requirements, capacity estimate, API design, high-level design, deep dive, trade-offs."},
+{"q":"What is the difference between functional and non-functional requirements?","a":"Functional requirements are what the system must do (the features); non-functional requirements are the quality bars it must meet while doing them (latency, scale, consistency, availability)."},
+{"q":"Why should you ask the interviewer for requirements instead of assuming them?","a":"Assuming risks designing for the wrong scope and wastes time; asking gets the real answer, shows a good clarifying habit, and buys you a moment to organize your thinking. It also lets the interviewer correct you if your assumption is wrong."},
+{"q":"What rounding of seconds-per-day is commonly used for back-of-envelope math, and why is it acceptable?","a":"86,400 seconds/day is rounded to ~100,000 for easier mental math — a roughly 15% overestimate that is fine to use as long as you state the rounding out loud."},
+{"q":"What peak-traffic multiplier is a reasonable default when converting average QPS to peak QPS?","a":"2-3x the average, as a starting assumption you state explicitly — real traffic clusters around peak hours instead of staying flat."},
+{"q":"In the URL shortener worked example, given 100M new URLs/month and a 100:1 read:write ratio, what is the approximate average write QPS and average read QPS?","a":"~33 writes/second average (100M ÷ 30 days ÷ 100,000 sec/day), and ~3,300 reads/second average (33 × 100)."},
+{"q":"In the chat app worked example, why does storage growth matter more than bandwidth for a text-messaging system at 50M DAU?","a":"Because message bandwidth stays small (single-digit MB/second even at peak) while storage accumulates to hundreds of terabytes per year once metadata and replication are included — the real design fight is data lifecycle and retention, not network capacity."},
+{"q":"Name three common failure modes that lose points in HLD interviews, independent of which system is being designed.","a":"Any three of: jumping straight to the solution, giving no numbers, going silent instead of narrating, waiting to be prompted instead of driving, boiling the ocean (equal depth everywhere), making silent assumptions."},
+{"q":"What is the practical difference between an IC-level and an EM-level answer on the &#39;build vs buy&#39; dimension?","a":"IC-level assumes self-hosting infrastructure by default; EM-level explicitly weighs a managed service against self-hosting on cost and ongoing operational/on-call load, not just technical fit."},
+{"q":"What does &#39;rollout and migration thinking&#39; add to a design that a purely technical answer usually omits?","a":"How you&#39;d get from the current state to the new architecture without an outage — e.g. dual-writing during migration, a feature flag for gradual cutover, and a rollback plan if the new path misbehaves."},
+{"q":"Why is &#39;depth on request&#39; considered such a strong differentiator between candidates?","a":"Because it reveals whether a candidate actually understands the system they drew or just memorized a template — when the interviewer probes one spot three levels deeper, a template answer collapses while genuine understanding holds up."},
+{"q":"What four things does a back-of-envelope capacity estimate typically cover?","a":"QPS (queries per second, split into reads and writes), storage (usually per day, projected out over time), bandwidth (data moved per second over the network), and cache sizing (how much hot data needs to fit in fast memory)."},
+{"q":"What is a reasonable default replication factor to fold into a storage estimate, and why does it matter?","a":"Commonly 3x, for durability — forgetting to multiply raw data by the replication factor is a common gotcha that understates real storage needs."}
+]'></div>

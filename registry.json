@@ -1,0 +1,258 @@
+{
+  "series_title": "HLD Interview-Prep Bible",
+  "chapters": [
+    {
+      "num": 0,
+      "part": "Index",
+      "title": "Hub",
+      "description": "Links every chapter with a one-line description and a locally-persisted progress checklist.",
+      "kind": "hub",
+      "favicon": "\ud83d\udcda",
+      "fragment": "fragments/ch00-hub.html",
+      "status": "published",
+      "url": "https://claude.ai/code/artifact/8d5e171d-6a60-440e-8030-e06b2bf49612"
+    },
+    {
+      "num": 1,
+      "part": "Part I \u2014 Foundations & Interview Craft",
+      "title": "How the HLD Interview Actually Works",
+      "description": "What's actually being scored; a repeatable framework (requirements \u2192 capacity estimate \u2192 API \u2192 high-level design \u2192 deep dive \u2192 trade-offs); functional vs non-functional requirements; back-of-envelope capacity math with 2+ worked examples; common failure modes; what reads as EM-level vs IC-level.",
+      "kind": "concept",
+      "favicon": "\ud83d\udcd0",
+      "fragment": "fragments/ch01.html",
+      "status": "published",
+      "url": "https://claude.ai/code/artifact/b8ded0b5-06e9-4cab-a440-2a260fd4fc28"
+    },
+    {
+      "num": 2,
+      "part": "Part I \u2014 Foundations & Interview Craft",
+      "title": "Scale From Zero to Millions of Users",
+      "description": "The 10-revision build-up from a single server to a sharded, multi-region, event-driven system. Light-theme rebuild of the reference chapter.",
+      "kind": "concept",
+      "favicon": "\ud83d\udcd0",
+      "fragment": "fragments/ch02.html",
+      "status": "published",
+      "url": "https://claude.ai/code/artifact/6ca938e6-5f67-4e21-906c-40bca1111db6"
+    },
+    {
+      "num": 3,
+      "part": "Part I \u2014 Foundations & Interview Craft",
+      "title": "Networking & Communication Building Blocks",
+      "description": "DNS; HTTP/HTTPS; REST vs GraphQL vs gRPC vs WebSockets vs SSE vs long-polling with a decision table; L4 vs L7 load balancers; reverse proxy vs API gateway; CDN.",
+      "kind": "concept",
+      "favicon": "\ud83d\udcd0",
+      "fragment": "fragments/ch03.html",
+      "status": "published",
+      "url": "https://claude.ai/code/artifact/48f6aef9-59ee-4114-b0c3-66fdf57b2bf8"
+    },
+    {
+      "num": 4,
+      "part": "Part II \u2014 Core Scalability Building Blocks",
+      "title": "Caching Deep Dive",
+      "description": "Cache-aside, read-through, write-through, write-back, write-around; eviction (LRU/LFU/FIFO); thundering herd and mitigations; Redis vs Memcached; real examples.",
+      "kind": "concept",
+      "favicon": "\ud83d\udcd0",
+      "fragment": "fragments/ch04.html",
+      "status": "published",
+      "url": "https://claude.ai/code/artifact/808bea1f-4d73-4104-9be3-d9ce1788b4d7"
+    },
+    {
+      "num": 5,
+      "part": "Part II \u2014 Core Scalability Building Blocks",
+      "title": "Load Balancing, Rate Limiting & Consistent Hashing",
+      "description": "LB algorithms; rate limiting algorithms (token/leaky bucket, fixed/sliding window) with a real API example; consistent hashing with virtual nodes.",
+      "kind": "concept",
+      "favicon": "\ud83d\udcd0",
+      "fragment": "fragments/ch05.html",
+      "status": "published",
+      "url": "https://claude.ai/code/artifact/a1792437-f26b-4f1f-b902-86df3721f53d"
+    },
+    {
+      "num": 6,
+      "part": "Part II \u2014 Core Scalability Building Blocks",
+      "title": "Partitioning, Sharding & Replication",
+      "description": "Range/hash/directory sharding; replication topologies. MySQL (Vitess) and MongoDB shown side by side with a comparison table.",
+      "kind": "concept",
+      "favicon": "\ud83d\udcd0",
+      "fragment": "fragments/ch06.html",
+      "status": "published",
+      "url": "https://claude.ai/code/artifact/e0db6da0-2b7d-40c3-8781-a134bca26f86"
+    },
+    {
+      "num": 7,
+      "part": "Part III \u2014 Databases Deep Dive",
+      "title": "Relational Databases Deep Dive (MySQL)",
+      "description": "Indexing (B-tree vs hash); ACID; isolation levels and the anomalies each prevents; MVCC; locking; normalization vs denormalization; replication and failover.",
+      "kind": "concept",
+      "favicon": "\ud83d\udcd0",
+      "fragment": "fragments/ch07.html",
+      "status": "published",
+      "url": "https://claude.ai/code/artifact/86794229-8a69-49c5-bf55-0eab2ebacb43"
+    },
+    {
+      "num": 8,
+      "part": "Part III \u2014 Databases Deep Dive",
+      "title": "Document & Key-Value NoSQL Deep Dive",
+      "description": "MongoDB schema design (embed vs reference), aggregation pipeline, indexing; Redis data structures beyond caching; DynamoDB partition keys, quorum reads/writes, GSIs.",
+      "kind": "concept",
+      "favicon": "\ud83d\udcd0",
+      "fragment": "fragments/ch08.html",
+      "status": "published",
+      "url": "https://claude.ai/code/artifact/08879a9e-b3e8-42cf-98a9-f5624dd92340"
+    },
+    {
+      "num": 9,
+      "part": "Part III \u2014 Databases Deep Dive",
+      "title": "Wide-Column & Graph NoSQL",
+      "description": "Cassandra ring architecture, gossip, LSM-tree + compaction, tunable consistency (R+W>N); brief HBase; Neo4j graph modeling with a concrete query example.",
+      "kind": "concept",
+      "favicon": "\ud83d\udcd0",
+      "fragment": "fragments/ch09.html",
+      "status": "published",
+      "url": "https://claude.ai/code/artifact/46b2406c-14ce-4cf7-82bd-9965d12324c3"
+    },
+    {
+      "num": 10,
+      "part": "Part III \u2014 Databases Deep Dive",
+      "title": "Data Lakes, Data Warehouses & Lakehouses",
+      "description": "OLTP vs OLAP; lake vs warehouse vs lakehouse; file formats (Parquet/ORC/Avro) and table formats (Delta/Iceberg/Hudi); ETL vs ELT; one full worked pipeline end to end.",
+      "kind": "concept",
+      "favicon": "\ud83d\udcd0",
+      "fragment": "fragments/ch10.html",
+      "status": "published",
+      "url": "https://claude.ai/code/artifact/d07529ba-cdfa-4c06-8589-abc608a92721"
+    },
+    {
+      "num": 11,
+      "part": "Part III \u2014 Databases Deep Dive",
+      "title": "Search, Time-Series & NewSQL",
+      "description": "Elasticsearch inverted index vs a DB index; time-series DBs; NewSQL (Spanner/CockroachDB/Vitess/TiDB); closes with a polyglot-persistence example (Uber).",
+      "kind": "concept",
+      "favicon": "\ud83d\udcd0",
+      "fragment": "fragments/ch11.html",
+      "status": "published",
+      "url": "https://claude.ai/code/artifact/564ba780-336a-437e-8b6f-8411f8069c20"
+    },
+    {
+      "num": 12,
+      "part": "Part IV \u2014 Distributed Systems Theory",
+      "title": "CAP Theorem, Consistency & Consensus",
+      "description": "CAP with concrete per-system picks; PACELC; consistency models with real examples; Paxos and Raft explained simply but correctly.",
+      "kind": "concept",
+      "favicon": "\ud83d\udcd0",
+      "fragment": "fragments/ch12.html",
+      "status": "published",
+      "url": "https://claude.ai/code/artifact/e66f7076-c39a-4ad1-a128-e68197b599b5"
+    },
+    {
+      "num": 13,
+      "part": "Part IV \u2014 Distributed Systems Theory",
+      "title": "Distributed Transactions & Coordination",
+      "description": "2PC/3PC; Saga (choreography vs orchestration) with a worked checkout example; idempotency; vector clocks/Lamport timestamps; distributed locks and split-brain; quorum; gossip; heartbeats.",
+      "kind": "concept",
+      "favicon": "\ud83d\udcd0",
+      "fragment": "fragments/ch13.html",
+      "status": "published",
+      "url": "https://claude.ai/code/artifact/350dd995-db28-4e62-84ec-4b911e98d2f7"
+    },
+    {
+      "num": 14,
+      "part": "Part V \u2014 Messaging, Microservices & Cross-Cutting Concerns",
+      "title": "Messaging & Event-Driven Architecture",
+      "description": "Queues vs pub-sub; Kafka deep dive (partitions, consumer groups, ISR, exactly-once); SQS/RabbitMQ comparison; event sourcing & CQRS; outbox pattern; backpressure.",
+      "kind": "concept",
+      "favicon": "\ud83d\udcd0",
+      "fragment": "fragments/ch14.html",
+      "status": "published",
+      "url": "https://claude.ai/code/artifact/a741cb59-dcb6-4071-b25a-19c3638acd36"
+    },
+    {
+      "num": 15,
+      "part": "Part V \u2014 Messaging, Microservices & Cross-Cutting Concerns",
+      "title": "Microservices & Resiliency Patterns",
+      "description": "Monolith vs microservices vs modular monolith decision framework; service discovery; API gateway; circuit breaker/retry/timeout/bulkhead; strangler fig; BFF; sidecar; service mesh.",
+      "kind": "concept",
+      "favicon": "\ud83d\udcd0",
+      "fragment": "fragments/ch15.html",
+      "status": "published",
+      "url": "https://claude.ai/code/artifact/ddac148d-c3dc-40ef-9d06-da5859dc5e80"
+    },
+    {
+      "num": 16,
+      "part": "Part V \u2014 Messaging, Microservices & Cross-Cutting Concerns",
+      "title": "Security, Observability & Reusable Building Blocks",
+      "description": "AuthN vs authZ; OAuth2/OIDC; JWT vs sessions; encryption; API security. Logs/metrics/traces and SLI/SLO/SLA. Reusable primitives: ID generation, geohashing, typeahead, distributed rate limiter and lock.",
+      "kind": "concept",
+      "favicon": "\ud83d\udcd0",
+      "fragment": "fragments/ch16.html",
+      "status": "published",
+      "url": "https://claude.ai/code/artifact/ad5d9eb1-f743-47ad-806c-58d30e201b64"
+    },
+    {
+      "num": 17,
+      "part": "Part VI \u2014 The Problem Bank",
+      "title": "Problem Bank: Social & Content",
+      "description": "Twitter/X, Instagram, TikTok-style feed, Reddit, YouTube/Netflix-style streaming, live comments/voting \u2014 full 11-part write-ups.",
+      "kind": "problem-bank",
+      "favicon": "\ud83e\udde9",
+      "fragment": "fragments/ch17.html",
+      "status": "published",
+      "url": "https://claude.ai/code/artifact/12abd437-fd42-47cb-a607-e6a015ae8a7d"
+    },
+    {
+      "num": 18,
+      "part": "Part VI \u2014 The Problem Bank",
+      "title": "Problem Bank: Messaging & Real-Time",
+      "description": "WhatsApp/Messenger, Slack/Discord, notification system, Google-Docs-style collaborative editing, live auction/bidding \u2014 full 11-part write-ups.",
+      "kind": "problem-bank",
+      "favicon": "\ud83e\udde9",
+      "fragment": "fragments/ch18.html",
+      "status": "published",
+      "url": "https://claude.ai/code/artifact/7dc0177e-9484-4432-ae55-6fbe54a818b0"
+    },
+    {
+      "num": 19,
+      "part": "Part VI \u2014 The Problem Bank",
+      "title": "Problem Bank: Marketplace & Location",
+      "description": "Uber/Lyft, food delivery, Maps-style ETA/routing, Yelp-style nearby search, hotel/Airbnb booking, ticket booking with seat-level concurrency \u2014 full 11-part write-ups.",
+      "kind": "problem-bank",
+      "favicon": "\ud83e\udde9",
+      "fragment": "fragments/ch19.html",
+      "status": "published",
+      "url": "https://claude.ai/code/artifact/a7d3029f-6df5-4b5d-b887-9f417298a9b9"
+    },
+    {
+      "num": 20,
+      "part": "Part VI \u2014 The Problem Bank",
+      "title": "Problem Bank: Infra Building Blocks as Interview Questions",
+      "description": "URL shortener, Pastebin, rate limiter, distributed cache, web crawler, job scheduler, message queue, key-value store, unique ID generator, distributed lock service, leaderboard, ad-click aggregation, log aggregation \u2014 full 11-part write-ups.",
+      "kind": "problem-bank",
+      "favicon": "\ud83e\udde9",
+      "fragment": "fragments/ch20.html",
+      "status": "published",
+      "url": "https://claude.ai/code/artifact/9f19bc8b-fa7b-4499-8b96-d689475dbda9"
+    },
+    {
+      "num": 21,
+      "part": "Part VI \u2014 The Problem Bank",
+      "title": "Problem Bank: Payments, Search & EM-Scale Systems",
+      "description": "Payment gateway, Splitwise, digital wallet, e-commerce checkout/inventory, ad exchange/RTB, search engine, recommendation system, news aggregator, plus EM-scale org problems (multi-region platform, feature flags, CI/CD, monolith\u2192microservices migration, multi-tenant SaaS, internal dev platform, global config) \u2014 full 11-part write-ups.",
+      "kind": "problem-bank",
+      "favicon": "\ud83e\udde9",
+      "fragment": "fragments/ch21.html",
+      "status": "published",
+      "url": "https://claude.ai/code/artifact/0ec9dfd8-6e9c-42c5-86aa-f0cdf88d2bec"
+    },
+    {
+      "num": 22,
+      "part": "Part VI \u2014 The Problem Bank",
+      "title": "Rapid-Fire Problem Index",
+      "description": "150+ additional named problems mapped to pattern family + one-line approach, for fast pattern-matching without full write-ups.",
+      "kind": "problem-bank",
+      "favicon": "\ud83e\udde9",
+      "fragment": "fragments/ch22.html",
+      "status": "published",
+      "url": "https://claude.ai/code/artifact/0713f3aa-7b9b-4ab6-97f1-9a3b0bdda159"
+    }
+  ]
+}

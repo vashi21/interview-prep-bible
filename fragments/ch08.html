@@ -1,0 +1,282 @@
+<p class="lede">MongoDB and Redis look nothing alike, but interviewers probe both the same way: what shape does your data take, how do you query it fast, and what breaks first at scale. This chapter goes past "MongoDB stores JSON" and "Redis is a cache" into the parts that actually come up in an interview — schema design trade-offs, the aggregation pipeline, Redis as a real data-structure server, and how DynamoDB's partition keys and consistency choices work.</p>
+
+<h2><span class="idx">01</span>BSON: What MongoDB Actually Stores</h2>
+<p>MongoDB documents look like JSON when you print them, but on disk and on the wire MongoDB stores and sends something called <strong>BSON</strong> — short for Binary JSON. BSON is a binary-encoded format: instead of human-readable text, every value is stored as a typed, length-prefixed sequence of bytes.</p>
+<p>Two things separate BSON from plain JSON:</p>
+<ul>
+  <li><strong>Richer types.</strong> JSON only really has a handful of types: string, a single generic "number," boolean, null, array, and object. That generic number type is a real limitation — JSON can't tell you whether <code>4</code> is meant to be an integer or a float. BSON fixes this by adding distinct types: <code>Int32</code>, <code>Int64</code>, <code>Double</code>, and <code>Decimal128</code> (for exact decimal math, useful for money) are all separate types, plus a native <code>Date</code> type (stored as milliseconds since the Unix epoch), a <code>Binary</code> type for raw byte data like images, and MongoDB's own <code>ObjectId</code> type.</li>
+  <li><strong>Faster to traverse.</strong> Every string and every embedded document in BSON is stored with its byte length written up front. That lets MongoDB's storage engine skip straight past a field it doesn't need instead of scanning character by character the way parsing text JSON requires. This is BSON's real reason for existing: it isn't reliably smaller than compact JSON — the extra type information can make it bigger — the trade is speed and richer typing, not raw size.</li>
+</ul>
+<p>Every document has an <code>_id</code> field, and if you don't supply one, MongoDB generates an <strong>ObjectId</strong>: a 12-byte value made of a 4-byte timestamp (when it was created), a 5-byte random value unique to the process that created it, and a 3-byte counter that starts at a random number and increments with each new id. That's why ObjectIds sort roughly by creation time even though nothing forces them to — the leading timestamp bytes dominate the sort order.</p>
+<div class="callout"><p>One BSON fact worth keeping in your head through the next section: a single MongoDB document is capped at <strong>16 MB</strong>. That number is the hard ceiling behind every "should I embed this or reference it?" decision that follows.</p></div>
+
+<h2><span class="idx">02</span>Schema Design: Embed vs Reference</h2>
+<p>Relational schema design asks "what tables do I need, and how do I join them?" MongoDB schema design asks a different question: for any two related pieces of data, do I nest one inside the other in a single document (<strong>embedding</strong>), or do I store them as separate documents linked by an id (<strong>referencing</strong>, MongoDB's version of a foreign key)? There's no universal right answer — it depends on how the data is shaped and how it's read.</p>
+
+<h3>Embedding: a blog post with its comments</h3>
+<p>Embedding means nesting the related data directly inside the parent document, usually as a sub-document or an array of sub-documents.</p>
+<pre><code>{
+  _id: ObjectId("64f1a2..."),
+  title: "Why We Switched To MongoDB",
+  author: "priya",
+  body: "...",
+  publishedAt: ISODate("2026-01-04T09:00:00Z"),
+  comments: [
+    { user: "arjun", text: "Great post!", postedAt: ISODate("2026-01-04T10:03:00Z") },
+    { user: "meera", text: "Agreed on the schema part.", postedAt: ISODate("2026-01-04T11:15:00Z") }
+  ]
+}</code></pre>
+<p>One query — fetch the post by <code>_id</code> — returns the post and every comment needed to render the page. No join, no second round trip. This is a good fit for three concrete reasons:</p>
+<ul>
+  <li>Comments belong to exactly <strong>one</strong> post — this is a one-to-many relationship, not many-to-many.</li>
+  <li>Comments and their post are almost always <strong>read together</strong> — nobody loads a comment without the post it's attached to.</li>
+  <li>Growth is <strong>bounded</strong>. A post might collect a few thousand comments over its life, which stays comfortably under the 16 MB document limit from section 01.</li>
+</ul>
+<p>If a post goes viral and its comment count starts threatening that limit, the common real-world fix is a hybrid: embed only the most recent N comments (say, 200) for fast rendering, and move older comments into their own collection referencing the post's id — embed the hot slice, reference the long tail.</p>
+
+<h3>Referencing: a social graph with followers</h3>
+<p>Referencing means storing an id that points at a document in another collection, instead of nesting the data.</p>
+<pre><code>// users collection
+{ _id: ObjectId("u1"), username: "arjun", bio: "..." }
+{ _id: ObjectId("u2"), username: "priya", bio: "..." }
+
+// follows collection
+{ _id: ObjectId("f1"), follower: ObjectId("u1"), following: ObjectId("u2"), createdAt: ISODate("2026-02-11T08:00:00Z") }</code></pre>
+<p>A "who follows whom" graph is the opposite shape from a blog post, on every count that mattered above:</p>
+<ul>
+  <li>It's <strong>many-to-many</strong> — arjun follows many people, and is followed by many people.</li>
+  <li>Growth is <strong>unbounded</strong> — a popular account can pick up tens of millions of followers. Embedding that as an array inside the user document would eventually blow past the 16 MB limit, and every new follow would mean writing into an already-huge array instead of a small, independent insert.</li>
+  <li>Both sides need <strong>independent queries</strong> that have nothing to do with a specific parent: "who does arjun follow," "who follows priya," "is arjun already following priya." Each of these is just a filtered, indexed query against the <code>follows</code> collection — you never need to load one giant array just to check membership.</li>
+</ul>
+<p>The cost of referencing: getting the full picture back — a user and their recent followers, say — now takes a second query against another collection, or a <code>$lookup</code> aggregation stage (covered next section), MongoDB's version of a join. And a write to <code>users</code> and a write to <code>follows</code> aren't automatically one atomic operation — you'd need MongoDB's multi-document transactions (available since version 4.0) if you needed both to succeed or fail together, and those cost throughput compared to a plain single-document write.</p>
+
+<div class="table-scroll">
+  <table class="spec-table compare">
+    <caption>Embed vs reference, side by side</caption>
+    <thead><tr><th>Concept</th><th>Embed</th><th>Reference</th></tr></thead>
+    <tbody>
+      <tr><td>Best fit</td><td>One-to-few / one-to-many, read together, bounded growth</td><td>Many-to-many, independent queries, unbounded growth</td></tr>
+      <tr><td>Read cost</td><td>One query returns everything</td><td>A second query, or a <code>$lookup</code> join stage</td></tr>
+      <tr><td>Write atomicity</td><td>Atomic — it's all one document</td><td>Not atomic across documents without a multi-document transaction</td></tr>
+      <tr><td>Growth ceiling</td><td>The 16 MB document limit</td><td>No built-in ceiling — one document per relation</td></tr>
+      <tr><td>Worked example</td><td>Blog post + its comments</td><td>Social graph follows</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<div class="callout say-this"><p>"I'd embed comments in the post because they're always read with it and the count stays bounded — but I'd reference followers in a separate collection, because that relationship is many-to-many and effectively unbounded on the popular-account side. The rule I use: embed when it's read together and bounded, reference when it's many-to-many, unbounded, or needs to be queried on its own."</p></div>
+
+<h2><span class="idx">03</span>The Aggregation Pipeline</h2>
+<p>MongoDB's <strong>aggregation pipeline</strong> is its framework for turning raw documents into computed answers — filtering, grouping, reshaping, and joining — by pushing a collection through a sequence of <strong>stages</strong>, where each stage's output becomes the next stage's input. It's the same idea as piping commands together in a Unix shell, applied to documents instead of text, and it's MongoDB's answer to what a SQL query with <code>WHERE</code>, <code>GROUP BY</code>, and <code>JOIN</code> does in one relational statement.</p>
+<p>A realistic example: given an <code>orders</code> collection, find the top 10 customers by total completed spend.</p>
+<pre><code>db.orders.aggregate([
+  { $match: { status: "completed" } },
+  { $group: {
+      _id: "$customerId",
+      totalSpent: { $sum: "$amount" },
+      orderCount: { $sum: 1 }
+  }},
+  { $sort: { totalSpent: -1 } },
+  { $limit: 10 }
+])</code></pre>
+<p>Reading it stage by stage:</p>
+<ul>
+  <li><strong><code>$match</code></strong> — a filter, like SQL's <code>WHERE</code>. Keep only orders with <code>status: "completed"</code>, and drop everything else before doing any heavier work.</li>
+  <li><strong><code>$group</code></strong> — bucket the remaining documents by <code>customerId</code>, like SQL's <code>GROUP BY</code>. For every bucket, <code>$sum: "$amount"</code> adds up that customer's order amounts into <code>totalSpent</code>, and <code>$sum: 1</code> counts how many orders landed in the bucket.</li>
+  <li><strong><code>$sort</code></strong> — order the one-document-per-customer result by <code>totalSpent</code> descending.</li>
+  <li><strong><code>$limit</code></strong> — keep only the top 10.</li>
+</ul>
+<div class="diagram" data-diagram='{
+  "title": "Aggregation pipeline: top 10 customers by total spend",
+  "nodes": [
+    {"id":"orders","x":20,"y":260,"w":170,"h":70,"kind":"storage","label":"orders collection","sub":"raw documents"},
+    {"id":"match","x":210,"y":260,"w":170,"h":70,"kind":"compute","label":"$match","sub":"status: completed"},
+    {"id":"group","x":400,"y":260,"w":170,"h":70,"kind":"compute","label":"$group","sub":"by customerId, $sum amount"},
+    {"id":"sort","x":590,"y":260,"w":170,"h":70,"kind":"compute","label":"$sort","sub":"totalSpent desc"},
+    {"id":"limit","x":780,"y":260,"w":170,"h":70,"kind":"compute","label":"$limit","sub":"top 10"}
+  ],
+  "edges": [
+    {"from":"orders","to":"match","label":"every order"},
+    {"from":"match","to":"group","label":"completed only"},
+    {"from":"group","to":"sort","label":"one doc per customer"},
+    {"from":"sort","to":"limit","label":"ranked by spend"}
+  ]
+}'></div>
+<p>Putting <code>$match</code> first isn't just tidy — it's a performance decision. It shrinks the set of documents before the more expensive grouping and sorting stages ever see them, and if <code>status</code> is indexed, an early <code>$match</code> can use that index exactly the way a <code>WHERE</code> clause would in a relational query. Pushing filters as early as possible in the pipeline is one of the few aggregation habits worth memorizing.</p>
+<p>The other stage worth knowing by name is <strong><code>$lookup</code></strong>, which performs a left outer join against another collection — <code>{ $lookup: { from: "customers", localField: "customerId", foreignField: "_id", as: "customerInfo" } }</code> would pull each customer's profile into the result above. This is exactly how a referenced design (section 02) reassembles data that a relational database would have joined at the database layer for free.</p>
+<div class="callout tradeoff"><p><code>$lookup</code> gives you a join, but it isn't a free one. A relational database has spent decades on join planning — picking join order, using indexes on both sides, choosing between hash and merge join strategies. MongoDB's <code>$lookup</code> is more of a per-document loop under the hood; it works, and it's fine at moderate scale with a good index on the foreign field, but it's rarely as fast as the equivalent join in a mature relational engine. A schema leaning on frequent, multi-collection <code>$lookup</code> stages is a signal you might actually want the relational model — see section 05.</p></div>
+
+<h2><span class="idx">04</span>Indexing In MongoDB</h2>
+<p>MongoDB indexes work on the same underlying idea as a relational index — a sorted structure (a B-tree, the same data structure introduced for MySQL indexing in Ch.7) that lets the query planner jump straight to matching documents instead of scanning the whole collection. Every collection gets a unique index on <code>_id</code> automatically; everything past that is a design choice.</p>
+<ul>
+  <li><strong>Single-field index</strong> — index one field, exactly like an index on one column in SQL.</li>
+  <li><strong>Compound index</strong> — index several fields together. Field order matters, the same left-prefix rule from relational compound indexes applies: a query can use the index if it filters on a leading prefix of the indexed fields. MongoDB's own guidance for ordering a compound index is the <strong>ESR rule</strong> — put <strong>E</strong>quality fields first, then <strong>S</strong>ort fields, then <strong>R</strong>ange fields.</li>
+  <li><strong>Multikey index</strong> — automatically created when you index a field whose value is an array. MongoDB creates one index entry per array element, so a query can match a document by any one of its array's values.</li>
+  <li><strong>Text index</strong> — supports basic text search across string fields (word-level matching, not a full search-engine relevance ranking — for that, reach for Elasticsearch, covered in Ch.11).</li>
+  <li><strong>Geospatial index (<code>2dsphere</code>)</strong> — supports "find things near this point" and "find things inside this shape" queries on coordinate data.</li>
+  <li><strong>TTL index</strong> — an index with an <code>expireAfterSeconds</code> setting that makes MongoDB automatically delete documents once they've aged past that limit. This is a common fit for session data or short-lived logs that should clean themselves up without a separate scheduled job.</li>
+</ul>
+<p>A <strong>covered query</strong> is one where every field the query needs — both to filter and to return — is already inside the index, so MongoDB never has to fetch the actual document off disk. Run <code>.explain("executionStats")</code> on a slow query to check: a plan showing <code>COLLSCAN</code> means MongoDB scanned the whole collection with no index; <code>IXSCAN</code> means it used one. Chasing <code>COLLSCAN</code> out of your slow queries is the single highest-leverage MongoDB performance habit.</p>
+<div class="callout"><p>The <strong>shard key</strong> — the field MongoDB uses to decide which shard a document lives on — is a separate decision from any of the indexes above, covered in depth in Ch.6, including why a poorly chosen (monotonically increasing) shard key creates a write hot spot. Every collection needs an index on its shard key, but not every index needs to be a shard key.</p></div>
+
+<h2><span class="idx">05</span>When Documents Beat Rows, And When They Genuinely Don't</h2>
+<p>Documents win when your data naturally nests as one aggregate that's read and written as a whole: a product with variants and attributes that differ per product, a blog post with its comments, a user profile with preferences that change shape over time without needing a schema migration that locks a table with a billion rows. MongoDB's flexible schema — sometimes called "schema-less," though it's really schema-flexible, since your application still has an implicit schema, MongoDB just doesn't enforce one at the database layer by default — means adding a new field to new documents doesn't require an <code>ALTER TABLE</code>-style operation across every existing row first.</p>
+<p>Rows win when your data is <strong>highly relational</strong>, meaning many entities cross-reference each other, and the queries that join them change from request to request instead of following one fixed access pattern. A concrete example: an accounting or ERP-style system where orders, customers, products, warehouses, discounts, and tax rules all need to be joined in different combinations depending on the report someone's running this week. Forcing that into documents means either duplicating data across many documents (denormalizing everything, and now every duplicate needs updating when the source changes) or stacking up <code>$lookup</code> stages that are really just doing a join anyway, without a relational query planner's decades of join optimization behind them.</p>
+<p>Rows also win when you need <strong>multi-row, multi-table ACID transactions as your default mode of operation</strong> — not an occasional case, but every write. A ledger where a debit on one account and a credit on another must commit together, every single time, is what relational transactions were built for from day one. MongoDB added multi-document transactions in version 4.0, and they work correctly, but they're a feature added on top of a document model, not the foundation the engine was designed around — and they cost meaningfully more throughput than a single-document write.</p>
+<div class="callout em-angle"><p>An EM-level answer doesn't reach for "NoSQL scales better" as the reason to move a relational system to MongoDB — plenty of relational systems scale fine with the sharding techniques from Ch.6. The real trigger is the <em>shape</em> of the data and its access pattern, not raw scale. Facebook's own history makes the point: their social graph — objects and the edges between them — didn't fit cleanly into either a pure relational model or a pure document model at their scale, which is why they built TAO, a graph-aware caching and storage layer running on top of sharded MySQL, instead of just picking one off-the-shelf database model. The lesson isn't "use TAO" — it's that the right answer to "rows or documents" is sometimes "neither, exactly — build the access pattern you actually need on top of one of them."</p></div>
+
+<h2><span class="idx">06</span>Redis Beyond "It's Just A Cache": Lists, Sets, And Sorted Sets</h2>
+<p>Ch.4 introduced Redis as a cache and touched on its data structures in passing. It's worth stopping here and taking those structures seriously, because Redis is really a <strong>data-structure server</strong> that happens to also work great as a cache: every key holds a typed value, and each type comes with its own atomic operations, so many clients can safely push, pop, or increment shared state without racing each other.</p>
+<h3>Lists</h3>
+<p>A Redis <strong>list</strong> is an ordered sequence of values, with fast push and pop from either end: <code>LPUSH</code>/<code>RPUSH</code> add to the left or right end, <code>LPOP</code>/<code>RPOP</code> remove from either end, and <code>BLPOP</code>/<code>BRPOP</code> are blocking versions that wait for an item to appear instead of returning immediately. This makes lists a natural fit for a simple job queue (workers <code>BRPOP</code> from one end while producers <code>LPUSH</code> onto the other) or a capped "recent activity" feed (<code>LPUSH</code> the newest item, then <code>LTRIM</code> the list down to a fixed length so it never grows unbounded).</p>
+<h3>Sets</h3>
+<p>A Redis <strong>set</strong> is an unordered collection of unique values, with an O(1) membership check (<code>SISMEMBER</code>) and built-in set algebra: <code>SUNION</code>, <code>SINTER</code>, and <code>SDIFF</code> compute the union, intersection, and difference of two or more sets directly on the server. That makes sets a good fit for "tags on this post," "who follows both X and Y" (a set intersection), or deduplicating a stream of ids without pulling everything into the application to compare.</p>
+<h3>Sorted sets</h3>
+<p>A <strong>sorted set</strong> (Redis calls the type <code>ZSET</code>) is a set where every member also carries a floating-point <strong>score</strong>, and Redis keeps the entire set ordered by that score at all times. Internally it's backed by a skip list plus a hash table, which is what makes both "give me this member's rank" and "give me everyone between these two scores" run in roughly O(log N) time instead of requiring a fresh sort on every read. This is the structure behind leaderboards, priority queues, and any ranked list that changes constantly but needs to be read in order on every request.</p>
+
+<h2><span class="idx">07</span>Redis Worked Example: A Leaderboard With A Sorted Set</h2>
+<p>A live leaderboard — "top players this week," updated after every match — is the textbook sorted-set use case.</p>
+<pre><code>ZADD leaderboard:global 4820 "player:1042"
+ZADD leaderboard:global 3990 "player:2871"
+ZADD leaderboard:global 5510 "player:9981"
+
+ZREVRANK leaderboard:global "player:1042"     # this player's rank, 0-indexed, highest score first
+ZSCORE  leaderboard:global "player:1042"      # this player's current score
+ZREVRANGE leaderboard:global 0 9 WITHSCORES   # top 10 players and their scores
+ZINCRBY leaderboard:global 150 "player:1042"  # add 150 points after a match</code></pre>
+<p><code>ZADD</code> sets (or updates) a member's score. Because Redis keeps the whole set ordered by score at all times, reading "top 10" (<code>ZREVRANGE 0 9</code>) or "this player's current rank" (<code>ZREVRANK</code>) is a cheap lookup against an already-sorted structure — the sort cost is paid once, incrementally, on every write, instead of being paid all over again on every read the way a plain <code>SELECT ... ORDER BY score DESC</code> would if you weren't caching the result. <code>ZINCRBY</code> atomically adds to an existing score, so two concurrent matches finishing at the same instant and both trying to add points to the same player never race each other into a wrong final total — the increment is a single atomic server-side operation, not a read-modify-write your application code has to coordinate itself.</p>
+
+<h2><span class="idx">08</span>Redis Worked Example: A Session Store</h2>
+<p>After a user logs in, something has to hold "who is this session, and are they still logged in" — and it has to be readable by whichever application server happens to handle their next request, since a load balancer usually won't pin a user to the exact server that authenticated them. Redis is a standard fit for this, storing session state in one place every application server can reach.</p>
+<pre><code>HSET session:a1b2c3 userId 4821 loginAt 1751000000 role "admin"
+EXPIRE session:a1b2c3 1800
+HGETALL session:a1b2c3</code></pre>
+<p><code>HSET</code> stores the session as a <strong>hash</strong> — a small field-value map living inside one key, essentially a mini-document. <code>EXPIRE</code> sets a <strong>TTL</strong> (time to live) of 1800 seconds — 30 minutes — on the whole key; once that time passes with no refresh, Redis deletes the key on its own, so idle sessions clean themselves up without a background cleanup job. A common pattern re-issues <code>EXPIRE</code> on every request that touches the session, turning the fixed TTL into a sliding window: "log the user out after 30 minutes of <em>inactivity</em>," not 30 minutes after login. <code>HGETALL</code> reads the whole session back in one round trip.</p>
+<p>A plain string key (<code>SET session:a1b2c3 "{...serialized json...}" EX 1800</code>) could store the same information, but a hash lets you update one field — bumping <code>lastSeenAt</code>, say — without re-serializing and rewriting the entire blob. And since Redis holds this in memory, production session stores usually run Redis replicated (Redis Cluster, or a managed offering like ElastiCache or MemoryDB) so that one node failing doesn't log out every active user at once — persistence and clustering trade-offs are covered in Ch.4.</p>
+
+<h2><span class="idx">09</span>DynamoDB: Partition Keys And The Hot Partition Problem</h2>
+<p>DynamoDB is Amazon's managed, key-value and document store: every item has a primary key, and DynamoDB decides which internal <strong>partition</strong> an item lives on by hashing its <strong>partition key</strong> (also called the hash key) — conceptually the same idea as hash-based sharding from Ch.6, except fully managed. You never choose the number of partitions directly; DynamoDB creates, splits, and moves them for you as a table's size and throughput grow.</p>
+<p>A table can use just a partition key, or a <strong>composite primary key</strong>: partition key plus <strong>sort key</strong>. Items sharing a partition key are stored together, sorted by the sort key — so partition key <code>userId</code> and sort key <code>orderTimestamp</code> gets you "all of this user's orders, in time order" as one cheap, local read, without touching any other partition.</p>
+<p>Good partition-key design means picking a key with high <strong>cardinality</strong> (many distinct values) and roughly even access across those values — every distinct partition key should get a similar share of the table's total traffic. Here's how it fails: imagine an events table logging telemetry with partition key <code>eventDate</code>, a value like <code>"2026-07-26"</code>. Every event created today writes to that exact same partition key value, so every write for the entire system, no matter how large the table is or how many partitions DynamoDB has allocated to it, funnels into a single partition. That one partition hits its throughput ceiling — AWS has documented per-partition limits on the order of 3,000 read capacity units and 1,000 write capacity units — and starts throttling writes, while every other partition in the table sits completely idle. This is DynamoDB's version of the monotonically-increasing shard key problem from Ch.6's MongoDB section: the fix is the same in spirit — pick a higher-cardinality key, or add a random or hashed suffix to spread one logical day's writes across many partition key values (say, <code>eventDate#03</code> where <code>03</code> is a random number from 0–99), then fan reads out across all the suffixes and merge the results.</p>
+<div class="diagram" data-diagram='{
+  "title": "DynamoDB: partition-key hashing and a Global Secondary Index",
+  "nodes": [
+    {"id":"app","x":30,"y":230,"w":150,"h":60,"kind":"external","label":"Application"},
+    {"id":"table","x":320,"y":230,"w":210,"h":70,"kind":"storage","label":"Orders table","sub":"partition key: orderId"},
+    {"id":"pa","x":740,"y":40,"w":190,"h":55,"kind":"storage","label":"Partition A"},
+    {"id":"pb","x":740,"y":120,"w":190,"h":55,"kind":"storage","label":"Partition B"},
+    {"id":"pc","x":740,"y":200,"w":190,"h":55,"kind":"storage","label":"Partition C"},
+    {"id":"gsi","x":320,"y":400,"w":260,"h":70,"kind":"storage","label":"GSI: customerId","sub":"separate partitions, async copy"}
+  ],
+  "edges": [
+    {"from":"app","to":"table","label":"Query: orderId = X"},
+    {"from":"app","to":"gsi","label":"Query: customerId = Y"},
+    {"from":"table","to":"pa","label":"hash(orderId)"},
+    {"from":"table","to":"pb","label":"hash(orderId)"},
+    {"from":"table","to":"pc","label":"hash(orderId)"},
+    {"from":"table","to":"gsi","label":"async propagate"}
+  ],
+  "groups": [
+    {"x":720,"y":20,"w":230,"h":260,"label":"Base-table partitions (DynamoDB-managed)"}
+  ]
+}'></div>
+<div class="callout tradeoff"><p>DynamoDB's <strong>adaptive capacity</strong> feature automatically shifts unused throughput from cold partitions toward a hot one, and it genuinely helps with mild, temporary imbalance. It cannot rescue a fundamentally bad key design, though — if every write in the system permanently targets one partition key value, there's no idle capacity anywhere else to borrow. Partition key choice is a design-time decision, not something you patch with a setting after launch.</p></div>
+
+<h2><span class="idx">10</span>DynamoDB: Quorum-Style Reads And Writes</h2>
+<p>DynamoDB replicates every item across multiple availability zones within a region — AWS documents this as three copies — for durability and availability, using a quorum-style protocol under the hood: a write is durable once enough replicas have it, and a read is trustworthy once it has checked enough replicas that its answer is guaranteed to reflect the most recent completed write. That's the same core idea Ch.9 covers in full, tunable detail for Cassandra's <code>R + W > N</code> formula — DynamoDB doesn't expose the exact replica math as a dial the way Cassandra does, but the underlying trade-off is identical.</p>
+<p>What DynamoDB does expose is a choice, on every read request, between two consistency levels:</p>
+<ul>
+  <li><strong>Eventually consistent read</strong> — the default, and it costs half the read capacity of a strongly consistent read for the same item. It might return data from a replica that hasn't yet received the very latest write; read right after a write and you could see a slightly stale value, though AWS says that window is normally well under a second.</li>
+  <li><strong>Strongly consistent read</strong> — guarantees the read reflects every write that completed successfully before it started. It costs more read capacity, adds a little latency, and — this is the real trade-off, a direct instance of the CAP theorem from Ch.12 — it can become unavailable under certain network-partition conditions where an eventually consistent read would still happily succeed.</li>
+</ul>
+<div class="callout say-this"><p>"For the product catalog page, I'd use eventually consistent reads — a shopper seeing a price that's a fraction of a second stale is harmless, and it's half the read cost at our scale. For the 'confirm my payment went through' read right after the write, I'd pay for a strongly consistent read, because showing the user a false 'still pending' state, or worse, double-charging because a stale read said the payment hadn't landed yet, is the more expensive failure."</p></div>
+
+<h2><span class="idx">11</span>DynamoDB: Global Secondary Indexes</h2>
+<p>DynamoDB can only efficiently query a table along its primary key — partition key alone, or partition key plus sort key. That's the price of a horizontally-partitioned store: there's no free "find all rows where this other column equals X" the way a relational index gives you almost for granted, because answering that against the base table's partitioning would mean checking every partition — an expensive full-table <strong>Scan</strong>, not a targeted <strong>Query</strong>.</p>
+<p>A <strong>Global Secondary Index (GSI)</strong> solves this: it's a second, DynamoDB-managed index over the same table, with its own partition key (and optional sort key) chosen from other attributes on the same items — see the GSI on <code>customerId</code> in the diagram above, sitting alongside a base table partitioned by <code>orderId</code>. Query the GSI directly for "all orders for this customer," sorted however the GSI's sort key is defined, without ever touching how the base table itself is partitioned.</p>
+<p>Two things worth knowing about GSIs specifically:</p>
+<ul>
+  <li><strong>They're eventually consistent only.</strong> A GSI is really a separate, asynchronously-updated copy of the table's data, reorganized under a different partition key — propagation from a base-table write to its GSI entry takes a small amount of time. (A <strong>Local Secondary Index</strong>, by contrast, shares the base table's partition key and only varies the sort key, which is why it can offer strongly consistent reads — it's not really a separate physical copy in the same way.)</li>
+  <li><strong>They have their own throughput</strong>, provisioned or on-demand separately from the base table. A GSI that gets hammered by one hot access pattern can throttle on its own, independent of how the base table itself is doing.</li>
+</ul>
+<p>The design habit a GSI teaches is the same one that's run through this whole chapter: model the schema around the queries you actually need to run, whether that's MongoDB's shard key, Redis's choice of data structure, or a DynamoDB GSI added for exactly one extra access pattern — not one schema you hope covers every future question.</p>
+<div class="callout em-angle"><p>Every GSI is close to a second table: its own storage, its own throughput cost, its own capacity to throttle. Adding one isn't free just because DynamoDB manages it for you — at the design-review stage, each proposed GSI is worth asking "what specific query does this serve, and is it worth paying for a second copy of this data to serve it," the same build-vs-buy discipline that applies to standing up any other piece of infrastructure.</p></div>
+
+<div class="specsheet">
+  <details>
+    <summary><span class="cat">BSON</span> Types and limits worth remembering</summary>
+    <div class="specbody">
+      <ul>
+        <li><strong>Extra types vs JSON</strong> — <code>Date</code>, <code>ObjectId</code>, <code>Binary</code>, <code>Decimal128</code>, and distinct <code>Int32</code>/<code>Int64</code>/<code>Double</code> where JSON only has one generic number type.</li>
+        <li><strong>ObjectId</strong> — 12 bytes: 4-byte timestamp, 5-byte process-unique random value, 3-byte incrementing counter.</li>
+        <li><strong>Document size limit</strong> — 16 MB per document, the hard ceiling behind every embed-vs-reference call.</li>
+      </ul>
+    </div>
+  </details>
+  <details>
+    <summary><span class="cat">Indexes</span> MongoDB index types, one line each</summary>
+    <div class="specbody">
+      <ul>
+        <li><strong>Single-field</strong> — one indexed field, like a SQL column index.</li>
+        <li><strong>Compound</strong> — several fields, ordered by the ESR rule: Equality, Sort, Range.</li>
+        <li><strong>Multikey</strong> — auto-created when indexing an array field; one index entry per array element.</li>
+        <li><strong>Text</strong> — basic word-level search across string fields.</li>
+        <li><strong>2dsphere</strong> — geospatial "near me" / "inside this shape" queries.</li>
+        <li><strong>TTL</strong> — auto-deletes documents once they age past <code>expireAfterSeconds</code>.</li>
+      </ul>
+    </div>
+  </details>
+  <details>
+    <summary><span class="cat">Redis</span> Data structures and their fit</summary>
+    <div class="specbody">
+      <ul>
+        <li><strong>String</strong> — simple value, atomic <code>INCR</code>/<code>DECR</code> for counters.</li>
+        <li><strong>List</strong> — ordered, fast push/pop both ends. Queues, capped recent-activity feeds.</li>
+        <li><strong>Set</strong> — unique values, O(1) membership, set algebra. Tags, deduplication.</li>
+        <li><strong>Sorted set (ZSET)</strong> — set plus a score, kept ordered. Leaderboards, ranked queues.</li>
+        <li><strong>Hash</strong> — field-value map in one key. Sessions, small objects.</li>
+      </ul>
+    </div>
+  </details>
+  <details>
+    <summary><span class="cat">DynamoDB</span> Key terms</summary>
+    <div class="specbody">
+      <ul>
+        <li><strong>Partition key</strong> — hashed to pick which partition an item lives on.</li>
+        <li><strong>Sort key</strong> — orders items that share a partition key; optional, forms a composite primary key.</li>
+        <li><strong>GSI</strong> — a second index with its own partition/sort key; eventually consistent only, own throughput.</li>
+        <li><strong>LSI</strong> — shares the base table's partition key, varies only the sort key; supports strongly consistent reads.</li>
+        <li><strong>Adaptive capacity</strong> — shifts unused throughput toward a hot partition; helps mild imbalance, not a bad key design.</li>
+      </ul>
+    </div>
+  </details>
+  <details>
+    <summary><span class="cat">Consistency</span> Eventually vs strongly consistent reads</summary>
+    <div class="specbody">
+      <ul>
+        <li><strong>Eventually consistent</strong> — default, cheaper, may return slightly stale data right after a write.</li>
+        <li><strong>Strongly consistent</strong> — guarantees the latest completed write is visible; costs more, can be unavailable during a network partition.</li>
+        <li><strong>Quorum, in general</strong> — a write is durable once enough replicas confirm it; a read is trustworthy once it's checked enough replicas to guarantee overlap with the latest write. Full tunable version in Ch.9 (Cassandra's <code>R + W &gt; N</code>).</li>
+      </ul>
+    </div>
+  </details>
+</div>
+
+<div class="flashcards" data-cards='[
+  {"q":"What is BSON, and why does MongoDB use it instead of plain JSON?","a":"BSON is Binary JSON, MongoDB&#39;s binary-encoded document format. It adds types JSON lacks (Date, ObjectId, distinct Int32/Int64/Double, Binary), and its length-prefixed encoding lets MongoDB skip over fields without parsing every byte - faster to traverse than text JSON, though not necessarily smaller."},
+  {"q":"What is a MongoDB ObjectId made of?","a":"A 12-byte value: a 4-byte creation timestamp, a 5-byte random value unique to the creating process, and a 3-byte counter that starts at a random number and increments."},
+  {"q":"What is the core question when choosing embed vs reference in MongoDB?","a":"Is this relationship read together most of the time and bounded in growth (embed), or is it many-to-many, unbounded, or queried independently of its parent (reference)?"},
+  {"q":"Why does a blog post with its comments fit the embedding pattern?","a":"Comments belong to exactly one post (one-to-many), are almost always read together with it, and stay bounded in count - comfortably under MongoDB&#39;s 16 MB per-document limit."},
+  {"q":"Why does a social graph&#39;s follows relationship fit referencing instead of embedding?","a":"It&#39;s many-to-many and effectively unbounded - a popular account could have tens of millions of followers, which would blow past the 16 MB document limit if embedded as an array. It also needs independent queries, like &#39;who does X follow,&#39; that have nothing to do with a specific parent document."},
+  {"q":"What does MongoDB&#39;s $lookup aggregation stage do?","a":"It performs a left outer join against another collection, similar to a SQL JOIN, letting a referenced design still combine data from two collections in one query."},
+  {"q":"Why put $match early in an aggregation pipeline?","a":"It shrinks the working set before the more expensive $group and $sort stages run, and if the filtered field is indexed, an early $match can use that index the same way a SQL WHERE clause would."},
+  {"q":"What is the ESR rule for MongoDB compound indexes?","a":"Order compound index fields as Equality fields first, then Sort fields, then Range fields - the same left-prefix logic behind any compound index, tuned for MongoDB&#39;s query planner."},
+  {"q":"What does a MongoDB TTL index do?","a":"It automatically deletes documents once they age past the expireAfterSeconds setting - a good fit for session data or logs that should clean themselves up without a separate job."},
+  {"q":"Give one real scenario where relational rows beat MongoDB documents.","a":"Highly relational data with ad hoc joins that change per query - like a reporting system joining orders, customers, products, and discounts in different combinations. That forces either heavy denormalization or many $lookup stages, neither of which matches a relational query planner&#39;s decades of join optimization."},
+  {"q":"Redis lists, sets, and sorted sets - one line each.","a":"Lists are ordered sequences with fast push/pop from both ends (queues, capped feeds). Sets are unordered unique-value collections with O(1) membership checks and set algebra. Sorted sets add a score to every member and keep the whole set ordered by it (leaderboards, ranked queues)."},
+  {"q":"How does a Redis sorted-set leaderboard return a player&#39;s rank without sorting on every read?","a":"ZADD/ZINCRBY update a member&#39;s score, and Redis keeps the set ordered by score at all times (backed by a skip list), so ZREVRANK/ZREVRANGE just read the existing order - the sort cost is paid once per write, not once per read."},
+  {"q":"How does a Redis session store clean up idle sessions automatically?","a":"Store the session as a hash under one key with HSET, then EXPIRE that key with a TTL. Redis deletes the whole key once the TTL runs out, and refreshing EXPIRE on every request turns it into a sliding, &#39;logs out after N minutes idle&#39; window."},
+  {"q":"Why does a bad DynamoDB partition key create a hot partition?","a":"If most or all writes share the same partition key value - like today&#39;s date - they all hash to the same partition regardless of how many partitions the table has. That one partition hits its throughput ceiling and throttles while every other partition sits idle."},
+  {"q":"Strongly consistent vs eventually consistent DynamoDB reads - what&#39;s the trade-off?","a":"Eventually consistent (the default) may return slightly stale data right after a write but costs less. Strongly consistent guarantees every prior completed write is visible, at higher cost and latency, and it can become unavailable during certain network-partition conditions where an eventually consistent read would still succeed."},
+  {"q":"What problem does a DynamoDB Global Secondary Index (GSI) solve, and what is its main limitation?","a":"DynamoDB can only efficiently query a table by its primary key. A GSI is a second, separately-partitioned index on other attributes that supports a different access pattern without a full table scan - but it&#39;s eventually consistent only, since it&#39;s an asynchronously-updated copy of the data under a different partition key."}
+]'></div>
