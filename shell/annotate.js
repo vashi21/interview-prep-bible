@@ -1,24 +1,36 @@
 /* HLD Interview-Prep Bible — Apple Pencil annotation layer (personal-site SPA
    only). Strokes are stored as fractions of the content box (0-1), not
    pixels, so a rotation/reflow rescales the whole drawing along with the
-   text instead of leaving it behind. Native pinch-zoom needs no special
-   handling: the browser scales the canvas and the content together as one
-   unit. Persisted in IndexedDB, one record per route — real on-device
-   storage, durable across closing the app/rebooting, no backend needed for
-   this MVP (a later phase adds one for cross-device sync).
+   text instead of leaving it behind. Persisted in IndexedDB, one record per
+   route — real on-device storage, durable across closing the app/rebooting,
+   no backend needed for this MVP (a later phase adds one for cross-device
+   sync).
 
    Scroll-lock model: the toolbar starts COLLAPSED, and while it's collapsed
-   the Pencil is fully inert — it does not draw, does not preventDefault,
-   and touch-action is left at its default, so both a finger and the Pencil
+   the Pencil is fully inert — it does not draw, does not preventDefault, and
+   touch-action is left at its default, so both a finger and the Pencil
    scroll the page normally. Expanding the toolbar (tapping the FAB) is the
    explicit "start annotating" action: at that point touch-action is set to
-   "none" on <html> for as long as the toolbar stays expanded. Setting it
-   this way — statically, the moment the toolbar opens, not reactively
-   inside a pointerdown handler — matters: on iOS Safari, toggling
-   touch-action only once a touch has already begun can be too late for the
-   native scroll gesture recognizer, which decides based on the CSS in
-   effect when the touch starts. Locking it well in advance of any stroke
-   is what actually stops the page from moving while drawing. */
+   "pinch-zoom" on <html> for as long as the toolbar stays expanded — chosen
+   over "none" specifically because "pinch-zoom" disables one-finger native
+   panning while *keeping native pinch-zoom working*. Setting it this way —
+   statically, the moment the toolbar opens, not reactively inside a
+   pointerdown handler — matters: on iOS Safari, toggling touch-action only
+   once a touch has already begun can be too late for the native scroll
+   gesture recognizer, which decides based on the CSS in effect when the
+   touch starts.
+
+   touch-action can only distinguish *gesture type* (pan vs. pinch), not
+   *pointer type* — it can't single out the Pencil and leave a finger
+   unaffected. So disabling native one-finger panning necessarily disables
+   it for a finger too. To keep finger-scrolling fully working regardless of
+   annotation state (the actual requirement), a finger's one-finger drag is
+   re-implemented here as a plain 1:1 `window.scrollTo` follow (see
+   fingerScroll below) — deliberately no momentum/fling after lift, since
+   replicating that physics exactly is out of scope; a direct drag-to-scroll
+   is what matters. The moment a second finger joins, this manual tracking
+   backs off and the browser's own native pinch-zoom (still permitted by
+   touch-action) takes over. */
 (function(){
   var DB_NAME = 'hld-bible-ink';
   var DB_VERSION = 1;
@@ -28,7 +40,7 @@
 
   var PALETTE = ['#1a1a1a', '#e5484d', '#2f6fed', '#2fa84f', '#e8871e', '#8a3ffc'];
   var PEN_WIDTHS = { thin: 1.5, medium: 3, thick: 6 };
-  var HL_WIDTHS = { thin: 8, medium: 14, thick: 22 };
+  var HL_WIDTHS = { thin: 12, medium: 20, thick: 30 };
   var DEFAULT_PEN_COLOR = '#1a1a1a';
   var DEFAULT_HL_COLOR = '#ffd400';
   var HL_ALPHA = 0.35;
@@ -150,9 +162,13 @@
 
   function currentDrawStyle(){
     if (prefs.tool === 'highlighter') {
-      return { color: prefs.highlighter.color, alpha: HL_ALPHA, width: HL_WIDTHS[prefs.highlighter.widthKey] || HL_WIDTHS.medium };
+      // Flat caps + constant width (no pressure modulation): a highlighter
+      // is a wide flat-tip marker in real life, not pressure-sensitive like
+      // a pen — modulating its width per point is what made it look like a
+      // lumpy chain of blobs instead of a clean flat highlight band.
+      return { color: prefs.highlighter.color, alpha: HL_ALPHA, width: HL_WIDTHS[prefs.highlighter.widthKey] || HL_WIDTHS.medium, cap: 'butt', pressureSensitive: false };
     }
-    return { color: prefs.pen.color, alpha: 1, width: PEN_WIDTHS[prefs.pen.widthKey] || PEN_WIDTHS.medium };
+    return { color: prefs.pen.color, alpha: 1, width: PEN_WIDTHS[prefs.pen.widthKey] || PEN_WIDTHS.medium, cap: 'round', pressureSensitive: true };
   }
 
   function currentEraserSize(){
@@ -196,9 +212,9 @@
       ctx.globalAlpha = style.alpha == null ? 1 : style.alpha;
       ctx.strokeStyle = style.color;
     }
-    ctx.lineCap = 'round';
+    ctx.lineCap = style.cap || 'round';
     ctx.lineJoin = 'round';
-    ctx.lineWidth = lineWidthFor(style.width, p1.p);
+    ctx.lineWidth = style.pressureSensitive ? lineWidthFor(style.width, p1.p) : style.width;
     ctx.beginPath();
     ctx.moveTo(p0.x, p0.y);
     ctx.lineTo(p1.x, p1.y);
@@ -213,9 +229,15 @@
   function paintEntry(entry, w, h){
     var pts = entryToPixelPoints(entry, w, h);
     if (pts.length < 2) return;
-    var style = entry.type === 'erase'
-      ? { erase: true, width: entry.width }
-      : { color: entry.color, alpha: entry.alpha, width: entry.width };
+    var style;
+    if (entry.type === 'erase') {
+      style = { erase: true, width: entry.width };
+    } else {
+      // cap/pressureSensitive aren't persisted — derived from alpha so old
+      // saved entries (before this distinction existed) still replay right.
+      var isHighlighter = entry.alpha != null && entry.alpha < 1;
+      style = { color: entry.color, alpha: entry.alpha, width: entry.width, cap: isHighlighter ? 'butt' : 'round', pressureSensitive: !isHighlighter };
+    }
     for (var i = 1; i < pts.length; i++) drawSegment(style, pts[i - 1], pts[i]);
   }
 
@@ -265,7 +287,26 @@
     return changed;
   }
 
+  // ---- finger drag-to-scroll passthrough ----
+  // touch-action:'pinch-zoom' (set while annotating) disables native
+  // one-finger panning for EVERY pointer type, since touch-action can't
+  // distinguish Pencil from finger. This replicates plain 1:1 finger
+  // scrolling by hand so it keeps working regardless of annotation state —
+  // deliberately no momentum after lift, see file header. Bails out the
+  // moment a second finger joins (touchPointerIds.size > 1) so the browser's
+  // own native pinch-zoom, still permitted by touch-action, takes over.
+  var touchPointerIds = new Set();
+  var fingerScroll = null;
+
   function onPointerDown(e){
+    if (e.pointerType === 'touch') {
+      touchPointerIds.add(e.pointerId);
+      if (touchPointerIds.size > 1) { fingerScroll = null; return; }
+      if (!prefs.collapsed && currentRoute && !e.target.closest('#ink-toolbar, #ink-fab')) {
+        fingerScroll = { pointerId: e.pointerId, y: e.clientY, scrollY: window.scrollY };
+      }
+      return;
+    }
     if (e.pointerType !== 'pen' || !wrap || !canvas || prefs.collapsed) return;
     e.preventDefault();
     snapshotForUndo();
@@ -282,6 +323,12 @@
   }
 
   function onPointerMove(e){
+    if (e.pointerType === 'touch') {
+      if (fingerScroll && e.pointerId === fingerScroll.pointerId && touchPointerIds.size === 1) {
+        window.scrollTo(window.scrollX, fingerScroll.scrollY - (e.clientY - fingerScroll.y));
+      }
+      return;
+    }
     if (e.pointerType !== 'pen' || !liveStroke) return;
     e.preventDefault();
     var rect = wrap.getBoundingClientRect();
@@ -304,6 +351,11 @@
   }
 
   function onPointerUp(e){
+    if (e.pointerType === 'touch') {
+      touchPointerIds.delete(e.pointerId);
+      if (fingerScroll && e.pointerId === fingerScroll.pointerId) fingerScroll = null;
+      return;
+    }
     if (e.pointerType !== 'pen' || !liveStroke) return;
     e.preventDefault();
 
@@ -396,15 +448,15 @@
 
   // ---- toolbar ----
   // Single place that decides both toolbar visibility AND scroll-lock, so
-  // the two can never drift apart: touch-action is "none" exactly when the
-  // toolbar is open on a real route, set here — well before any stroke
+  // the two can never drift apart: touch-action is "pinch-zoom" exactly when
+  // the toolbar is open on a real route, set here — well before any stroke
   // begins — rather than inside a pointer handler (see the file header for
   // why that timing matters on iOS Safari).
   function updateToolbarVisibility(show){
     var bar = document.getElementById('ink-toolbar');
     var fab = document.getElementById('ink-fab');
     var annotating = show && !prefs.collapsed;
-    document.documentElement.style.touchAction = annotating ? 'none' : '';
+    document.documentElement.style.touchAction = annotating ? 'pinch-zoom' : '';
     if (!show) {
       if (bar) bar.style.display = 'none';
       if (fab) fab.style.display = 'none';
