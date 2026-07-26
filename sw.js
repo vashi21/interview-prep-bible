@@ -1,4 +1,4 @@
-var CACHE = 'hld-bible-a27b48e9d6';
+var CACHE = 'hld-bible-b0d858c232';
 var SHELL = ['./', './index.html', './manifest.json', './icon-192.png', './icon-512.png'];
 self.addEventListener('install', function(e){
   self.skipWaiting();
