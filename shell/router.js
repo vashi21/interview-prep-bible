@@ -27,7 +27,7 @@
     var routes = window.__ROUTES__ || {};
     var titles = window.__TITLES__ || {};
     var parts = parseHash();
-    var html, title;
+    var html, title, annotateKey = null;
 
     if (parts.length === 0){
       html = window.__VOLUME_SELECTOR_HTML__ || notFoundHtml();
@@ -35,12 +35,14 @@
     } else if (parts[0] === 'hld' && parts.length === 1){
       html = routes.hub || notFoundHtml();
       title = titles.hub || 'HLD Bible';
+      annotateKey = 'hub';
     } else if (parts[0] === 'hld' && parts[1]){
       var m = parts[1].match(/^ch(\d+)$/);
       var key = m ? 'ch' + m[1] : null;
       if (key && routes[key]){
         html = routes[key];
         title = titles[key] || 'HLD Bible';
+        annotateKey = key;
       } else {
         html = notFoundHtml();
         title = 'Not found';
@@ -54,6 +56,7 @@
     document.title = title;
     window.scrollTo(0, 0);
     if (window.HLDBibleEngine && window.HLDBibleEngine.init) window.HLDBibleEngine.init();
+    if (window.HLDBibleAnnotate && window.HLDBibleAnnotate.mount) window.HLDBibleAnnotate.mount(annotateKey);
   }
 
   function boot(){

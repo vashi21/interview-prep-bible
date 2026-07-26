@@ -182,6 +182,11 @@ def build():
     comp_css = read("shell/components.css")
     site_css = read("shell/site.css")
     engine_js = read("shell/engine.js")
+    # annotate_js before router_js: both defer their DOM setup to
+    # DOMContentLoaded, and router's boot() calls HLDBibleAnnotate.mount()
+    # immediately — mount() needs the toolbar annotate.js builds to already
+    # exist, so annotate's listener must be registered (and fire) first.
+    annotate_js = read("shell/annotate.js")
     router_js = read("shell/router.js")
 
     routes = {}
@@ -211,7 +216,14 @@ def build():
         routes[key] = page
         titles[key] = f'HLD Bible — Ch.{c["num"]} {c["title"]}'
 
-    version = hashlib.sha1((json.dumps(routes) + json.dumps(titles)).encode()).hexdigest()[:10]
+    # Hash covers the shell code too (not just chapter content) — a fix to
+    # engine.js/router.js/annotate.js/*.css must bump this, or the service
+    # worker's cache name stays byte-identical and installed/offline copies
+    # never see the update (see service_worker_js: cache-first by name).
+    version = hashlib.sha1((
+        json.dumps(routes) + json.dumps(titles) +
+        theme_css + comp_css + site_css + engine_js + router_js + annotate_js
+    ).encode()).hexdigest()[:10]
 
     html = []
     html.append('<meta charset="utf-8">')
@@ -235,6 +247,7 @@ def build():
     html.append('window.__TITLES__ = ' + safe_for_inline_script(json.dumps(titles)) + ';')
     html.append('window.__VOLUME_SELECTOR_HTML__ = ' + safe_for_inline_script(json.dumps(VOLUME_SELECTOR_HTML)) + ';')
     html.append(engine_js)
+    html.append(annotate_js)
     html.append(router_js)
     html.append("if ('serviceWorker' in navigator) { navigator.serviceWorker.register('sw.js').catch(function(){}); }")
     html.append('</script>')
