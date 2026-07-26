@@ -53,22 +53,32 @@
    reads as cleaner and more predictable than continuous pressure-driven
    width jitter did.
 
-   Two-layer canvas, for latency: `canvas`/`ctx` holds every COMMITTED
-   stroke and is only fully repainted when `strokes` actually changes
-   (mount, undo, clear, resize, or a stroke finishing) — never on a raw
-   pointermove. A second `liveCanvas`/`liveCtx`, stacked on top, holds only
-   the CURRENT in-progress pen/highlighter stroke and is cheap to redraw on
-   every move since it never has to re-render everything else on the page.
-   An earlier version called a full clear-and-repaint-every-committed-stroke
-   on every single pointermove, which is fine with a handful of strokes but
-   becomes multi-second input lag once a page accumulates enough of them
-   (especially highlighter entries, each needing the scratch-canvas
-   composite below) — Pencil sampling far outpaces how long that full
-   repaint takes, so events queue up visibly behind the render.
-   Precision/standard erasing sidesteps this differently: since
-   destination-out has no compounding-alpha problem, it's applied
-   incrementally and permanently straight onto the BASE canvas as the
-   gesture moves, one new segment at a time — never a full repaint either. */
+   `canvas`/`ctx` holds every COMMITTED stroke and is only fully repainted
+   when `strokes` actually changes (mount, undo, clear, resize, or a stroke
+   finishing) — never on a raw pointermove. An earlier version called a
+   full clear-and-repaint-every-committed-stroke on every single
+   pointermove, which is fine with a handful of strokes but becomes
+   multi-second input lag once a page accumulates enough of them — Pencil
+   sampling far outpaces how long that full repaint takes, so events queue
+   up visibly behind the render.
+
+   Per-event cost is minimized differently per tool, chosen by whether the
+   tool has an alpha-compounding correctness concern at all:
+   - Pen (opaque, alpha 1) and precision/standard eraser (destination-out,
+     no alpha blending either way) both draw the newest segment directly
+     and PERMANENTLY onto the base canvas as the gesture moves — O(1) per
+     event, no clearing, no path rebuilding, nothing else on the page ever
+     touched. This is safe for both because there's no scenario where
+     re-stroking overlapping geometry changes the visible result.
+   - Highlighter is the one tool that actually needs a whole-stroke-at-once
+     technique (see "alpha exactly once" below), so it alone uses a second
+     `liveCanvas`/`liveCtx`, stacked on top, holding just the current
+     in-progress highlighter stroke via an incrementally-extended Path2D
+     (`livePath`) — never rebuilt from scratch — clipped to that stroke's
+     own bounding box (`liveBounds`, updated in O(1) per point) rather than
+     the whole page height, since clearing/compositing a page-tall canvas
+     on every event is itself expensive once a page is long enough,
+     independent of how many committed strokes exist. */
 (function(){
   var DB_NAME = 'hld-bible-ink';
   var DB_VERSION = 1;
@@ -193,12 +203,14 @@
   var wrap = null;
   var canvas = null;       // base layer: committed strokes only
   var ctx = null;
-  var liveCanvas = null;   // overlay: current in-progress pen/highlighter stroke only
+  var liveCanvas = null;   // overlay: current in-progress HIGHLIGHTER stroke only (pen/eraser draw straight to the base)
   var liveCtx = null;
   var currentRoute = null;
   var strokes = [];        // committed entries, RELATIVE coords
   var undoStack = [];      // snapshots of `strokes` taken before each mutating gesture
   var liveStroke = null;   // points of the in-progress draw/erase gesture (PIXEL coords), or the string 'stroke-erase'
+  var livePath = null;     // Path2D, only for a live highlighter stroke — extended incrementally, never rebuilt
+  var liveBounds = null;   // {minX,maxX,minY,maxY}, only for a live highlighter stroke's own bounding box
   var dpr = window.devicePixelRatio || 1;
 
   function currentDrawStyle(){
@@ -208,11 +220,6 @@
       return { color: prefs.highlighter.color, alpha: HL_ALPHA, width: HL_WIDTHS[prefs.highlighter.widthKey] || HL_WIDTHS.medium, cap: 'butt' };
     }
     return { color: prefs.pen.color, alpha: 1, width: PEN_WIDTHS[prefs.pen.widthKey] || PEN_WIDTHS.medium, cap: 'round' };
-  }
-
-  function liveDrawStyle(){
-    if (prefs.tool === 'eraser') return { erase: true, width: currentEraserSize() * 2 };
-    return currentDrawStyle();
   }
 
   function currentEraserSize(){
@@ -284,7 +291,13 @@
   var scratchCanvas = document.createElement('canvas');
   var scratchCtx = scratchCanvas.getContext('2d');
 
-  function strokePath(targetCtx, targetCanvas, path, style){
+  // clipRegion (optional): { x, y, w, h } in the SAME CSS-px coordinate
+  // space the path's points are in. When given, the scratch buffer is
+  // sized to just that region instead of the whole page — clearing and
+  // compositing a page-tall buffer on every live-drawing event is itself
+  // expensive once a page is long enough, regardless of how many
+  // committed strokes exist elsewhere on it.
+  function strokePath(targetCtx, targetCanvas, path, style, clipRegion){
     if (style.erase || style.alpha == null || style.alpha >= 1) {
       targetCtx.save();
       applyStrokeStyle(targetCtx, style);
@@ -292,13 +305,38 @@
       targetCtx.restore();
       return;
     }
-    if (scratchCanvas.width !== targetCanvas.width || scratchCanvas.height !== targetCanvas.height) {
-      scratchCanvas.width = targetCanvas.width;
-      scratchCanvas.height = targetCanvas.height;
+    var region = clipRegion || { x: 0, y: 0, w: targetCanvas.width / dpr, h: targetCanvas.height / dpr };
+    var neededW = Math.max(1, Math.ceil(region.w * dpr));
+    var neededH = Math.max(1, Math.ceil(region.h * dpr));
+    if (clipRegion) {
+      // Live drawing: grow-only, with headroom, and NEVER shrink. Resizing
+      // a canvas element discards and reallocates its backing store, which
+      // is measurably expensive regardless of the resulting size. A live
+      // highlighter stroke's own bounding box grows on almost every event,
+      // so resizing the scratch canvas to fit it EXACTLY every time — even
+      // though each individual size was small — was the actual dominant
+      // per-event cost, not the compositing itself. Growing with margin
+      // means this happens a handful of times per stroke at most, not once
+      // per event.
+      if (neededW > scratchCanvas.width || neededH > scratchCanvas.height) {
+        scratchCanvas.width = Math.max(scratchCanvas.width, Math.ceil(neededW * 1.5));
+        scratchCanvas.height = Math.max(scratchCanvas.height, Math.ceil(neededH * 1.5));
+      }
+    } else {
+      // Full-page replay (redraw(), infrequent — not the hot path): exact
+      // size, no headroom multiplier. Applying the 1.5x live-drawing
+      // headroom HERE too once caused the scratch canvas to exceed the
+      // browser's max canvas dimensions on a real chapter-height page,
+      // which makes the canvas silently fail every draw call — no thrown
+      // error, just a permanently blank result, despite correct data.
+      if (scratchCanvas.width !== neededW || scratchCanvas.height !== neededH) {
+        scratchCanvas.width = neededW;
+        scratchCanvas.height = neededH;
+      }
     }
     scratchCtx.setTransform(1, 0, 0, 1, 0, 0);
-    scratchCtx.clearRect(0, 0, scratchCanvas.width, scratchCanvas.height);
-    scratchCtx.setTransform(targetCtx.getTransform());
+    scratchCtx.clearRect(0, 0, neededW, neededH);
+    scratchCtx.setTransform(dpr, 0, 0, dpr, -region.x * dpr, -region.y * dpr);
     scratchCtx.save();
     applyStrokeStyle(scratchCtx, style, true);
     scratchCtx.stroke(path);
@@ -308,7 +346,7 @@
     targetCtx.setTransform(1, 0, 0, 1, 0, 0);
     targetCtx.globalCompositeOperation = 'source-over';
     targetCtx.globalAlpha = style.alpha;
-    targetCtx.drawImage(scratchCanvas, 0, 0);
+    targetCtx.drawImage(scratchCanvas, 0, 0, neededW, neededH, Math.round(region.x * dpr), Math.round(region.y * dpr), neededW, neededH);
     targetCtx.restore();
   }
 
@@ -363,14 +401,63 @@
     strokes.forEach(function(entry){ paintEntry(entry, w, h); });
   }
 
-  // Repaints ONLY the live overlay with the current in-progress pen/
-  // highlighter stroke — cheap, since it never touches committed strokes.
-  function redrawLiveOverlay(){
-    if (!liveCtx || !liveMetrics) return;
-    liveCtx.clearRect(0, 0, liveMetrics.w, liveMetrics.h);
-    if (Array.isArray(liveStroke) && liveStroke.length > 1) {
-      strokePath(liveCtx, liveCanvas, buildPathFromPoints(liveStroke), liveDrawStyle());
+  // Pen: opaque, no alpha-compounding concern, so — exactly like the eraser
+  // below — the newest segment is drawn directly and permanently onto the
+  // BASE canvas as the gesture moves. O(1) per event, no clearing, no path
+  // rebuilding, and nothing to "bake in" later since it's already there.
+  function drawLiveSegmentToBase(points, i, style){
+    var p1 = points[i - 1], p2 = points[i];
+    if (Math.hypot(p2.x - p1.x, p2.y - p1.y) > MAX_JUMP) return;
+    var start = i >= 2 ? midpoint(points[i - 2], p1) : p1;
+    var end = midpoint(p1, p2);
+    ctx.save();
+    ctx.globalCompositeOperation = 'source-over';
+    ctx.globalAlpha = 1;
+    ctx.strokeStyle = style.color;
+    ctx.lineWidth = style.width;
+    ctx.lineCap = style.cap || 'round';
+    ctx.lineJoin = 'round';
+    ctx.beginPath();
+    ctx.moveTo(start.x, start.y);
+    ctx.quadraticCurveTo(p1.x, p1.y, end.x, end.y);
+    ctx.stroke();
+    ctx.restore();
+  }
+
+  // Highlighter: the one tool that genuinely needs whole-stroke-at-once
+  // alpha (see strokePath) — extends the live Path2D by exactly one
+  // segment (never rebuilds from the full points array) and grows the
+  // stroke's own running bounding box, both O(1) per point.
+  function extendLiveHighlighterPath(p1, p2){
+    if (Math.hypot(p2.x - p1.x, p2.y - p1.y) > MAX_JUMP) {
+      livePath.moveTo(p2.x, p2.y);
+    } else {
+      var mid = midpoint(p1, p2);
+      livePath.quadraticCurveTo(p1.x, p1.y, mid.x, mid.y);
     }
+    liveBounds.minX = Math.min(liveBounds.minX, p2.x);
+    liveBounds.maxX = Math.max(liveBounds.maxX, p2.x);
+    liveBounds.minY = Math.min(liveBounds.minY, p2.y);
+    liveBounds.maxY = Math.max(liveBounds.maxY, p2.y);
+  }
+
+  function liveHighlighterClip(style){
+    var pad = style.width / 2 + 6;
+    var x = Math.max(0, liveBounds.minX - pad);
+    var y = Math.max(0, liveBounds.minY - pad);
+    var maxX = liveMetrics ? Math.min(liveMetrics.w, liveBounds.maxX + pad) : liveBounds.maxX + pad;
+    var maxY = liveMetrics ? Math.min(liveMetrics.h, liveBounds.maxY + pad) : liveBounds.maxY + pad;
+    return { x: x, y: y, w: Math.max(1, maxX - x), h: Math.max(1, maxY - y) };
+  }
+
+  // Repaints ONLY the region the live highlighter stroke's own bounding box
+  // covers, not the whole page — see file header for why that matters.
+  function redrawLiveOverlay(){
+    if (!liveCtx || !livePath || !liveBounds) return;
+    var style = currentDrawStyle();
+    var clip = liveHighlighterClip(style);
+    liveCtx.clearRect(clip.x, clip.y, clip.w, clip.h);
+    strokePath(liveCtx, liveCanvas, livePath, style, clip);
   }
 
   // Precision/standard eraser: destination-out has no compounding-alpha
@@ -398,8 +485,19 @@
     if (currentRoute) saveRoute(currentRoute, strokes);
   }
 
+  // A shallow copy is enough: an existing entry is never mutated in place
+  // once committed (only pushed, spliced out, or the whole array replaced),
+  // so sharing entry references across snapshots is safe. The previous
+  // JSON.parse(JSON.stringify(strokes)) deep-cloned every point of every
+  // stroke ever drawn on the page, on every single pointerdown, regardless
+  // of tool — cost scaling with ALL accumulated content, not the current
+  // gesture. On a page with real content built up over repeated testing,
+  // that alone is enough to block the very first render of a new stroke
+  // for hundreds of milliseconds — matching "draw/erase, then a beat before
+  // ink shows up" exactly, and explaining why drawing and erasing were
+  // equally affected despite going through otherwise-unrelated code paths.
   function snapshotForUndo(){
-    undoStack.push(JSON.parse(JSON.stringify(strokes)));
+    undoStack.push(strokes.slice());
     if (undoStack.length > UNDO_LIMIT) undoStack.shift();
   }
 
@@ -511,6 +609,11 @@
       return;
     }
     liveStroke = [point];
+    if (prefs.tool === 'highlighter') {
+      livePath = new Path2D();
+      livePath.moveTo(point.x, point.y);
+      liveBounds = { minX: point.x, maxX: point.x, minY: point.y, maxY: point.y };
+    }
   }
 
   function onPointerMove(e){
@@ -532,11 +635,15 @@
       return;
     }
 
+    var prevPoint = liveStroke[liveStroke.length - 1];
     liveStroke.push(newPoint);
     if (prefs.tool === 'eraser') {
       eraseLiveSegment(liveStroke, liveStroke.length - 1, currentEraserSize() * 2);
-    } else {
+    } else if (prefs.tool === 'highlighter') {
+      extendLiveHighlighterPath(prevPoint, newPoint);
       redrawLiveOverlay();
+    } else {
+      drawLiveSegmentToBase(liveStroke, liveStroke.length - 1, currentDrawStyle());
     }
   }
 
@@ -571,8 +678,18 @@
         var style = currentDrawStyle();
         strokes.push({ type: 'draw', color: style.color, alpha: style.alpha, width: style.width, points: relPoints });
         persist();
-        redraw(); // bake the finished stroke into the base layer, once
-        if (liveCtx) liveCtx.clearRect(0, 0, w, h); // now redundant with the base layer
+        if (prefs.tool === 'highlighter') {
+          // Unlike pen, the base canvas never had this stroke directly —
+          // only the live overlay did — so it needs one full bake-in.
+          redraw();
+          if (liveCtx && liveBounds) {
+            var clip = liveHighlighterClip(style);
+            liveCtx.clearRect(clip.x, clip.y, clip.w, clip.h);
+          }
+        }
+        // pen: already drawn directly and permanently onto the base canvas
+        // as the gesture progressed (see drawLiveSegmentToBase) — nothing
+        // further to bake in.
       }
     } else {
       // A tap (no drag) never got its own entry — pop the unused undo snapshot.
@@ -580,13 +697,16 @@
     }
     liveStroke = null;
     liveMetrics = null;
+    livePath = null;
+    liveBounds = null;
   }
 
   function mount(routeKey){
     if (canvas && canvas.parentNode) canvas.parentNode.removeChild(canvas);
     if (liveCanvas && liveCanvas.parentNode) liveCanvas.parentNode.removeChild(liveCanvas);
     canvas = null; ctx = null; liveCanvas = null; liveCtx = null;
-    wrap = null; strokes = []; liveStroke = null; currentRoute = null; undoStack = [];
+    wrap = null; strokes = []; liveStroke = null; liveMetrics = null; livePath = null; liveBounds = null;
+    currentRoute = null; undoStack = [];
     hideEraserCursor();
     updateToolbarVisibility(!!routeKey);
     if (!routeKey) return;
