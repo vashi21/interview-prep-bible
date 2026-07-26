@@ -1,15 +1,24 @@
 /* HLD Interview-Prep Bible — Apple Pencil annotation layer (personal-site SPA
-   only). Draws only on pointerType "pen" so a finger keeps scrolling/tapping
-   links normally. Strokes are stored as fractions of the content box (0-1),
-   not pixels, so a rotation/reflow rescales the whole drawing along with the
+   only). Strokes are stored as fractions of the content box (0-1), not
+   pixels, so a rotation/reflow rescales the whole drawing along with the
    text instead of leaving it behind. Native pinch-zoom needs no special
    handling: the browser scales the canvas and the content together as one
    unit. Persisted in IndexedDB, one record per route — real on-device
    storage, durable across closing the app/rebooting, no backend needed for
-   this MVP (a later phase adds one for cross-device sync). While an actual
-   pencil stroke is in progress, page scroll is locked via `touch-action`
-   (see lockScroll/unlockScroll) — Pencil-down always means draw/erase,
-   never scroll, matching how GoodNotes/Notes behave. */
+   this MVP (a later phase adds one for cross-device sync).
+
+   Scroll-lock model: the toolbar starts COLLAPSED, and while it's collapsed
+   the Pencil is fully inert — it does not draw, does not preventDefault,
+   and touch-action is left at its default, so both a finger and the Pencil
+   scroll the page normally. Expanding the toolbar (tapping the FAB) is the
+   explicit "start annotating" action: at that point touch-action is set to
+   "none" on <html> for as long as the toolbar stays expanded. Setting it
+   this way — statically, the moment the toolbar opens, not reactively
+   inside a pointerdown handler — matters: on iOS Safari, toggling
+   touch-action only once a touch has already begun can be too late for the
+   native scroll gesture recognizer, which decides based on the CSS in
+   effect when the touch starts. Locking it well in advance of any stroke
+   is what actually stops the page from moving while drawing. */
 (function(){
   var DB_NAME = 'hld-bible-ink';
   var DB_VERSION = 1;
@@ -27,7 +36,7 @@
   function defaultPrefs(){
     return {
       tool: 'pen',
-      collapsed: false,
+      collapsed: true,
       pen: { color: DEFAULT_PEN_COLOR, widthKey: 'medium' },
       highlighter: { color: DEFAULT_HL_COLOR, widthKey: 'medium' },
       eraser: { mode: 'standard', precisionSize: 6, standardSize: 20, strokeSize: 16 }
@@ -226,13 +235,6 @@
     if (undoStack.length > UNDO_LIMIT) undoStack.shift();
   }
 
-  // ---- scroll lock: an active pencil stroke should never scroll the page,
-  // regardless of which tool is selected. Toggled on document.documentElement
-  // only for the span of one pointerdown-to-up/cancel gesture, so finger
-  // scroll/pinch-zoom are completely unaffected the rest of the time. ----
-  function lockScroll(){ document.documentElement.style.touchAction = 'none'; }
-  function unlockScroll(){ document.documentElement.style.touchAction = ''; }
-
   function distToSegment(px, py, x1, y1, x2, y2){
     var dx = x2 - x1, dy = y2 - y1;
     var lenSq = dx * dx + dy * dy;
@@ -264,9 +266,8 @@
   }
 
   function onPointerDown(e){
-    if (e.pointerType !== 'pen' || !wrap || !canvas) return;
+    if (e.pointerType !== 'pen' || !wrap || !canvas || prefs.collapsed) return;
     e.preventDefault();
-    lockScroll();
     snapshotForUndo();
     var rect = wrap.getBoundingClientRect();
     var point = { x: e.clientX - rect.left, y: e.clientY - rect.top, p: e.pressure || 0.5 };
@@ -305,7 +306,6 @@
   function onPointerUp(e){
     if (e.pointerType !== 'pen' || !liveStroke) return;
     e.preventDefault();
-    unlockScroll();
 
     if (liveStroke === 'stroke-erase') {
       liveStroke = null;
@@ -395,20 +395,27 @@
   }
 
   // ---- toolbar ----
+  // Single place that decides both toolbar visibility AND scroll-lock, so
+  // the two can never drift apart: touch-action is "none" exactly when the
+  // toolbar is open on a real route, set here — well before any stroke
+  // begins — rather than inside a pointer handler (see the file header for
+  // why that timing matters on iOS Safari).
   function updateToolbarVisibility(show){
     var bar = document.getElementById('ink-toolbar');
     var fab = document.getElementById('ink-fab');
+    var annotating = show && !prefs.collapsed;
+    document.documentElement.style.touchAction = annotating ? 'none' : '';
     if (!show) {
       if (bar) bar.style.display = 'none';
       if (fab) fab.style.display = 'none';
       return;
     }
-    if (prefs.collapsed) {
-      if (bar) bar.style.display = 'none';
-      if (fab) fab.style.display = 'flex';
-    } else {
+    if (annotating) {
       if (bar) bar.style.display = 'flex';
       if (fab) fab.style.display = 'none';
+    } else {
+      if (bar) bar.style.display = 'none';
+      if (fab) fab.style.display = 'flex';
     }
   }
 
@@ -567,10 +574,12 @@
     resizeTimer = setTimeout(sizeCanvas, 150);
   });
 
-  document.addEventListener('pointerdown', onPointerDown, { passive: false });
-  document.addEventListener('pointermove', onPointerMove, { passive: false });
-  document.addEventListener('pointerup', onPointerUp, { passive: false });
-  document.addEventListener('pointercancel', onPointerUp, { passive: false });
+  // capture:true so preventDefault() runs as early in the dispatch as
+  // possible — belt-and-suspenders alongside the static touch-action lock.
+  document.addEventListener('pointerdown', onPointerDown, { passive: false, capture: true });
+  document.addEventListener('pointermove', onPointerMove, { passive: false, capture: true });
+  document.addEventListener('pointerup', onPointerUp, { passive: false, capture: true });
+  document.addEventListener('pointercancel', onPointerUp, { passive: false, capture: true });
 
   function init(){ buildToolbar(); }
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', init);
