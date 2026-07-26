@@ -366,9 +366,8 @@
   // Repaints ONLY the live overlay with the current in-progress pen/
   // highlighter stroke — cheap, since it never touches committed strokes.
   function redrawLiveOverlay(){
-    if (!liveCtx || !wrap) return;
-    var w = wrap.scrollWidth, h = wrap.scrollHeight;
-    liveCtx.clearRect(0, 0, w, h);
+    if (!liveCtx || !liveMetrics) return;
+    liveCtx.clearRect(0, 0, liveMetrics.w, liveMetrics.h);
     if (Array.isArray(liveStroke) && liveStroke.length > 1) {
       strokePath(liveCtx, liveCanvas, buildPathFromPoints(liveStroke), liveDrawStyle());
     }
@@ -468,6 +467,18 @@
   var fingerScroll = null;
   var scrollRafPending = false;
 
+  // wrap.getBoundingClientRect()/scrollWidth/scrollHeight are geometry reads
+  // that can force a synchronous layout recompute — cheap in isolation, but
+  // .wrap holds an entire chapter's worth of content (text, tables,
+  // diagrams), so on real hardware that recompute is expensive enough that
+  // doing it on every single pointermove (Pencil sampling is fast) is what
+  // caused the remaining draw/erase lag even after the redraw-scoping fix.
+  // .wrap's geometry cannot change during a single gesture (scroll is
+  // locked while annotating; nothing else in the gesture touches layout),
+  // so it's cached once at pointerdown and reused for the rest of that
+  // gesture instead of re-queried on every move.
+  var liveMetrics = null; // { left, top, w, h }
+
   function applyPendingScroll(){
     scrollRafPending = false;
     if (!fingerScroll || touchPointerIds.size !== 1) return;
@@ -491,12 +502,12 @@
     e.preventDefault();
     snapshotForUndo();
     var rect = wrap.getBoundingClientRect();
-    var point = { x: e.clientX - rect.left, y: e.clientY - rect.top, p: e.pressure || 0.5 };
+    liveMetrics = { left: rect.left, top: rect.top, w: wrap.scrollWidth, h: wrap.scrollHeight };
+    var point = { x: e.clientX - liveMetrics.left, y: e.clientY - liveMetrics.top, p: e.pressure || 0.5 };
 
     if (prefs.tool === 'eraser' && prefs.eraser.mode === 'stroke') {
       liveStroke = 'stroke-erase';
-      var w = wrap.scrollWidth, h = wrap.scrollHeight;
-      if (eraseStrokesNear(point.x, point.y, currentEraserSize(), w, h)) redraw();
+      if (eraseStrokesNear(point.x, point.y, currentEraserSize(), liveMetrics.w, liveMetrics.h)) redraw();
       return;
     }
     liveStroke = [point];
@@ -512,14 +523,12 @@
     }
     if (e.pointerType !== 'pen') return;
     if (prefs.tool === 'eraser' && !prefs.collapsed && currentRoute) updateEraserCursor(e.clientX, e.clientY);
-    if (!liveStroke) return;
+    if (!liveStroke || !liveMetrics) return;
     e.preventDefault();
-    var rect = wrap.getBoundingClientRect();
-    var newPoint = { x: e.clientX - rect.left, y: e.clientY - rect.top, p: e.pressure || 0.5 };
+    var newPoint = { x: e.clientX - liveMetrics.left, y: e.clientY - liveMetrics.top, p: e.pressure || 0.5 };
 
     if (liveStroke === 'stroke-erase') {
-      var w = wrap.scrollWidth, h = wrap.scrollHeight;
-      if (eraseStrokesNear(newPoint.x, newPoint.y, currentEraserSize(), w, h)) redraw();
+      if (eraseStrokesNear(newPoint.x, newPoint.y, currentEraserSize(), liveMetrics.w, liveMetrics.h)) redraw();
       return;
     }
 
@@ -544,12 +553,13 @@
 
     if (liveStroke === 'stroke-erase') {
       liveStroke = null;
+      liveMetrics = null;
       persist();
       return;
     }
 
-    if (liveStroke.length > 1 && wrap) {
-      var w = wrap.scrollWidth, h = wrap.scrollHeight;
+    if (liveStroke.length > 1 && liveMetrics) {
+      var w = liveMetrics.w, h = liveMetrics.h;
       var relPoints = liveStroke.map(function(p){ return { x: p.x / w, y: p.y / h, p: p.p }; });
       if (prefs.tool === 'eraser') {
         // Base canvas already reflects the erasing — it was applied
@@ -569,6 +579,7 @@
       undoStack.pop();
     }
     liveStroke = null;
+    liveMetrics = null;
   }
 
   function mount(routeKey){
