@@ -362,12 +362,12 @@ footer.colophon p{color:var(--ink-faint);margin-bottom:.6em;}
 .ink-canvas{position:absolute;top:0;left:0;pointer-events:none;z-index:5;}
 
 .ink-toolbar{
-  position:fixed;bottom:1rem;right:1rem;z-index:50;display:none;flex-direction:column;gap:.5rem;
-  width:19rem;max-width:calc(100vw - 2rem);background:var(--bg-raised);border:1px solid var(--border-strong);
-  border-radius:6px;padding:.6rem;box-shadow:0 4px 16px var(--shadow);
+  position:fixed;top:0;left:0;right:0;z-index:50;display:none;flex-direction:column;gap:.35rem;
+  background:var(--bg-raised);border:none;border-bottom:1px solid var(--border-strong);
+  padding:.45rem .6rem;box-shadow:0 2px 12px var(--shadow);
 }
 .ink-row{display:flex;gap:.35rem;flex-wrap:wrap;align-items:center;}
-.ink-row-options{border-top:1px dashed var(--border);padding-top:.55rem;min-height:2.2rem;}
+.ink-row-options{border-top:1px dashed var(--border);padding-top:.4rem;min-height:1.9rem;}
 
 .ink-toolbar button{
   font-family:var(--font-mono);font-size:.66rem;letter-spacing:.02em;text-transform:uppercase;
@@ -400,9 +400,9 @@ footer.colophon p{color:var(--ink-faint);margin-bottom:.6em;}
 .ink-eraser-size{flex:1 1 100px;min-width:80px;accent-color:var(--accent);}
 
 .ink-fab{
-  position:fixed;bottom:1rem;right:1rem;z-index:50;display:none;align-items:center;justify-content:center;
-  width:2.7rem;height:2.7rem;border-radius:50%;border:1px solid var(--border-strong);
-  background:var(--bg-raised);color:var(--ink);font-size:1.15rem;cursor:pointer;box-shadow:0 2px 10px var(--shadow);
+  position:fixed;top:.6rem;right:.6rem;z-index:50;display:none;align-items:center;justify-content:center;
+  width:2.4rem;height:2.4rem;border-radius:50%;border:1px solid var(--border-strong);
+  background:var(--bg-raised);color:var(--ink);font-size:1.05rem;cursor:pointer;box-shadow:0 2px 10px var(--shadow);
 }
 
 .ink-eraser-cursor{
@@ -678,36 +678,41 @@ window.__VOLUME_SELECTOR_HTML__ = "<div class=\"wrap\"><header class=\"hero\"><p
    *pointer type* — it can't single out the Pencil and leave a finger
    unaffected. So disabling native one-finger panning necessarily disables
    it for a finger too. To keep finger-scrolling fully working regardless of
-   annotation state (the actual requirement), a finger's one-finger drag is
-   re-implemented here as a plain 1:1 `window.scrollTo` follow (see
-   fingerScroll below), applied once per animation frame via
-   requestAnimationFrame rather than once per raw pointermove — calling
-   scrollTo synchronously on every event is what made it feel glitchy,
-   since touchmove can fire faster than layout/paint can keep up; batching
-   to one call per frame is the standard fix. Deliberately still no
-   momentum/fling after lift — replicating that physics exactly is out of
-   scope, a direct drag-to-scroll is what matters. The moment a second
-   finger joins, this manual tracking backs off and the browser's own
-   native pinch-zoom (still permitted by touch-action) takes over.
+   annotation state, a finger's one-finger drag is re-implemented as an
+   incremental `window.scrollBy` follow (see fingerScroll below), applied
+   once per animation frame rather than once per raw pointermove. It tracks
+   the delta since the LAST applied frame (not the delta since the original
+   touch-down) specifically so it self-corrects if the browser ever clamps
+   the scroll position (top/bottom of page) instead of drifting out of sync.
+   Deliberately still no momentum/fling after lift. The moment a second
+   finger joins, this manual tracking backs off and the browser's own native
+   pinch-zoom (still permitted by touch-action) takes over.
 
-   Strokes are drawn as a sequence of small quadratic curves through the
-   midpoints of consecutive points (a standard freehand-smoothing trick),
-   not straight lineTo segments — straight segments only looked smooth at
-   slow, densely-sampled speeds; at normal writing speed the sparser points
-   made fast strokes and eraser drags look faceted/jagged. The same helper
-   draws both the live in-progress stroke and the full replay in
-   `paintEntry`, so nothing changes appearance the moment a stroke commits.
-
-   Eraser size is a RADIUS throughout (matches the size slider and the
-   circular cursor preview drawn at the Pencil's position while erasing);
-   the destination-out stroke used for precision/standard erasing uses
-   double that as its line width (a line's width is its diameter). */
+   Stroke rendering: every stroke (pen, highlighter, or an eraser drag) is
+   built as ONE continuous Path2D — a sequence of quadratic curves through
+   the midpoints of consecutive points, a standard freehand-smoothing trick
+   — and painted with a SINGLE ctx.stroke() call. This matters more than it
+   sounds: an earlier version stroked each tiny segment independently, which
+   is fine for an opaque pen but visibly wrong for the semi-transparent
+   highlighter — each independently-stroked segment re-blends its alpha
+   where it overlaps its neighbor (which happens constantly, by
+   construction, at round caps and curve joins), so the highlighter came out
+   as a jagged chain of darker/lighter patches instead of one clean band.
+   Building the whole stroke as one path and stroking it once applies the
+   alpha exactly once, uniformly. The same path-builder handles a stray
+   large jump between two samples (a tracking glitch, not real movement) by
+   starting a new sub-path instead of connecting it with a long line.
+   Pressure is still recorded per point but no longer affects width — a
+   single consistent width per stroke (from the selected thickness preset)
+   reads as cleaner and more predictable than continuous pressure-driven
+   width jitter did. */
 (function(){
   var DB_NAME = 'hld-bible-ink';
   var DB_VERSION = 1;
   var STORE = 'routes';
   var PREFS_KEY = 'hld-bible-ink-prefs';
   var UNDO_LIMIT = 20;
+  var MAX_JUMP = 60; // CSS px between consecutive samples beyond which we treat it as a tracking glitch
 
   var PALETTE = ['#1a1a1a', '#e5484d', '#2f6fed', '#2fa84f', '#e8871e', '#8a3ffc'];
   var PEN_WIDTHS = { thin: 1.5, medium: 3, thick: 6 };
@@ -828,18 +833,21 @@ window.__VOLUME_SELECTOR_HTML__ = "<div class=\"wrap\"><header class=\"hero\"><p
   var currentRoute = null;
   var strokes = [];        // committed entries, RELATIVE coords
   var undoStack = [];      // snapshots of `strokes` taken before each mutating gesture
-  var liveStroke = null;   // points of the in-progress draw/erase gesture, PIXEL coords
+  var liveStroke = null;   // points of the in-progress draw/erase gesture (PIXEL coords), or the string 'stroke-erase'
   var dpr = window.devicePixelRatio || 1;
 
   function currentDrawStyle(){
     if (prefs.tool === 'highlighter') {
-      // Flat caps + constant width (no pressure modulation): a highlighter
-      // is a wide flat-tip marker in real life, not pressure-sensitive like
-      // a pen — modulating its width per point is what made it look like a
-      // lumpy chain of blobs instead of a clean flat highlight band.
-      return { color: prefs.highlighter.color, alpha: HL_ALPHA, width: HL_WIDTHS[prefs.highlighter.widthKey] || HL_WIDTHS.medium, cap: 'butt', pressureSensitive: false };
+      // Flat caps + constant width: a highlighter is a wide flat-tip marker
+      // in real life, not pressure-sensitive like a pen.
+      return { color: prefs.highlighter.color, alpha: HL_ALPHA, width: HL_WIDTHS[prefs.highlighter.widthKey] || HL_WIDTHS.medium, cap: 'butt' };
     }
-    return { color: prefs.pen.color, alpha: 1, width: PEN_WIDTHS[prefs.pen.widthKey] || PEN_WIDTHS.medium, cap: 'round', pressureSensitive: true };
+    return { color: prefs.pen.color, alpha: 1, width: PEN_WIDTHS[prefs.pen.widthKey] || PEN_WIDTHS.medium, cap: 'round' };
+  }
+
+  function liveDrawStyle(){
+    if (prefs.tool === 'eraser') return { erase: true, width: currentEraserSize() * 2 };
+    return currentDrawStyle();
   }
 
   function currentEraserSize(){
@@ -868,47 +876,86 @@ window.__VOLUME_SELECTOR_HTML__ = "<div class=\"wrap\"><header class=\"hero\"><p
     redraw();
   }
 
-  function lineWidthFor(baseWidth, pressure){
-    return baseWidth * (0.45 + 0.9 * (pressure == null ? 0.5 : pressure));
-  }
-
   function midpoint(a, b){
     return { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 };
   }
 
-  function applyStrokeStyle(style, pressure){
+  function applyStrokeStyle(targetCtx, style, forceOpaque){
     if (style.erase) {
-      ctx.globalCompositeOperation = 'destination-out';
-      ctx.globalAlpha = 1;
-      ctx.strokeStyle = '#000';
-      ctx.lineWidth = style.width; // already a diameter — see file header
+      targetCtx.globalCompositeOperation = 'destination-out';
+      targetCtx.globalAlpha = 1;
+      targetCtx.strokeStyle = '#000';
+      targetCtx.lineWidth = style.width; // already a diameter — see file header
     } else {
-      ctx.globalCompositeOperation = 'source-over';
-      ctx.globalAlpha = style.alpha == null ? 1 : style.alpha;
-      ctx.strokeStyle = style.color;
-      ctx.lineWidth = style.pressureSensitive ? lineWidthFor(style.width, pressure) : style.width;
+      targetCtx.globalCompositeOperation = 'source-over';
+      targetCtx.globalAlpha = forceOpaque ? 1 : (style.alpha == null ? 1 : style.alpha);
+      targetCtx.strokeStyle = style.color;
+      targetCtx.lineWidth = style.width;
     }
-    ctx.lineCap = style.cap || 'round';
-    ctx.lineJoin = 'round';
+    targetCtx.lineCap = style.cap || 'round';
+    targetCtx.lineJoin = 'round';
   }
 
-  // Draws the segment ending at points[i] as a small quadratic curve through
-  // the midpoints on either side of points[i-1], using points[i-1] itself as
-  // the control point — the standard freehand-smoothing technique. Each call
-  // strokes only the new increment (no re-stroking of earlier segments), so
-  // it's safe to call once per new point during live drawing as well as
-  // once per point during a full replay.
-  function drawSmoothSegment(style, points, i){
-    var p1 = points[i - 1], p2 = points[i];
-    var start = i >= 2 ? midpoint(points[i - 2], p1) : p1;
-    var end = midpoint(p1, p2);
+  // A stroke's own geometry can self-overlap (a thick highlighter tracing a
+  // tight turn covers the same pixels twice), and even a single stroke()
+  // call double-blends a semi-transparent color at such an overlap — this
+  // is what made the highlighter look inconsistently blotchy. For anything
+  // with alpha < 1, draw the path fully opaque onto an offscreen scratch
+  // canvas first (self-overlap there is a no-op — opaque-on-opaque is still
+  // opaque), then composite that scratch canvas onto the real canvas ONCE
+  // at the target alpha, so the whole stroke gets the same opacity exactly
+  // once no matter how many times its own outline crosses itself.
+  var scratchCanvas = document.createElement('canvas');
+  var scratchCtx = scratchCanvas.getContext('2d');
+
+  function strokePath(path, style){
+    if (style.erase || style.alpha == null || style.alpha >= 1) {
+      ctx.save();
+      applyStrokeStyle(ctx, style);
+      ctx.stroke(path);
+      ctx.restore();
+      return;
+    }
+    if (scratchCanvas.width !== canvas.width || scratchCanvas.height !== canvas.height) {
+      scratchCanvas.width = canvas.width;
+      scratchCanvas.height = canvas.height;
+    }
+    scratchCtx.setTransform(1, 0, 0, 1, 0, 0);
+    scratchCtx.clearRect(0, 0, scratchCanvas.width, scratchCanvas.height);
+    scratchCtx.setTransform(ctx.getTransform());
+    scratchCtx.save();
+    applyStrokeStyle(scratchCtx, style, true);
+    scratchCtx.stroke(path);
+    scratchCtx.restore();
+
     ctx.save();
-    applyStrokeStyle(style, p2.p);
-    ctx.beginPath();
-    ctx.moveTo(start.x, start.y);
-    ctx.quadraticCurveTo(p1.x, p1.y, end.x, end.y);
-    ctx.stroke();
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    ctx.globalCompositeOperation = 'source-over';
+    ctx.globalAlpha = style.alpha;
+    ctx.drawImage(scratchCanvas, 0, 0);
     ctx.restore();
+  }
+
+  // Builds ONE continuous path for a whole stroke: quadratic curves through
+  // point midpoints, ending with a short line to the true last point so the
+  // stroke doesn't stop short at a midpoint. A gap larger than MAX_JUMP
+  // starts a fresh sub-path instead of connecting it with a long line.
+  function buildPathFromPoints(points){
+    var path = new Path2D();
+    if (!points.length) return path;
+    path.moveTo(points[0].x, points[0].y);
+    for (var i = 0; i < points.length - 1; i++){
+      var curr = points[i], next = points[i + 1];
+      if (Math.hypot(next.x - curr.x, next.y - curr.y) > MAX_JUMP) {
+        path.moveTo(next.x, next.y);
+        continue;
+      }
+      var mid = midpoint(curr, next);
+      path.quadraticCurveTo(curr.x, curr.y, mid.x, mid.y);
+    }
+    var last = points[points.length - 1];
+    path.lineTo(last.x, last.y);
+    return path;
   }
 
   function entryToPixelPoints(entry, w, h){
@@ -922,12 +969,12 @@ window.__VOLUME_SELECTOR_HTML__ = "<div class=\"wrap\"><header class=\"hero\"><p
     if (entry.type === 'erase') {
       style = { erase: true, width: entry.width };
     } else {
-      // cap/pressureSensitive aren't persisted — derived from alpha so old
-      // saved entries (before this distinction existed) still replay right.
+      // cap isn't persisted — derived from alpha so entries saved before
+      // this distinction existed still replay with the right look.
       var isHighlighter = entry.alpha != null && entry.alpha < 1;
-      style = { color: entry.color, alpha: entry.alpha, width: entry.width, cap: isHighlighter ? 'butt' : 'round', pressureSensitive: !isHighlighter };
+      style = { color: entry.color, alpha: entry.alpha, width: entry.width, cap: isHighlighter ? 'butt' : 'round' };
     }
-    for (var i = 1; i < pts.length; i++) drawSmoothSegment(style, pts, i);
+    strokePath(buildPathFromPoints(pts), style);
   }
 
   function redraw(){
@@ -935,6 +982,9 @@ window.__VOLUME_SELECTOR_HTML__ = "<div class=\"wrap\"><header class=\"hero\"><p
     var w = wrap.scrollWidth, h = wrap.scrollHeight;
     ctx.clearRect(0, 0, w, h);
     strokes.forEach(function(entry){ paintEntry(entry, w, h); });
+    if (Array.isArray(liveStroke) && liveStroke.length > 1) {
+      strokePath(buildPathFromPoints(liveStroke), liveDrawStyle());
+    }
   }
 
   function persist(){
@@ -1000,21 +1050,22 @@ window.__VOLUME_SELECTOR_HTML__ = "<div class=\"wrap\"><header class=\"hero\"><p
   // touch-action:'pinch-zoom' (set while annotating) disables native
   // one-finger panning for EVERY pointer type, since touch-action can't
   // distinguish Pencil from finger. This replicates plain 1:1 finger
-  // scrolling by hand so it keeps working regardless of annotation state.
-  // Applied once per animation frame (not once per raw event — that's what
-  // made it feel glitchy) via requestAnimationFrame. Deliberately still no
-  // momentum after lift, see file header. Bails out the moment a second
-  // finger joins (touchPointerIds.size > 1) so the browser's own native
-  // pinch-zoom, still permitted by touch-action, takes over.
+  // scrolling so it keeps working regardless of annotation state, applied
+  // once per animation frame. Tracks the delta since the last APPLIED
+  // frame (not since the original touch-down) so it self-corrects if the
+  // browser clamps scroll position instead of drifting. Bails out the
+  // moment a second finger joins so the browser's own native pinch-zoom,
+  // still permitted by touch-action, takes over.
   var touchPointerIds = new Set();
   var fingerScroll = null;
   var scrollRafPending = false;
 
   function applyPendingScroll(){
     scrollRafPending = false;
-    if (fingerScroll && touchPointerIds.size === 1) {
-      window.scrollTo(window.scrollX, fingerScroll.scrollY - (fingerScroll.lastY - fingerScroll.y));
-    }
+    if (!fingerScroll || touchPointerIds.size !== 1) return;
+    var delta = fingerScroll.prevY - fingerScroll.lastY;
+    fingerScroll.prevY = fingerScroll.lastY;
+    if (delta !== 0) window.scrollBy(0, delta);
   }
 
   function onPointerDown(e){
@@ -1022,7 +1073,7 @@ window.__VOLUME_SELECTOR_HTML__ = "<div class=\"wrap\"><header class=\"hero\"><p
       touchPointerIds.add(e.pointerId);
       if (touchPointerIds.size > 1) { fingerScroll = null; return; }
       if (!prefs.collapsed && currentRoute && !e.target.closest('#ink-toolbar, #ink-fab')) {
-        fingerScroll = { pointerId: e.pointerId, y: e.clientY, lastY: e.clientY, scrollY: window.scrollY };
+        fingerScroll = { pointerId: e.pointerId, prevY: e.clientY, lastY: e.clientY };
       }
       return;
     }
@@ -1065,8 +1116,7 @@ window.__VOLUME_SELECTOR_HTML__ = "<div class=\"wrap\"><header class=\"hero\"><p
     }
 
     liveStroke.push(newPoint);
-    var style = prefs.tool === 'eraser' ? { erase: true, width: currentEraserSize() * 2 } : currentDrawStyle();
-    drawSmoothSegment(style, liveStroke, liveStroke.length - 1);
+    redraw();
   }
 
   function onPointerUp(e){
@@ -1101,6 +1151,7 @@ window.__VOLUME_SELECTOR_HTML__ = "<div class=\"wrap\"><header class=\"hero\"><p
       undoStack.pop();
     }
     liveStroke = null;
+    redraw();
   }
 
   function mount(routeKey){
