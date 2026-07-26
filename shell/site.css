@@ -29,6 +29,7 @@
 /* ---------- Apple Pencil annotation layer (shell/annotate.js) ---------- */
 .wrap{position:relative;}
 .ink-canvas{position:absolute;top:0;left:0;pointer-events:none;z-index:5;}
+.ink-canvas-live{z-index:6;} /* the in-progress stroke overlay, above the committed base layer */
 
 .ink-toolbar{
   position:fixed;top:0;left:0;right:0;z-index:50;display:none;flex-direction:column;gap:.35rem;

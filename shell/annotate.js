@@ -51,7 +51,24 @@
    Pressure is still recorded per point but no longer affects width — a
    single consistent width per stroke (from the selected thickness preset)
    reads as cleaner and more predictable than continuous pressure-driven
-   width jitter did. */
+   width jitter did.
+
+   Two-layer canvas, for latency: `canvas`/`ctx` holds every COMMITTED
+   stroke and is only fully repainted when `strokes` actually changes
+   (mount, undo, clear, resize, or a stroke finishing) — never on a raw
+   pointermove. A second `liveCanvas`/`liveCtx`, stacked on top, holds only
+   the CURRENT in-progress pen/highlighter stroke and is cheap to redraw on
+   every move since it never has to re-render everything else on the page.
+   An earlier version called a full clear-and-repaint-every-committed-stroke
+   on every single pointermove, which is fine with a handful of strokes but
+   becomes multi-second input lag once a page accumulates enough of them
+   (especially highlighter entries, each needing the scratch-canvas
+   composite below) — Pencil sampling far outpaces how long that full
+   repaint takes, so events queue up visibly behind the render.
+   Precision/standard erasing sidesteps this differently: since
+   destination-out has no compounding-alpha problem, it's applied
+   incrementally and permanently straight onto the BASE canvas as the
+   gesture moves, one new segment at a time — never a full repaint either. */
 (function(){
   var DB_NAME = 'hld-bible-ink';
   var DB_VERSION = 1;
@@ -174,8 +191,10 @@
 
   // ---- active canvas state (only one route is ever showing at a time) ----
   var wrap = null;
-  var canvas = null;
+  var canvas = null;       // base layer: committed strokes only
   var ctx = null;
+  var liveCanvas = null;   // overlay: current in-progress pen/highlighter stroke only
+  var liveCtx = null;
   var currentRoute = null;
   var strokes = [];        // committed entries, RELATIVE coords
   var undoStack = [];      // snapshots of `strokes` taken before each mutating gesture
@@ -204,14 +223,17 @@
   }
 
   function sizeCanvas(){
-    if (!wrap || !canvas) return;
-    // Shrink first: the canvas is an absolutely-positioned child of .wrap, so
-    // its own previous size otherwise feeds into wrap.scrollWidth/Height and
-    // any transient overshoot (e.g. a layout shift during font swap) becomes
-    // permanent and compounds on every later resize — a one-way ratchet that
-    // can inflate the page to tens of thousands of pixels of empty scroll.
+    if (!wrap || !canvas || !liveCanvas) return;
+    // Shrink first: both canvases are absolutely-positioned children of
+    // .wrap, so their own previous size otherwise feeds into
+    // wrap.scrollWidth/Height and any transient overshoot (e.g. a layout
+    // shift during font swap) becomes permanent and compounds on every
+    // later resize — a one-way ratchet that can inflate the page to tens
+    // of thousands of pixels of empty scroll.
     canvas.style.width = '0px';
     canvas.style.height = '0px';
+    liveCanvas.style.width = '0px';
+    liveCanvas.style.height = '0px';
     var w = wrap.scrollWidth, h = wrap.scrollHeight;
     canvas.style.width = w + 'px';
     canvas.style.height = h + 'px';
@@ -219,6 +241,14 @@
     canvas.height = Math.max(1, Math.round(h * dpr));
     ctx = canvas.getContext('2d');
     ctx.scale(dpr, dpr);
+
+    liveCanvas.style.width = w + 'px';
+    liveCanvas.style.height = h + 'px';
+    liveCanvas.width = Math.max(1, Math.round(w * dpr));
+    liveCanvas.height = Math.max(1, Math.round(h * dpr));
+    liveCtx = liveCanvas.getContext('2d');
+    liveCtx.scale(dpr, dpr);
+
     redraw();
   }
 
@@ -254,32 +284,32 @@
   var scratchCanvas = document.createElement('canvas');
   var scratchCtx = scratchCanvas.getContext('2d');
 
-  function strokePath(path, style){
+  function strokePath(targetCtx, targetCanvas, path, style){
     if (style.erase || style.alpha == null || style.alpha >= 1) {
-      ctx.save();
-      applyStrokeStyle(ctx, style);
-      ctx.stroke(path);
-      ctx.restore();
+      targetCtx.save();
+      applyStrokeStyle(targetCtx, style);
+      targetCtx.stroke(path);
+      targetCtx.restore();
       return;
     }
-    if (scratchCanvas.width !== canvas.width || scratchCanvas.height !== canvas.height) {
-      scratchCanvas.width = canvas.width;
-      scratchCanvas.height = canvas.height;
+    if (scratchCanvas.width !== targetCanvas.width || scratchCanvas.height !== targetCanvas.height) {
+      scratchCanvas.width = targetCanvas.width;
+      scratchCanvas.height = targetCanvas.height;
     }
     scratchCtx.setTransform(1, 0, 0, 1, 0, 0);
     scratchCtx.clearRect(0, 0, scratchCanvas.width, scratchCanvas.height);
-    scratchCtx.setTransform(ctx.getTransform());
+    scratchCtx.setTransform(targetCtx.getTransform());
     scratchCtx.save();
     applyStrokeStyle(scratchCtx, style, true);
     scratchCtx.stroke(path);
     scratchCtx.restore();
 
-    ctx.save();
-    ctx.setTransform(1, 0, 0, 1, 0, 0);
-    ctx.globalCompositeOperation = 'source-over';
-    ctx.globalAlpha = style.alpha;
-    ctx.drawImage(scratchCanvas, 0, 0);
-    ctx.restore();
+    targetCtx.save();
+    targetCtx.setTransform(1, 0, 0, 1, 0, 0);
+    targetCtx.globalCompositeOperation = 'source-over';
+    targetCtx.globalAlpha = style.alpha;
+    targetCtx.drawImage(scratchCanvas, 0, 0);
+    targetCtx.restore();
   }
 
   // Builds ONE continuous path for a whole stroke: quadratic curves through
@@ -320,17 +350,49 @@
       var isHighlighter = entry.alpha != null && entry.alpha < 1;
       style = { color: entry.color, alpha: entry.alpha, width: entry.width, cap: isHighlighter ? 'butt' : 'round' };
     }
-    strokePath(buildPathFromPoints(pts), style);
+    strokePath(ctx, canvas, buildPathFromPoints(pts), style);
   }
 
+  // Repaints the BASE layer (committed strokes) only — call when `strokes`
+  // actually changes (mount, undo, clear, resize, a stroke committing), not
+  // on every pointermove; see file header.
   function redraw(){
     if (!ctx || !wrap) return;
     var w = wrap.scrollWidth, h = wrap.scrollHeight;
     ctx.clearRect(0, 0, w, h);
     strokes.forEach(function(entry){ paintEntry(entry, w, h); });
+  }
+
+  // Repaints ONLY the live overlay with the current in-progress pen/
+  // highlighter stroke — cheap, since it never touches committed strokes.
+  function redrawLiveOverlay(){
+    if (!liveCtx || !wrap) return;
+    var w = wrap.scrollWidth, h = wrap.scrollHeight;
+    liveCtx.clearRect(0, 0, w, h);
     if (Array.isArray(liveStroke) && liveStroke.length > 1) {
-      strokePath(buildPathFromPoints(liveStroke), liveDrawStyle());
+      strokePath(liveCtx, liveCanvas, buildPathFromPoints(liveStroke), liveDrawStyle());
     }
+  }
+
+  // Precision/standard eraser: destination-out has no compounding-alpha
+  // problem, so each new segment is punched directly and permanently into
+  // the BASE canvas as the gesture moves — no full repaint needed.
+  function eraseLiveSegment(points, i, width){
+    var p1 = points[i - 1], p2 = points[i];
+    if (Math.hypot(p2.x - p1.x, p2.y - p1.y) > MAX_JUMP) return;
+    var start = i >= 2 ? midpoint(points[i - 2], p1) : p1;
+    var end = midpoint(p1, p2);
+    ctx.save();
+    ctx.globalCompositeOperation = 'destination-out';
+    ctx.globalAlpha = 1;
+    ctx.lineCap = 'round';
+    ctx.lineJoin = 'round';
+    ctx.lineWidth = width;
+    ctx.beginPath();
+    ctx.moveTo(start.x, start.y);
+    ctx.quadraticCurveTo(p1.x, p1.y, end.x, end.y);
+    ctx.stroke();
+    ctx.restore();
   }
 
   function persist(){
@@ -462,7 +524,11 @@
     }
 
     liveStroke.push(newPoint);
-    redraw();
+    if (prefs.tool === 'eraser') {
+      eraseLiveSegment(liveStroke, liveStroke.length - 1, currentEraserSize() * 2);
+    } else {
+      redrawLiveOverlay();
+    }
   }
 
   function onPointerUp(e){
@@ -486,23 +552,30 @@
       var w = wrap.scrollWidth, h = wrap.scrollHeight;
       var relPoints = liveStroke.map(function(p){ return { x: p.x / w, y: p.y / h, p: p.p }; });
       if (prefs.tool === 'eraser') {
+        // Base canvas already reflects the erasing — it was applied
+        // incrementally and permanently as the gesture moved (see
+        // eraseLiveSegment) — so no repaint is needed here.
         strokes.push({ type: 'erase', width: currentEraserSize() * 2, points: relPoints });
+        persist();
       } else {
         var style = currentDrawStyle();
         strokes.push({ type: 'draw', color: style.color, alpha: style.alpha, width: style.width, points: relPoints });
+        persist();
+        redraw(); // bake the finished stroke into the base layer, once
+        if (liveCtx) liveCtx.clearRect(0, 0, w, h); // now redundant with the base layer
       }
-      persist();
     } else {
       // A tap (no drag) never got its own entry — pop the unused undo snapshot.
       undoStack.pop();
     }
     liveStroke = null;
-    redraw();
   }
 
   function mount(routeKey){
     if (canvas && canvas.parentNode) canvas.parentNode.removeChild(canvas);
-    canvas = null; ctx = null; wrap = null; strokes = []; liveStroke = null; currentRoute = null; undoStack = [];
+    if (liveCanvas && liveCanvas.parentNode) liveCanvas.parentNode.removeChild(liveCanvas);
+    canvas = null; ctx = null; liveCanvas = null; liveCtx = null;
+    wrap = null; strokes = []; liveStroke = null; currentRoute = null; undoStack = [];
     hideEraserCursor();
     updateToolbarVisibility(!!routeKey);
     if (!routeKey) return;
@@ -514,6 +587,10 @@
     canvas = document.createElement('canvas');
     canvas.className = 'ink-canvas';
     wrap.appendChild(canvas);
+
+    liveCanvas = document.createElement('canvas');
+    liveCanvas.className = 'ink-canvas ink-canvas-live';
+    wrap.appendChild(liveCanvas);
 
     loadRoute(routeKey).then(function(record){
       strokes = ((record && record.strokes) || []).map(normalizeEntry);
